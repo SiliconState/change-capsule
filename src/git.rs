@@ -1,5 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -739,7 +738,9 @@ fn executable_in_path(name: &str) -> Option<PathBuf> {
             file.push(extension);
             let candidate = directory.join(file);
             if candidate.is_file() {
-                return fs::canonicalize(&candidate).ok().or(Some(candidate));
+                return crate::path::canonicalize(&candidate)
+                    .ok()
+                    .or(Some(candidate));
             }
         }
     }
@@ -751,7 +752,7 @@ fn valid_object_id(value: &str) -> bool {
 }
 
 fn canonical_existing(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).map_err(|error| io(path, error))
+    crate::path::canonicalize(path).map_err(|error| io(path, error))
 }
 
 #[derive(Debug)]

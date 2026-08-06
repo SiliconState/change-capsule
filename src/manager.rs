@@ -2609,11 +2609,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn canonical_existing(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).map_err(|error| io(path, error))
+    crate::path::canonicalize(path).map_err(|error| io(path, error))
 }
 
 fn same_path_existing_or_clean(left: &Path, right: &Path) -> bool {
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
+    match (
+        crate::path::canonicalize(left),
+        crate::path::canonicalize(right),
+    ) {
         (Ok(left), Ok(right)) => left == right,
         _ => clean_absolute(left) == clean_absolute(right),
     }

@@ -58,7 +58,7 @@ pub(crate) struct StateStore {
 impl StateStore {
     pub(crate) fn open(root: &Path) -> Result<Self> {
         ensure_private_dir(root)?;
-        let root = fs::canonicalize(root).map_err(|error| io(root, error))?;
+        let root = crate::path::canonicalize(root).map_err(|error| io(root, error))?;
         let store = Self { root };
         ensure_private_dir(&store.capsules_dir())?;
         ensure_private_dir(&store.workspaces_dir())?;
@@ -353,7 +353,7 @@ impl StateStore {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let parent = fs::canonicalize(parent).map_err(|error| io(parent, error))?;
+        let parent = crate::path::canonicalize(parent).map_err(|error| io(parent, error))?;
         let name = destination.file_name().ok_or_else(|| {
             Error::InvalidInput(format!(
                 "destination must name a new directory: {}",

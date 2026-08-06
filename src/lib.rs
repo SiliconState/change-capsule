@@ -66,6 +66,7 @@ pub mod error;
 mod git;
 mod manager;
 pub mod model;
+mod path;
 pub mod policy;
 mod state;
 pub mod verify;
