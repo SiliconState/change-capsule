@@ -52,7 +52,8 @@ Status fields relevant to automation:
 
 - `health`: stop on anything other than `healthy` while active;
 - `dirty`: whether the real worktree has uncommitted changes;
-- `changed_paths`: complete paths changed from the pinned base;
+- `changed_paths`: complete non-ignored paths changed from the pinned base;
+- `ignored_paths`: ignored untracked files/directories deliberately excluded from the capsule result;
 - `commits_ahead`: commits reachable from `HEAD` and not from the base;
 - `sealed`: after close, whether the worktree still matches the result.
 
@@ -65,7 +66,7 @@ capsule --json checkpoint <id> \
   --author-email "runner@example.test"
 ```
 
-Checkpoint is explicit because it stages all current worktree changes. A runner should not invoke it behind an agent's back unless that behavior is part of its contract.
+Checkpoint constructs the commit through a private index, journals the exact parent, commit, and patch digest, and atomically advances the capsule branch. It does not stage through the worktree's real index. A runner should still not invoke it behind an agent's back unless committing all current workspace content is part of its contract. An interrupted checkpoint reports `health=incomplete_checkpoint` and is handled by `recover` only when its protected Git ref, commit, and journal agree.
 
 ### 5. Record evidence
 
@@ -136,6 +137,7 @@ Successful commands emit one JSON value to stdout. Failed commands emit one JSON
 
 Current error kinds are:
 
+- `cli`
 - `not_repository`
 - `not_found`
 - `invalid_input`
@@ -148,7 +150,7 @@ Current error kinds are:
 - `schema_version`
 - `internal`
 
-Consumers should branch on `kind` and retain the message for diagnosis. The JSON schema is versioned through each manifest's `schema_version`; additive fields may appear within the same major package line.
+Consumers should branch on `kind` and retain the message for diagnosis. `cli` covers argument-parser failures; JSON help and version requests instead succeed with `kind=cli_help` and an `output` field. All other listed error kinds come from library operations. The on-disk manifest and result format is currently schema version 2. Incompatible schemas fail closed; additive JSON output fields may appear within the same major package line.
 
 ## Links
 
@@ -178,4 +180,6 @@ Run at process startup or after an interrupted lifecycle operation:
 capsule --json recover
 ```
 
-Recovery is conservative. It completes provable journal transitions and otherwise leaves state for explicit inspection. It does not delete work or invent a result.
+Recovery is conservative. It completes provable journal transitions for create, checkpoint, integration, and cleanup and otherwise leaves state for explicit inspection. Prepared commits are protected by namespaced Git refs until their transition becomes durable. Recovery does not delete work, reset unrelated target changes, or invent a result.
+
+Dirty nested submodule worktrees are rejected because a top-level patch cannot contain their internal files. Commit the nested repository first when the desired result is a top-level gitlink change. `status.ignored_paths` reports ignored untracked content that is deliberately excluded from the result.

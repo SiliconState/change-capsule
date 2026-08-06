@@ -10,7 +10,8 @@ use crate::error::{Error, Result, io};
 use crate::git::{CommitPatch, Git, Repository};
 use crate::model::{
     Capsule, CapsuleHealth, CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint,
-    Evidence, Integration, RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION,
+    CheckpointJournal, Cleanup, Evidence, Integration, RecoveryAction, ResultKind, ResultRef,
+    SCHEMA_VERSION,
 };
 use crate::state::{StateStore, default_state_root};
 
@@ -94,8 +95,9 @@ impl CapsuleManager {
     }
 
     pub fn open(state_root: impl Into<PathBuf>) -> Result<Self> {
+        let state_root = state_root.into();
         Ok(Self {
-            store: StateStore::open(state_root.into())?,
+            store: StateStore::open(&state_root)?,
             git: Git::discover()?,
         })
     }
@@ -107,6 +109,12 @@ impl CapsuleManager {
     pub fn create(&self, options: CreateOptions) -> Result<Capsule> {
         validate_create_options(&options)?;
         let repository = self.git.repository(&options.repository)?;
+        if self.git.sparse_checkout(&repository.worktree)? {
+            return Err(Error::InvalidInput(
+                "cannot create a capsule from a sparse-checkout worktree; disable sparse checkout first"
+                    .to_owned(),
+            ));
+        }
         let base_commit = self
             .git
             .resolve_commit(&repository.worktree, &options.base)?;
@@ -125,6 +133,7 @@ impl CapsuleManager {
             state: CapsuleState::Creating,
             source_worktree: repository.worktree.clone(),
             repository_common_dir: repository.common_dir.clone(),
+            workspace_git_dir: None,
             workspace_path,
             project_key,
             branch,
@@ -132,9 +141,11 @@ impl CapsuleManager {
             created_at_unix: created_at,
             updated_at_unix: created_at,
             checkpoints: Vec::new(),
+            checkpoint: None,
             evidence: Vec::new(),
             result: None,
             integration: None,
+            cleanup: None,
             closed_at_unix: None,
             dropped_at_unix: None,
         };
@@ -145,6 +156,7 @@ impl CapsuleManager {
             &capsule.branch,
             &capsule.base_commit,
         )?;
+        capsule.workspace_git_dir = Some(self.git.repository(&capsule.workspace_path)?.git_dir);
         self.validate_owned_worktree(&capsule)?;
         capsule.state = CapsuleState::Active;
         capsule.updated_at_unix = now()?;
@@ -180,15 +192,21 @@ impl CapsuleManager {
     pub fn diff(&self, id: &str) -> Result<Vec<u8>> {
         let capsule = self.show(id)?;
         match capsule.state {
-            CapsuleState::Closed | CapsuleState::Integrating | CapsuleState::Integrated => self
-                .sealed_artifacts(&capsule)
-                .and_then(|(matches, _, patch)| {
-                    if matches {
-                        Ok(patch)
-                    } else {
-                        Err(Error::ResultDrift(capsule.id.clone()))
-                    }
-                }),
+            CapsuleState::Closed
+            | CapsuleState::Integrating
+            | CapsuleState::Integrated
+            | CapsuleState::Dropping
+                if capsule.result.is_some() =>
+            {
+                self.sealed_artifacts(&capsule)
+                    .and_then(|(matches, _, patch)| {
+                        if matches {
+                            Ok(patch)
+                        } else {
+                            Err(Error::ResultDrift(capsule.id.clone()))
+                        }
+                    })
+            }
             CapsuleState::Dropped if capsule.result.is_some() => self
                 .sealed_artifacts(&capsule)
                 .and_then(|(matches, _, patch)| {
@@ -198,10 +216,18 @@ impl CapsuleManager {
                         Err(Error::ResultDrift(capsule.id.clone()))
                     }
                 }),
-            CapsuleState::Active | CapsuleState::Creating | CapsuleState::Orphaned => {
+            CapsuleState::Active | CapsuleState::Checkpointing => {
+                self.validate_owned_worktree(&capsule)?;
                 let snapshot = self.snapshot(&capsule)?;
                 Ok(snapshot.patch)
             }
+            CapsuleState::Creating | CapsuleState::Orphaned => {
+                Err(invalid_state(&capsule, "active or a sealed result"))
+            }
+            CapsuleState::Closed
+            | CapsuleState::Integrating
+            | CapsuleState::Integrated
+            | CapsuleState::Dropping => Err(invalid_state(&capsule, "a sealed result")),
             CapsuleState::Dropped => Ok(Vec::new()),
         }
     }
@@ -226,6 +252,10 @@ impl CapsuleManager {
         if capsule.result.is_none() {
             return Err(invalid_state(&capsule, "a sealed result"));
         }
+        let (matches, _, _) = self.sealed_artifacts(&capsule)?;
+        if !matches {
+            return Err(Error::ResultDrift(capsule.id));
+        }
         Ok(self.store.capsule_dir(id)?.join("result.patch"))
     }
 
@@ -237,25 +267,54 @@ impl CapsuleManager {
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
         self.validate_owned_worktree(&capsule)?;
-        if self.git.clean(&capsule.workspace_path)? {
-            return Err(Error::InvalidInput("nothing to checkpoint".to_owned()));
-        }
-        let snapshot = self.snapshot(&capsule)?;
+        let head_before = self.git.head(&capsule.workspace_path)?;
+        let snapshot = self.snapshot_against(&capsule, &head_before)?;
         if snapshot.patch.is_empty() {
             return Err(Error::InvalidInput("nothing to checkpoint".to_owned()));
         }
-        let commit = self.git.checkpoint(
+        let index = self.store.temporary_index(&capsule.id)?;
+        let head_after = self.git.commit_patch(&CommitPatch {
+            worktree: &capsule.workspace_path,
+            base: &head_before,
+            patch: &snapshot.patch,
+            index: index.path(),
+            message: &options.message,
+            name: &options.author.name,
+            email: &options.author.email,
+        })?;
+        let prepared =
+            self.git
+                .commit_snapshot(&capsule.workspace_path, &head_before, &head_after)?;
+        if self.git.parents(&capsule.workspace_path, &head_after)? != [head_before.clone()]
+            || prepared.patch != snapshot.patch
+            || prepared.changed_paths != snapshot.changed_paths
+        {
+            return Err(Error::UnsafeState(
+                "prepared checkpoint commit does not reproduce the workspace snapshot".to_owned(),
+            ));
+        }
+        self.git.create_ref(
             &capsule.workspace_path,
-            &options.message,
-            &options.author.name,
-            &options.author.email,
+            &checkpoint_ref(&capsule),
+            &head_after,
         )?;
-        let checkpoint = Checkpoint {
-            commit,
+        let started_at = now()?;
+        capsule.state = CapsuleState::Checkpointing;
+        capsule.checkpoint = Some(CheckpointJournal {
+            head_before: head_before.clone(),
+            head_after: head_after.clone(),
+            patch_sha256: sha256_hex(&snapshot.patch),
             message: options.message,
-            created_at_unix: now()?,
-        };
-        capsule.checkpoints.push(checkpoint.clone());
+            author_name: options.author.name,
+            author_email: options.author.email,
+            started_at_unix: started_at,
+        });
+        capsule.updated_at_unix = started_at;
+        self.store.write_capsule(&capsule)?;
+
+        let checkpoint = self.finish_checkpoint(&mut capsule)?.ok_or_else(|| {
+            Error::UnsafeState("checkpoint side effect was not observable".to_owned())
+        })?;
         capsule.updated_at_unix = now()?;
         self.store.write_capsule(&capsule)?;
         Ok(checkpoint)
@@ -317,21 +376,27 @@ impl CapsuleManager {
         let result = CapsuleResult {
             schema_version: SCHEMA_VERSION,
             capsule_id: capsule.id.clone(),
+            label: capsule.label.clone(),
+            links: capsule.links.clone(),
             kind,
             base_commit: capsule.base_commit.clone(),
             head_commit: head.clone(),
             patch_sha256: digest.clone(),
             patch_bytes: snapshot.patch.len() as u64,
             changed_paths: snapshot.changed_paths.clone(),
+            checkpoints: capsule.checkpoints.clone(),
             evidence: capsule.evidence.clone(),
+            created_at_unix: capsule.created_at_unix,
             sealed_at_unix: sealed_at,
         };
+        let result_digest = result_sha256(&result)?;
         self.store.write_patch(id, &snapshot.patch)?;
         self.store.write_result(id, &result)?;
         capsule.result = Some(ResultRef {
             kind,
             head_commit: head,
             patch_sha256: digest,
+            result_sha256: result_digest,
             patch_bytes: snapshot.patch.len() as u64,
             changed_paths: snapshot.changed_paths.len(),
             sealed_at_unix: sealed_at,
@@ -353,67 +418,89 @@ impl CapsuleManager {
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Closed, "closed")?;
         self.ensure_sealed(&capsule)?;
-        let target = self.git.repository(&options.target)?;
-        if target.common_dir != capsule.repository_common_dir {
-            return Err(Error::ForeignWorktree(target.worktree));
-        }
-        if target.worktree == capsule.workspace_path {
-            return Err(Error::InvalidInput(
-                "cannot integrate a capsule into its own workspace".to_owned(),
-            ));
-        }
-        if !self.git.clean(&target.worktree)? {
-            return Err(Error::DirtyIntegrationTarget(target.worktree));
-        }
-        let target_before = self.git.head(&target.worktree)?;
-        if target_before != capsule.base_commit {
-            return Err(Error::InvalidInput(format!(
-                "integration target HEAD {target_before} does not equal pinned base {}; update or recreate the capsule explicitly",
-                capsule.base_commit
-            )));
-        }
+        let (target, target_before, target_head_ref) =
+            self.validate_integration_target(&capsule, &options.target)?;
         let result = self.store.read_result(id)?;
         let patch = self.store.read_patch(id)?;
         let started_at = now()?;
         capsule.state = CapsuleState::Integrating;
         capsule.integration = Some(Integration {
             target_worktree: target.worktree.clone(),
+            target_git_dir: target.git_dir.clone(),
+            target_head_ref,
             target_head_before: target_before.clone(),
             target_head_after: None,
+            commit_message: options.message.clone().unwrap_or_else(|| {
+                capsule
+                    .label
+                    .as_ref()
+                    .map_or_else(|| format!("Integrate capsule {}", capsule.id), Clone::clone)
+            }),
+            author_name: options.author.name.clone(),
+            author_email: options.author.email.clone(),
             started_at_unix: started_at,
             integrated_at_unix: None,
         });
         capsule.updated_at_unix = started_at;
         self.store.write_capsule(&capsule)?;
 
-        let integration = self.integrate_result(&capsule, &target, &result, &patch, options);
-        match integration {
-            Ok(target_after) => {
-                let integrated_at = now()?;
-                let integration = capsule.integration.as_mut().ok_or_else(|| {
-                    Error::UnsafeState("integration record disappeared".to_owned())
-                })?;
-                integration.target_head_after = Some(target_after);
-                integration.integrated_at_unix = Some(integrated_at);
-                capsule.state = CapsuleState::Integrated;
-                capsule.updated_at_unix = integrated_at;
-                self.store.write_capsule(&capsule)?;
-                Ok(capsule)
-            }
+        let proposed_head = match self.prepare_integration(&capsule, &target, &result, &patch) {
+            Ok(head) => head,
             Err(error) => {
-                if self
-                    .git
-                    .reset_hard(&target.worktree, &target_before)
-                    .is_ok()
-                {
-                    capsule.state = CapsuleState::Closed;
-                    capsule.integration = None;
-                    capsule.updated_at_unix = now()?;
-                    self.store.write_capsule(&capsule)?;
-                }
-                Err(error)
+                capsule.state = CapsuleState::Closed;
+                capsule.integration = None;
+                capsule.updated_at_unix = now()?;
+                self.store.write_capsule(&capsule)?;
+                return Err(error);
             }
+        };
+        if proposed_head != target_before {
+            self.git
+                .create_ref(&target.worktree, &integration_ref(&capsule), &proposed_head)?;
         }
+        capsule
+            .integration
+            .as_mut()
+            .ok_or_else(|| Error::UnsafeState("integration record disappeared".to_owned()))?
+            .target_head_after = Some(proposed_head.clone());
+        capsule.updated_at_unix = now()?;
+        self.store.write_capsule(&capsule)?;
+
+        let current_target = self.git.repository(&target.worktree)?;
+        if current_target.common_dir != capsule.repository_common_dir
+            || current_target.git_dir != target.git_dir
+            || self.git.head_ref(&current_target.worktree)?
+                != capsule
+                    .integration
+                    .as_ref()
+                    .ok_or_else(|| Error::UnsafeState("integration record disappeared".to_owned()))?
+                    .target_head_ref
+            || !self.git.clean(&current_target.worktree)?
+            || self.git.head(&current_target.worktree)? != target_before
+        {
+            return Err(Error::ForeignWorktree(target.worktree));
+        }
+        if proposed_head != target_before {
+            self.git.fast_forward(&target.worktree, &proposed_head)?;
+        }
+
+        let integrated_at = now()?;
+        let integration = capsule
+            .integration
+            .as_mut()
+            .ok_or_else(|| Error::UnsafeState("integration record disappeared".to_owned()))?;
+        integration.integrated_at_unix = Some(integrated_at);
+        capsule.state = CapsuleState::Integrated;
+        capsule.updated_at_unix = integrated_at;
+        if proposed_head != target_before {
+            self.git.delete_ref_if_matches(
+                &target.worktree,
+                &integration_ref(&capsule),
+                &proposed_head,
+            )?;
+        }
+        self.store.write_capsule(&capsule)?;
+        Ok(capsule)
     }
 
     pub fn drop_capsule(&self, id: &str, force: bool) -> Result<Capsule> {
@@ -423,9 +510,15 @@ impl CapsuleManager {
         if capsule.state == CapsuleState::Dropped {
             return Ok(capsule);
         }
+        if capsule.state == CapsuleState::Dropping {
+            self.finish_cleanup(&mut capsule)?;
+            capsule.updated_at_unix = now()?;
+            self.store.write_capsule(&capsule)?;
+            return Ok(capsule);
+        }
         if matches!(
             capsule.state,
-            CapsuleState::Creating | CapsuleState::Integrating
+            CapsuleState::Creating | CapsuleState::Checkpointing | CapsuleState::Integrating
         ) && !force
         {
             return Err(invalid_state(
@@ -436,28 +529,49 @@ impl CapsuleManager {
         if capsule.state == CapsuleState::Active && !force {
             return Err(Error::UnsealedChanges(id.to_owned()));
         }
-        if matches!(
+        let require_sealed = matches!(
             capsule.state,
             CapsuleState::Closed | CapsuleState::Integrated
-        ) && !force
-        {
+        ) && !force;
+        if require_sealed {
             self.ensure_sealed(&capsule)?;
         }
 
+        let execution_root = self.execution_root(&capsule)?;
+        let branch_head = self.git.branch_head(&execution_root, &capsule.branch)?;
         if capsule.workspace_path.exists() {
+            if capsule.workspace_git_dir.is_none() && capsule.state == CapsuleState::Creating {
+                capsule.workspace_git_dir =
+                    Some(self.git.repository(&capsule.workspace_path)?.git_dir);
+            }
             self.validate_owned_worktree(&capsule)?;
-            let execution_root = Self::execution_root(&capsule)?;
-            self.git
-                .remove_worktree(&execution_root, &capsule.workspace_path, true)?;
-            self.git.delete_branch(&execution_root, &capsule.branch)?;
-            self.git.prune(&execution_root)?;
-        } else if self.registered_record(&capsule)?.is_some() {
+            let workspace_head = self.git.head(&capsule.workspace_path)?;
+            if branch_head.as_deref() != Some(workspace_head.as_str()) {
+                return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
+            }
+        } else if require_sealed {
+            return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
+        } else if let Some(record) = self.registered_record(&capsule)? {
+            Self::validate_registered_record(&capsule, &record, branch_head.as_deref())?;
+        } else if branch_head
+            .as_deref()
+            .is_some_and(|head| !recorded_capsule_head(&capsule, head))
+        {
             return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
         }
-        let dropped_at = now()?;
-        capsule.state = CapsuleState::Dropped;
-        capsule.dropped_at_unix = Some(dropped_at);
-        capsule.updated_at_unix = dropped_at;
+
+        let started_at = now()?;
+        capsule.state = CapsuleState::Dropping;
+        capsule.cleanup = Some(Cleanup {
+            branch_head,
+            require_sealed,
+            started_at_unix: started_at,
+        });
+        capsule.updated_at_unix = started_at;
+        self.store.write_capsule(&capsule)?;
+
+        self.finish_cleanup(&mut capsule)?;
+        capsule.updated_at_unix = now()?;
         self.store.write_capsule(&capsule)?;
         Ok(capsule)
     }
@@ -472,8 +586,10 @@ impl CapsuleManager {
             let previous = capsule.state;
             let action = match capsule.state {
                 CapsuleState::Creating => Some(self.recover_creating(&mut capsule)?),
-                CapsuleState::Active => self.recover_active(&mut capsule),
+                CapsuleState::Checkpointing => self.recover_checkpointing(&mut capsule)?,
+                CapsuleState::Active => self.recover_active(&mut capsule)?,
                 CapsuleState::Integrating => self.recover_integrating(&mut capsule)?,
+                CapsuleState::Dropping => Some(self.finish_cleanup(&mut capsule)?),
                 CapsuleState::Closed
                 | CapsuleState::Integrated
                 | CapsuleState::Orphaned
@@ -501,22 +617,31 @@ impl CapsuleManager {
                 head_commit: None,
                 dirty: None,
                 changed_paths: Vec::new(),
+                ignored_paths: Vec::new(),
+                commits_ahead: None,
+                sealed: None,
+            });
+        }
+        if capsule.state == CapsuleState::Creating {
+            return Ok(CapsuleStatus {
+                capsule,
+                health: CapsuleHealth::IncompleteCreation,
+                head_commit: None,
+                dirty: None,
+                changed_paths: Vec::new(),
+                ignored_paths: Vec::new(),
                 commits_ahead: None,
                 sealed: None,
             });
         }
         if !capsule.workspace_path.exists() {
-            let health = if capsule.state == CapsuleState::Creating {
-                CapsuleHealth::IncompleteCreation
-            } else {
-                CapsuleHealth::MissingWorktree
-            };
             return Ok(CapsuleStatus {
                 capsule,
-                health,
+                health: CapsuleHealth::MissingWorktree,
                 head_commit: None,
                 dirty: None,
                 changed_paths: Vec::new(),
+                ignored_paths: Vec::new(),
                 commits_ahead: None,
                 sealed: None,
             });
@@ -528,11 +653,13 @@ impl CapsuleManager {
                 head_commit: None,
                 dirty: None,
                 changed_paths: Vec::new(),
+                ignored_paths: Vec::new(),
                 commits_ahead: None,
                 sealed: None,
             });
         }
         let snapshot = self.snapshot(&capsule)?;
+        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
         let head = self.git.head(&capsule.workspace_path)?;
         let dirty = !self.git.clean(&capsule.workspace_path)?;
         let commits_ahead = self
@@ -546,11 +673,18 @@ impl CapsuleManager {
         let health = if sealed == Some(false)
             && matches!(
                 capsule.state,
-                CapsuleState::Closed | CapsuleState::Integrating | CapsuleState::Integrated
+                CapsuleState::Closed
+                    | CapsuleState::Integrating
+                    | CapsuleState::Integrated
+                    | CapsuleState::Dropping
             ) {
             CapsuleHealth::DriftedAfterClose
         } else if capsule.state == CapsuleState::Creating {
             CapsuleHealth::IncompleteCreation
+        } else if capsule.state == CapsuleState::Checkpointing {
+            CapsuleHealth::IncompleteCheckpoint
+        } else if capsule.state == CapsuleState::Orphaned {
+            CapsuleHealth::Orphaned
         } else {
             CapsuleHealth::Healthy
         };
@@ -560,29 +694,66 @@ impl CapsuleManager {
             head_commit: Some(head),
             dirty: Some(dirty),
             changed_paths: snapshot.changed_paths,
+            ignored_paths,
             commits_ahead: Some(commits_ahead),
             sealed,
         })
     }
 
-    fn integrate_result(
+    fn validate_integration_target(
+        &self,
+        capsule: &Capsule,
+        path: &Path,
+    ) -> Result<(Repository, String, String)> {
+        let target = self.git.repository(path)?;
+        if target.common_dir != capsule.repository_common_dir {
+            return Err(Error::ForeignWorktree(target.worktree));
+        }
+        if target.worktree == capsule.workspace_path {
+            return Err(Error::InvalidInput(
+                "cannot integrate a capsule into its own workspace".to_owned(),
+            ));
+        }
+        if self.git.sparse_checkout(&target.worktree)?
+            || self.git.hidden_index_entries(&target.worktree)?
+        {
+            return Err(Error::InvalidInput(
+                "integration target uses sparse-checkout, skip-worktree, or assume-unchanged entries; restore a full checkout first"
+                    .to_owned(),
+            ));
+        }
+        if !self.git.clean(&target.worktree)? {
+            return Err(Error::DirtyIntegrationTarget(target.worktree));
+        }
+        let head = self.git.head(&target.worktree)?;
+        let head_ref = self.git.head_ref(&target.worktree)?;
+        if head != capsule.base_commit {
+            return Err(Error::InvalidInput(format!(
+                "integration target HEAD {head} does not equal pinned base {}; update or recreate the capsule explicitly",
+                capsule.base_commit
+            )));
+        }
+        Ok((target, head, head_ref))
+    }
+
+    fn prepare_integration(
         &self,
         capsule: &Capsule,
         target: &Repository,
         result: &CapsuleResult,
         patch: &[u8],
-        options: &IntegrateOptions,
     ) -> Result<String> {
         if result.kind == ResultKind::NoChange {
             return self.git.head(&target.worktree);
         }
-        let message = options.message.clone().unwrap_or_else(|| {
-            capsule
-                .label
-                .as_ref()
-                .map_or_else(|| format!("Integrate capsule {}", capsule.id), Clone::clone)
-        });
-        let message = format!("{message}\n\nChange-Capsule: {}", capsule.id);
+        let integration = capsule
+            .integration
+            .as_ref()
+            .ok_or_else(|| Error::UnsafeState("integration record disappeared".to_owned()))?;
+        let message = format!(
+            "{}\n\nChange-Capsule: {}",
+            integration.commit_message, capsule.id
+        );
         let index = self.store.temporary_index(&capsule.id)?;
         let commit = self.git.commit_patch(&CommitPatch {
             worktree: &target.worktree,
@@ -590,10 +761,23 @@ impl CapsuleManager {
             patch,
             index: index.path(),
             message: &message,
-            name: &options.author.name,
-            email: &options.author.email,
+            name: &integration.author_name,
+            email: &integration.author_email,
         })?;
-        self.git.reset_hard(&target.worktree, &commit)?;
+        let parents = self.git.parents(&target.worktree, &commit)?;
+        if parents != [capsule.base_commit.clone()] {
+            return Err(Error::UnsafeState(format!(
+                "prepared integration commit {commit} does not have exactly the pinned base as parent"
+            )));
+        }
+        let prepared = self
+            .git
+            .commit_snapshot(&target.worktree, &capsule.base_commit, &commit)?;
+        if prepared.patch != patch || prepared.changed_paths != result.changed_paths {
+            return Err(Error::UnsafeState(
+                "prepared integration commit does not reproduce the sealed result".to_owned(),
+            ));
+        }
         Ok(commit)
     }
 
@@ -637,21 +821,44 @@ impl CapsuleManager {
             && reference.head_commit == result.head_commit
             && reference.patch_sha256 == stored_digest
             && reference.patch_sha256 == result.patch_sha256
+            && reference.result_sha256 == result_sha256(&result)?
             && reference.patch_bytes == stored_patch.len() as u64
             && reference.patch_bytes == result.patch_bytes
             && reference.changed_paths == result.changed_paths.len()
             && reference.sealed_at_unix == result.sealed_at_unix
             && result.schema_version == SCHEMA_VERSION
             && result.capsule_id == capsule.id
+            && result.label == capsule.label
+            && result.links == capsule.links
             && result.base_commit == capsule.base_commit
-            && result.evidence == capsule.evidence;
+            && result.checkpoints == capsule.checkpoints
+            && result.evidence == capsule.evidence
+            && result.created_at_unix == capsule.created_at_unix;
         Ok((matches, result, stored_patch))
     }
 
     fn snapshot(&self, capsule: &Capsule) -> Result<crate::git::Snapshot> {
+        self.snapshot_against(capsule, &capsule.base_commit)
+    }
+
+    fn snapshot_against(&self, capsule: &Capsule, base: &str) -> Result<crate::git::Snapshot> {
+        if self.git.sparse_checkout(&capsule.workspace_path)?
+            || self.git.hidden_index_entries(&capsule.workspace_path)?
+        {
+            return Err(Error::InvalidInput(
+                "sparse-checkout, skip-worktree, or assume-unchanged index entries cannot produce a complete capsule snapshot; restore a full checkout first"
+                    .to_owned(),
+            ));
+        }
+        if self.git.dirty_submodules(&capsule.workspace_path)? {
+            return Err(Error::InvalidInput(
+                "dirty submodule worktrees cannot be represented by a top-level capsule patch; commit or clean them first"
+                    .to_owned(),
+            ));
+        }
         let index = self.store.temporary_index(&capsule.id)?;
         self.git
-            .snapshot(&capsule.workspace_path, &capsule.base_commit, index.path())
+            .snapshot(&capsule.workspace_path, base, index.path())
     }
 
     fn validate_owned_worktree(&self, capsule: &Capsule) -> Result<()> {
@@ -660,6 +867,7 @@ impl CapsuleManager {
             .repository(&capsule.workspace_path)
             .map_err(|_| Error::ForeignWorktree(capsule.workspace_path.clone()))?;
         if repository.common_dir != capsule.repository_common_dir
+            || capsule.workspace_git_dir.as_ref() != Some(&repository.git_dir)
             || repository.worktree != canonical_existing(&capsule.workspace_path)?
             || self.git.branch(&capsule.workspace_path)? != capsule.branch
         {
@@ -668,36 +876,126 @@ impl CapsuleManager {
         let record = self
             .registered_record(capsule)?
             .ok_or_else(|| Error::ForeignWorktree(capsule.workspace_path.clone()))?;
-        if record.branch.as_deref() != Some(capsule.branch.as_str()) || record.bare {
-            return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
-        }
+        let head = self.git.head(&capsule.workspace_path)?;
+        Self::validate_registered_record(capsule, &record, Some(&head))?;
         Ok(())
     }
 
     fn registered_record(&self, capsule: &Capsule) -> Result<Option<crate::git::WorktreeRecord>> {
-        let execution_root = Self::execution_root(capsule)?;
+        let execution_root = self.execution_root(capsule)?;
         let records = self.git.registered_worktrees(&execution_root)?;
         Ok(records
             .into_iter()
             .find(|record| same_path_existing_or_clean(&record.path, &capsule.workspace_path)))
     }
 
-    fn execution_root(capsule: &Capsule) -> Result<PathBuf> {
-        if capsule.source_worktree.exists() {
-            return Ok(capsule.source_worktree.clone());
+    fn validate_registered_record(
+        capsule: &Capsule,
+        record: &crate::git::WorktreeRecord,
+        expected_head: Option<&str>,
+    ) -> Result<()> {
+        if record.branch.as_deref() != Some(capsule.branch.as_str())
+            || record.bare
+            || record.head.as_deref() != expected_head
+        {
+            return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
         }
+        Ok(())
+    }
+
+    fn finish_cleanup(&self, capsule: &mut Capsule) -> Result<String> {
+        let cleanup = capsule.cleanup.clone().ok_or_else(|| {
+            Error::UnsafeState("dropping capsule has no cleanup journal".to_owned())
+        })?;
+        let execution_root = self.execution_root(capsule)?;
+        let expected_head = cleanup.branch_head.as_deref();
+
         if capsule.workspace_path.exists() {
-            return Ok(capsule.workspace_path.clone());
+            self.validate_owned_worktree(capsule)?;
+            let workspace_head = self.git.head(&capsule.workspace_path)?;
+            if expected_head != Some(workspace_head.as_str()) {
+                return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
+            }
+            if cleanup.require_sealed {
+                self.ensure_sealed(capsule)?;
+            }
+            self.git
+                .remove_worktree(&execution_root, &capsule.workspace_path, true)?;
+        } else if let Some(record) = self.registered_record(capsule)? {
+            Self::validate_registered_record(capsule, &record, expected_head)?;
+            self.git.prune(&execution_root)?;
+            if self.registered_record(capsule)?.is_some() {
+                return Err(Error::ForeignWorktree(capsule.workspace_path.clone()));
+            }
+        }
+
+        match expected_head {
+            Some(head) => {
+                self.git
+                    .delete_branch_if_matches(&execution_root, &capsule.branch, head)?;
+            }
+            None => {
+                if self
+                    .git
+                    .branch_head(&execution_root, &capsule.branch)?
+                    .is_some()
+                {
+                    return Err(Error::UnsafeState(format!(
+                        "refusing to delete branch {} created after cleanup began",
+                        capsule.branch
+                    )));
+                }
+            }
+        }
+        self.git.prune(&execution_root)?;
+        for pending_ref in [checkpoint_ref(capsule), integration_ref(capsule)] {
+            if let Some(commit) = self.git.ref_head(&execution_root, &pending_ref)? {
+                self.git
+                    .delete_ref_if_matches(&execution_root, &pending_ref, &commit)?;
+            }
+        }
+        let dropped_at = now()?;
+        capsule.state = CapsuleState::Dropped;
+        capsule.checkpoint = None;
+        capsule.cleanup = None;
+        capsule.dropped_at_unix = Some(dropped_at);
+        Ok("completed journaled worktree and branch cleanup".to_owned())
+    }
+
+    fn execution_root(&self, capsule: &Capsule) -> Result<PathBuf> {
+        for path in [&capsule.source_worktree, &capsule.workspace_path] {
+            if path.exists()
+                && self
+                    .git
+                    .repository(path)
+                    .is_ok_and(|repository| repository.common_dir == capsule.repository_common_dir)
+            {
+                return Ok(path.clone());
+            }
+        }
+        if capsule.repository_common_dir.exists()
+            && canonical_existing(&capsule.repository_common_dir)? == capsule.repository_common_dir
+        {
+            return Ok(capsule.repository_common_dir.clone());
         }
         Err(Error::ForeignWorktree(capsule.workspace_path.clone()))
     }
 
     fn recover_creating(&self, capsule: &mut Capsule) -> Result<String> {
-        if capsule.workspace_path.exists() && self.validate_owned_worktree(capsule).is_ok() {
-            self.git
-                .reset_hard(&capsule.workspace_path, &capsule.base_commit)?;
-            capsule.state = CapsuleState::Active;
-            return Ok("completed an interrupted workspace creation".to_owned());
+        if capsule.workspace_path.exists() {
+            if capsule.workspace_git_dir.is_none() {
+                capsule.workspace_git_dir = self
+                    .git
+                    .repository(&capsule.workspace_path)
+                    .ok()
+                    .map(|repository| repository.git_dir);
+            }
+            if self.validate_owned_worktree(capsule).is_ok() {
+                self.git
+                    .reset_hard(&capsule.workspace_path, &capsule.base_commit)?;
+                capsule.state = CapsuleState::Active;
+                return Ok("completed an interrupted workspace creation".to_owned());
+            }
         }
         capsule.state = CapsuleState::Orphaned;
         Ok(
@@ -706,15 +1004,161 @@ impl CapsuleManager {
         )
     }
 
-    fn recover_active(&self, capsule: &mut Capsule) -> Option<String> {
+    fn recover_checkpointing(&self, capsule: &mut Capsule) -> Result<Option<String>> {
+        Ok(self
+            .finish_checkpoint(capsule)?
+            .map(|checkpoint| format!("completed interrupted checkpoint {}", checkpoint.commit)))
+    }
+
+    fn finish_checkpoint(&self, capsule: &mut Capsule) -> Result<Option<Checkpoint>> {
+        let journal = capsule.checkpoint.clone().ok_or_else(|| {
+            Error::UnsafeState("checkpointing capsule has no checkpoint journal".to_owned())
+        })?;
+        self.validate_owned_worktree(capsule)?;
+        let parents = self
+            .git
+            .parents(&capsule.workspace_path, &journal.head_after)?;
+        let committed = self.git.commit_snapshot(
+            &capsule.workspace_path,
+            &journal.head_before,
+            &journal.head_after,
+        )?;
+        if parents != [journal.head_before.clone()]
+            || sha256_hex(&committed.patch) != journal.patch_sha256
+        {
+            return Err(Error::UnsafeState(
+                "checkpoint journal does not match its prepared commit".to_owned(),
+            ));
+        }
+
+        let head = self.git.head(&capsule.workspace_path)?;
+        let pending_ref = checkpoint_ref(capsule);
+        let pending_head = self.git.ref_head(&capsule.workspace_path, &pending_ref)?;
+        if head == journal.head_before {
+            match pending_head.as_deref() {
+                Some(head) if head == journal.head_after => {}
+                None => self.git.create_ref(
+                    &capsule.workspace_path,
+                    &pending_ref,
+                    &journal.head_after,
+                )?,
+                Some(_) => {
+                    return Err(Error::UnsafeState(
+                        "checkpoint pending ref points to an unexpected commit".to_owned(),
+                    ));
+                }
+            }
+            self.git.advance_branch(
+                &capsule.workspace_path,
+                &capsule.branch,
+                &journal.head_after,
+                &journal.head_before,
+            )?;
+        } else if head == journal.head_after {
+            if pending_head.as_deref().is_some_and(|value| value != head) {
+                return Err(Error::UnsafeState(
+                    "checkpoint pending ref points to an unexpected commit".to_owned(),
+                ));
+            }
+            self.git
+                .reset_index(&capsule.workspace_path, &journal.head_after)?;
+        } else {
+            return Ok(None);
+        }
+        if pending_head.is_some() {
+            self.git.delete_ref_if_matches(
+                &capsule.workspace_path,
+                &pending_ref,
+                &journal.head_after,
+            )?;
+        }
+
+        if capsule
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.commit == journal.head_after)
+        {
+            return Err(Error::UnsafeState(
+                "checkpoint journal duplicates an existing checkpoint".to_owned(),
+            ));
+        }
+        let checkpoint = Checkpoint {
+            commit: journal.head_after,
+            message: journal.message,
+            author_name: journal.author_name,
+            author_email: journal.author_email,
+            created_at_unix: journal.started_at_unix,
+        };
+        capsule.checkpoints.push(checkpoint.clone());
+        capsule.checkpoint = None;
+        capsule.state = CapsuleState::Active;
+        Ok(Some(checkpoint))
+    }
+
+    fn recover_active(&self, capsule: &mut Capsule) -> Result<Option<String>> {
         if capsule.workspace_path.exists() && self.validate_owned_worktree(capsule).is_ok() {
-            return None;
+            let pending_ref = checkpoint_ref(capsule);
+            if let Some(commit) = self.git.ref_head(&capsule.workspace_path, &pending_ref)? {
+                self.git
+                    .delete_ref_if_matches(&capsule.workspace_path, &pending_ref, &commit)?;
+                return Ok(Some(
+                    "removed a prepared checkpoint ref left before its journal was written"
+                        .to_owned(),
+                ));
+            }
+            return Ok(None);
         }
         capsule.state = CapsuleState::Orphaned;
-        Some(
+        Ok(Some(
             "marked an active capsule orphaned because its owned worktree is missing or foreign"
                 .to_owned(),
-        )
+        ))
+    }
+
+    fn integration_matches_result(
+        &self,
+        target: &Repository,
+        integration: &Integration,
+        result: &CapsuleResult,
+        stored_patch: &[u8],
+        head: &str,
+    ) -> Result<bool> {
+        if head == integration.target_head_before {
+            return Ok(result.kind == ResultKind::NoChange
+                && result.patch_bytes == 0
+                && result.changed_paths.is_empty()
+                && stored_patch.is_empty());
+        }
+        let parents = self.git.parents(&target.worktree, head)?;
+        let snapshot =
+            self.git
+                .commit_snapshot(&target.worktree, &integration.target_head_before, head)?;
+        Ok(parents == [integration.target_head_before.clone()]
+            && snapshot.patch == stored_patch
+            && snapshot.changed_paths == result.changed_paths)
+    }
+
+    fn recovery_integration_target(
+        &self,
+        capsule: &Capsule,
+        integration: &Integration,
+    ) -> Result<Option<Repository>> {
+        if !integration.target_worktree.exists() {
+            return Ok(None);
+        }
+        let Ok(target) = self.git.repository(&integration.target_worktree) else {
+            return Ok(None);
+        };
+        if target.common_dir != capsule.repository_common_dir
+            || target.git_dir != integration.target_git_dir
+            || self.git.head_ref(&target.worktree)? != integration.target_head_ref
+            || self.git.sparse_checkout(&target.worktree)?
+            || self.git.hidden_index_entries(&target.worktree)?
+            || !self.git.clean(&target.worktree)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(target))
     }
 
     fn recover_integrating(&self, capsule: &mut Capsule) -> Result<Option<String>> {
@@ -724,43 +1168,115 @@ impl CapsuleManager {
                 "marked an integration orphaned because its journal record is missing".to_owned(),
             ));
         };
-        if !integration.target_worktree.exists() {
+        let Some(target) = self.recovery_integration_target(capsule, &integration)? else {
             return Ok(None);
-        }
-        let target = self.git.repository(&integration.target_worktree)?;
-        if target.common_dir != capsule.repository_common_dir
-            || !self.git.clean(&target.worktree)?
-        {
-            return Ok(None);
-        }
+        };
         let head = self.git.head(&target.worktree)?;
-        if head == integration.target_head_before {
+        let pending_ref = integration_ref(capsule);
+        let pending_ref_head = self.git.ref_head(&target.worktree, &pending_ref)?;
+        if integration.target_head_after.is_none() {
+            if head != integration.target_head_before {
+                return Ok(None);
+            }
+            if let Some(prepared) = pending_ref_head {
+                self.git
+                    .delete_ref_if_matches(&target.worktree, &pending_ref, &prepared)?;
+            }
             capsule.state = CapsuleState::Closed;
             capsule.integration = None;
+            return Ok(Some(
+                "removed a prepared integration ref left before its journal update".to_owned(),
+            ));
+        }
+        let (artifacts_match, result, stored_patch) = self.sealed_artifacts(capsule)?;
+        if !artifacts_match {
+            return Ok(None);
+        }
+        let pending = integration
+            .target_head_after
+            .as_deref()
+            .filter(|head| *head != integration.target_head_before);
+        if let Some(head) = pending {
+            if self
+                .git
+                .ref_head(&target.worktree, &pending_ref)?
+                .is_some_and(|value| value != head)
+            {
+                return Err(Error::UnsafeState(
+                    "integration pending ref points to an unexpected commit".to_owned(),
+                ));
+            }
+        }
+        if integration.target_head_after.as_deref() == Some(head.as_str()) {
+            if !self.integration_matches_result(
+                &target,
+                &integration,
+                &result,
+                &stored_patch,
+                &head,
+            )? {
+                return Ok(None);
+            }
+            let completed_at = now()?;
+            if let Some(record) = capsule.integration.as_mut() {
+                record.integrated_at_unix = Some(completed_at);
+            }
+            capsule.state = CapsuleState::Integrated;
+            if let Some(pending) = pending {
+                self.git
+                    .delete_ref_if_matches(&target.worktree, &pending_ref, pending)?;
+            }
+            return Ok(Some(
+                "finalized an integration whose exact Git commit completed before the journal update"
+                    .to_owned(),
+            ));
+        }
+        if head == integration.target_head_before {
+            if let Some(pending) = pending {
+                if self
+                    .git
+                    .ref_head(&target.worktree, &pending_ref)?
+                    .as_deref()
+                    != Some(pending)
+                {
+                    return Ok(None);
+                }
+            }
+            capsule.state = CapsuleState::Closed;
+            capsule.integration = None;
+            if let Some(pending) = pending {
+                self.git
+                    .delete_ref_if_matches(&target.worktree, &pending_ref, pending)?;
+            }
             return Ok(Some(
                 "restored a pre-side-effect interrupted integration to closed".to_owned(),
             ));
         }
-        let snapshot_capsule = Capsule {
-            workspace_path: target.worktree.clone(),
-            ..capsule.clone()
-        };
-        let snapshot = self.snapshot(&snapshot_capsule)?;
-        let result = self.store.read_result(&capsule.id)?;
-        if sha256_hex(&snapshot.patch) == result.patch_sha256 {
-            let completed_at = now()?;
-            if let Some(record) = capsule.integration.as_mut() {
-                record.target_head_after = Some(head);
-                record.integrated_at_unix = Some(completed_at);
-            }
-            capsule.state = CapsuleState::Integrated;
-            return Ok(Some(
-                "finalized an integration whose Git commit completed before the journal update"
-                    .to_owned(),
-            ));
-        }
         Ok(None)
     }
+}
+
+fn recorded_capsule_head(capsule: &Capsule, head: &str) -> bool {
+    head == capsule.base_commit
+        || capsule
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.commit == head)
+        || capsule
+            .result
+            .as_ref()
+            .is_some_and(|result| result.head_commit == head)
+        || capsule.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.head_before == head || checkpoint.head_after == head
+        })
+}
+
+fn checkpoint_ref(capsule: &Capsule) -> String {
+    format!("refs/change-capsule/{}/checkpoint", capsule.id)
+}
+
+fn integration_ref(capsule: &Capsule) -> String {
+    format!("refs/change-capsule/{}/integration", capsule.id)
 }
 
 fn validate_create_options(options: &CreateOptions) -> Result<()> {
@@ -856,6 +1372,14 @@ fn project_key(common_dir: &Path) -> Result<String> {
         .ok_or_else(|| Error::NonUtf8Path(common_dir.to_path_buf()))?;
     let digest = Sha256::digest(path.as_bytes());
     Ok(hex::encode(&digest[..12]))
+}
+
+fn result_sha256(result: &CapsuleResult) -> Result<String> {
+    let bytes = serde_json::to_vec(result).map_err(|source| Error::Json {
+        path: PathBuf::from("result digest"),
+        source,
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

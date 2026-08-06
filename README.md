@@ -18,9 +18,9 @@ A capsule is more than a Git worktree. It records the complete boundary of an at
 - exact repository and base commit;
 - isolated ordinary filesystem path;
 - optional links to tasks, runs, agents, or external systems;
-- checkpoints created during the attempt;
+- checkpoints created during the attempt, including crash-recoverable checkpoint journals;
 - caller-recorded verification evidence;
-- complete binary-capable patch and changed-path inventory;
+- complete binary-capable patch, changed-path inventory, and sealed provenance;
 - immutable result digest and drift detection;
 - explicit, journaled integration;
 - guarded cleanup and crash recovery.
@@ -75,7 +75,7 @@ capsule --json status cap-01...
 capsule diff cap-01... > /tmp/attempt.patch
 ```
 
-Optionally commit a recoverable checkpoint:
+Optionally create a recoverable checkpoint. Checkpoint commits are prepared through a private index, journaled, then atomically advanced onto the capsule branch; `recover` finishes an interrupted transition:
 
 ```sh
 capsule --json checkpoint cap-01... \
@@ -161,9 +161,9 @@ The crate owns lifecycle and provenance. The caller owns process launch, model c
 2. Each receives a separate ordinary Git worktree and branch.
 3. Attempts may change the same files independently.
 4. The source worktree remains untouched until explicit integration.
-5. Every result has a complete patch, changed-path inventory, digest, and provenance.
-6. Results survive process restart and can be inspected by another process or agent.
-7. Missing, replaced, or drifted workspaces fail closed.
+5. Every result has a complete patch, changed-path inventory, digest, and sealed provenance, including label, links, checkpoints, and evidence.
+6. Results and journaled checkpoint, integration, and cleanup transitions survive process restart and can be inspected or recovered by another process or agent.
+7. Missing, replaced, drifted, or unrepresentable workspaces fail closed.
 8. Cleanup refuses foreign directories even with `--force`.
 9. Integration is explicit and requires a clean target at the exact pinned base.
 
@@ -182,7 +182,9 @@ See:
 
 ## Status
 
-This is the smallest convincing milestone. It intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Remote execution, background jobs, non-Git snapshots, automatic rebasing, merge queues, and network services are out of scope.
+This is the smallest convincing milestone. It intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Sparse-checkout, `skip-worktree`, and `assume-unchanged` entries are rejected because an absent or hidden file cannot be distinguished safely from a requested deletion. Dirty nested submodule worktrees and unregistered embedded Git repositories are rejected rather than silently omitted or converted to accidental gitlinks; commit a registered submodule change first if the top-level gitlink should be captured. Ignored untracked paths are excluded but reported by `status.ignored_paths`. Remote execution, distributed persistence, background jobs, non-Git snapshots, automatic rebasing, merge queues, network services, signed attestations, quotas, and execution sandboxing remain out of scope.
+
+The on-disk schema is currently version 2. This pre-release build fails closed on incompatible state rather than silently interpreting an older schema.
 
 ## License
 

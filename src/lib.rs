@@ -11,6 +11,7 @@ pub use manager::{
 };
 pub use model::{
     Capsule, CapsuleHealth, CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint,
-    Evidence, Integration, RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION,
+    CheckpointJournal, Cleanup, Evidence, Integration, RecoveryAction, ResultKind, ResultRef,
+    SCHEMA_VERSION,
 };
 pub use state::default_state_root;

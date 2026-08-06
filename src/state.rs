@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use tempfile::NamedTempFile;
 
 use crate::error::{Error, Result, io};
-use crate::model::{Capsule, CapsuleResult, SCHEMA_VERSION};
+use crate::model::{Capsule, CapsuleResult, CapsuleState, SCHEMA_VERSION};
 
 const JSON_CAP: u64 = 1024 * 1024;
 const PATCH_CAP: u64 = 64 * 1024 * 1024;
@@ -18,7 +18,11 @@ pub fn default_state_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CAPSULE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+    if cfg!(windows) {
+        if let Some(path) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path).join("change-capsule"));
+        }
+    } else if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path).join("change-capsule"));
     }
     if let Some(path) = env::var_os("HOME").filter(|value| !value.is_empty()) {
@@ -26,9 +30,6 @@ pub fn default_state_root() -> Result<PathBuf> {
             .join(".local")
             .join("state")
             .join("change-capsule"));
-    }
-    if let Some(path) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("change-capsule"));
     }
     Err(Error::InvalidInput(
         "cannot determine state directory; set CAPSULE_HOME".to_owned(),
@@ -41,8 +42,9 @@ pub(crate) struct StateStore {
 }
 
 impl StateStore {
-    pub(crate) fn open(root: PathBuf) -> Result<Self> {
-        ensure_private_dir(&root)?;
+    pub(crate) fn open(root: &Path) -> Result<Self> {
+        ensure_private_dir(root)?;
+        let root = fs::canonicalize(root).map_err(|error| io(root, error))?;
         let store = Self { root };
         ensure_private_dir(&store.capsules_dir())?;
         ensure_private_dir(&store.workspaces_dir())?;
@@ -78,10 +80,21 @@ impl StateStore {
     }
 
     pub(crate) fn prepare_capsule(&self, id: &str, project_key: &str) -> Result<()> {
-        let capsule_dir = self.capsule_dir(id)?;
-        ensure_private_dir(&capsule_dir)?;
+        validate_project_key(project_key)?;
+        validate_id(id)?;
         let project_dir = self.workspaces_dir().join(project_key);
-        ensure_private_dir(&project_dir)
+        ensure_private_dir(&project_dir)?;
+        let capsule_dir = self.capsule_dir(id)?;
+        match fs::create_dir(&capsule_dir) {
+            Ok(()) => set_private_dir_permissions(&capsule_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::UnsafeState(format!(
+                    "refusing to reuse existing capsule state: {}",
+                    capsule_dir.display()
+                )))
+            }
+            Err(error) => Err(io(&capsule_dir, error)),
+        }
     }
 
     pub(crate) fn lock_global(&self) -> Result<StateLock> {
@@ -123,24 +136,25 @@ impl StateStore {
             });
         }
         let path = self.capsule_dir(&capsule.id)?.join("capsule.json");
-        write_json_atomic(&path, capsule)
+        write_json_atomic_bounded(&path, capsule, JSON_CAP)
     }
 
     pub(crate) fn read_capsule(&self, id: &str) -> Result<Capsule> {
         let path = self.capsule_dir(id)?.join("capsule.json");
-        let capsule: Capsule = read_json_bounded(&path, JSON_CAP)?;
+        let capsule: Capsule = read_versioned_json(&path, JSON_CAP)?;
         if capsule.id != id {
             return Err(Error::UnsafeState(format!(
                 "manifest id {} does not match directory {id}",
                 capsule.id
             )));
         }
-        if capsule.schema_version > SCHEMA_VERSION {
+        if capsule.schema_version != SCHEMA_VERSION {
             return Err(Error::SchemaVersion {
                 found: capsule.schema_version,
                 supported: SCHEMA_VERSION,
             });
         }
+        validate_capsule_manifest(self, &capsule, id)?;
         Ok(capsule)
     }
 
@@ -170,13 +184,47 @@ impl StateStore {
     }
 
     pub(crate) fn write_result(&self, id: &str, result: &CapsuleResult) -> Result<()> {
+        if result.schema_version != SCHEMA_VERSION {
+            return Err(Error::SchemaVersion {
+                found: result.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if result.capsule_id != id {
+            return Err(Error::UnsafeState(format!(
+                "result id {} does not match capsule {id}",
+                result.capsule_id
+            )));
+        }
         let path = self.capsule_dir(id)?.join("result.json");
-        write_json_atomic(&path, result)
+        write_json_atomic_bounded(&path, result, JSON_CAP)
     }
 
     pub(crate) fn read_result(&self, id: &str) -> Result<CapsuleResult> {
         let path = self.capsule_dir(id)?.join("result.json");
-        read_json_bounded(&path, JSON_CAP)
+        let result: CapsuleResult = read_versioned_json(&path, JSON_CAP)?;
+        if result.schema_version != SCHEMA_VERSION {
+            return Err(Error::SchemaVersion {
+                found: result.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if result.capsule_id != id {
+            return Err(Error::UnsafeState(format!(
+                "result id {} does not match capsule {id}",
+                result.capsule_id
+            )));
+        }
+        if !valid_object_id(&result.base_commit)
+            || !valid_object_id(&result.head_commit)
+            || !valid_sha256(&result.patch_sha256)
+            || result.patch_bytes > PATCH_CAP
+        {
+            return Err(Error::UnsafeState(format!(
+                "result for capsule {id} contains malformed identity or size data"
+            )));
+        }
+        Ok(result)
     }
 
     pub(crate) fn write_patch(&self, id: &str, patch: &[u8]) -> Result<()> {
@@ -228,9 +276,113 @@ impl TemporaryIndex {
 impl Drop for TemporaryIndex {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-        let lock = PathBuf::from(format!("{}.lock", self.path.display()));
-        let _ = fs::remove_file(lock);
+        let mut lock = self.path.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = fs::remove_file(PathBuf::from(lock));
     }
+}
+
+fn validate_capsule_manifest(store: &StateStore, capsule: &Capsule, id: &str) -> Result<()> {
+    validate_project_key(&capsule.project_key)?;
+    let expected_workspace = store.workspace_path(&capsule.project_key, id)?;
+    let expected_branch = format!("capsule/{}", &id[4..]);
+    if malformed_capsule_identity(capsule, &expected_workspace, &expected_branch) {
+        return Err(Error::UnsafeState(format!(
+            "capsule {id} contains inconsistent or malformed identity data"
+        )));
+    }
+    if !lifecycle_journals_consistent(capsule) {
+        return Err(Error::UnsafeState(format!(
+            "capsule {id} contains an inconsistent lifecycle journal"
+        )));
+    }
+    if project_key(&capsule.repository_common_dir)? != capsule.project_key {
+        return Err(Error::UnsafeState(format!(
+            "capsule {id} contains an inconsistent repository identity"
+        )));
+    }
+    Ok(())
+}
+
+fn malformed_capsule_identity(
+    capsule: &Capsule,
+    expected_workspace: &Path,
+    expected_branch: &str,
+) -> bool {
+    capsule.workspace_path != expected_workspace
+        || capsule.branch != expected_branch
+        || !capsule.source_worktree.is_absolute()
+        || !capsule.repository_common_dir.is_absolute()
+        || capsule
+            .workspace_git_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        || (matches!(
+            capsule.state,
+            CapsuleState::Active
+                | CapsuleState::Checkpointing
+                | CapsuleState::Closed
+                | CapsuleState::Integrating
+                | CapsuleState::Integrated
+        ) && capsule.workspace_git_dir.is_none())
+        || !valid_object_id(&capsule.base_commit)
+        || capsule
+            .checkpoints
+            .iter()
+            .any(|checkpoint| !valid_object_id(&checkpoint.commit))
+        || capsule
+            .result
+            .as_ref()
+            .is_some_and(|result| !valid_result_ref(result))
+        || capsule.checkpoint.as_ref().is_some_and(|checkpoint| {
+            !valid_object_id(&checkpoint.head_before)
+                || !valid_object_id(&checkpoint.head_after)
+                || !valid_sha256(&checkpoint.patch_sha256)
+        })
+        || capsule.integration.as_ref().is_some_and(|integration| {
+            !integration.target_worktree.is_absolute()
+                || !integration.target_git_dir.is_absolute()
+                || integration.target_head_ref.is_empty()
+                || integration.target_head_ref.len() > 1024
+                || integration.target_head_ref.chars().any(char::is_control)
+                || !valid_object_id(&integration.target_head_before)
+                || integration
+                    .target_head_after
+                    .as_ref()
+                    .is_some_and(|head| !valid_object_id(head))
+        })
+        || capsule
+            .cleanup
+            .as_ref()
+            .and_then(|cleanup| cleanup.branch_head.as_ref())
+            .is_some_and(|head| !valid_object_id(head))
+}
+
+fn lifecycle_journals_consistent(capsule: &Capsule) -> bool {
+    let checkpoint_consistent = if capsule.checkpoint.is_some() {
+        matches!(
+            capsule.state,
+            CapsuleState::Checkpointing | CapsuleState::Dropping
+        )
+    } else {
+        capsule.state != CapsuleState::Checkpointing
+    };
+    let integration_consistent = if capsule.integration.is_some() {
+        matches!(
+            capsule.state,
+            CapsuleState::Integrating
+                | CapsuleState::Integrated
+                | CapsuleState::Dropping
+                | CapsuleState::Dropped
+        )
+    } else {
+        !matches!(
+            capsule.state,
+            CapsuleState::Integrating | CapsuleState::Integrated
+        )
+    };
+    let cleanup_consistent = (capsule.state == CapsuleState::Dropping) == capsule.cleanup.is_some();
+    checkpoint_consistent && integration_consistent && cleanup_consistent
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -245,6 +397,31 @@ fn validate_id(id: &str) -> Result<()> {
     } else {
         Err(Error::InvalidId(id.to_owned()))
     }
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_result_ref(result: &crate::model::ResultRef) -> bool {
+    valid_object_id(&result.head_commit)
+        && valid_sha256(&result.patch_sha256)
+        && valid_sha256(&result.result_sha256)
+        && result.patch_bytes <= PATCH_CAP
+}
+
+fn project_key(common_dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let path = common_dir
+        .to_str()
+        .ok_or_else(|| Error::NonUtf8Path(common_dir.to_path_buf()))?;
+    let digest = Sha256::digest(path.as_bytes());
+    Ok(hex::encode(&digest[..12]))
 }
 
 fn validate_project_key(key: &str) -> Result<()> {
@@ -294,9 +471,30 @@ fn reject_symlink_or_non_file_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn read_json_bounded<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
+fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
     let bytes = read_bytes_bounded(path, cap)?;
-    serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let found = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| {
+            Error::UnsafeState(format!(
+                "state JSON has no valid schema_version: {}",
+                path.display()
+            ))
+        })?;
+    if found != SCHEMA_VERSION {
+        return Err(Error::SchemaVersion {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    serde_json::from_value(value).map_err(|source| Error::Json {
         path: path.to_path_buf(),
         source,
     })
@@ -325,12 +523,18 @@ fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+fn write_json_atomic_bounded<T: Serialize>(path: &Path, value: &T, cap: u64) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| Error::Json {
         path: path.to_path_buf(),
         source,
     })?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > cap {
+        return Err(Error::InvalidInput(format!(
+            "state JSON exceeds the {cap}-byte limit: {}",
+            path.display()
+        )));
+    }
     write_bytes_atomic(path, &bytes)
 }
 

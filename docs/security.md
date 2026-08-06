@@ -35,7 +35,7 @@ Change Capsule resolves and retains an absolute Git executable path when a manag
 - disables filesystem monitors;
 - disables commit signing;
 - disables external diff commands;
-- captures stdout and stderr in temporary files with explicit bounds.
+- captures stdout and stderr through concurrently drained pipes with explicit in-memory bounds.
 
 Repository content may still contain attributes and configuration interpreted by Git. The first milestone assumes repositories are trusted at the same level as any normal local checkout.
 
@@ -44,6 +44,7 @@ Repository content may still contain attributes and configuration interpreted by
 Cleanup is destructive and therefore requires several identities to agree:
 
 - the manifest's canonical Git common directory;
+- the workspace's recorded and current canonical Git administration directory;
 - the workspace's current canonical root;
 - the registered Git worktree path;
 - the expected capsule branch;
@@ -64,7 +65,7 @@ Before integration:
 - target `HEAD` must equal the exact base commit;
 - author identity must be explicit and bounded.
 
-The integration transition is journaled before applying the patch. On apply or commit failure, the manager attempts a hard reset to the prior target commit. If rollback cannot be proven, the journal remains `integrating` for explicit diagnosis or conservative recovery.
+The integration transition records the target worktree and its exact Git administration directory before any target change. A candidate commit is constructed through a private index, checked against the sealed patch, and protected by a namespaced pending ref. The target is revalidated immediately before a fast-forward. Recovery finalizes only that exact commit or restores a provably untouched journal to `closed`; it never hard-resets unrelated target work.
 
 Change Capsule does not push, pull, fetch, rebase, merge, or run hooks.
 
@@ -72,19 +73,24 @@ Change Capsule does not push, pull, fetch, rebase, merge, or run hooks.
 
 A seal covers:
 
-- base commit;
-- result HEAD;
+- capsule ID, label, and opaque links;
+- creation and seal timestamps;
+- base commit and result HEAD;
+- checkpoint records;
 - complete binary-capable patch bytes;
 - SHA-256 patch digest;
 - changed paths;
-- evidence present at close time;
-- seal timestamp.
+- evidence present at close time.
 
 This detects accidental or same-user mutation after handoff. It does not provide authenticity against a same-user attacker who can rewrite both state and repository content. Signed attestations would be a separate feature.
 
 ## Known limits
 
-- Same-user replacement between individual checks remains possible on hostile filesystems; cleanup revalidates repository identity immediately before invoking Git, but the design is not a kernel-enforced capability system.
+- Sparse checkout and `skip-worktree` entries are rejected because they can make an absent tracked file indistinguishable from an intended deletion.
+- Dirty nested submodule worktrees are rejected because their internal content is not representable by a top-level Git patch; committed gitlink changes remain supported.
+- Unregistered embedded Git repositories are rejected rather than silently converted into accidental gitlinks.
+- State schema upgrades currently fail closed and require explicit migration or a fresh state root.
+- Same-user replacement between individual checks remains possible on hostile filesystems; cleanup and integration revalidate Git identities immediately before destructive or target-mutating operations, but the design is not a kernel-enforced capability system.
 - UTF-8 paths are required for the changed-path JSON inventory.
 - File locks are advisory.
 - Evidence is caller-asserted.

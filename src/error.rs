@@ -36,7 +36,7 @@ pub enum Error {
     GitOutputTooLarge { command: String, cap: usize },
     #[error("unsupported non-UTF-8 path: {0:?}")]
     NonUtf8Path(PathBuf),
-    #[error("state schema version {found} is newer than supported version {supported}")]
+    #[error("state schema version {found} is incompatible with supported version {supported}")]
     SchemaVersion { found: u32, supported: u32 },
     #[error("I/O error at {path}: {source}")]
     Io {

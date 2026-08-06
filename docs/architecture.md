@@ -53,7 +53,7 @@ Git remains the source of truth for repository content. Capsule state provides l
 
 ## State layout
 
-Default roots follow `CAPSULE_HOME`, `XDG_STATE_HOME`, `HOME`, then `LOCALAPPDATA`.
+Default roots follow `CAPSULE_HOME`, then `XDG_STATE_HOME`/`HOME` on Unix-like platforms or `LOCALAPPDATA`/`HOME` on Windows.
 
 ```text
 change-capsule/
@@ -77,55 +77,63 @@ The project key is a truncated SHA-256 of the canonical Git common-directory pat
 ## Lifecycle
 
 ```text
-              create worktree
- creating ───────────────────▶ active
-     │                           │
-     │ recover failed            │ close seals patch/result
-     ▼                           ▼
- orphaned                     closed
-                                 │
-                                 │ begin explicit integration
-                                 ▼
-                             integrating
-                              │       │
-                   rollback   │       │ commit+journal
-                              ▼       ▼
-                            closed  integrated
-                              │       │
-                              └───┬───┘
-                                  │ guarded cleanup
-                                  ▼
-                                dropped
+                    create worktree
+ creating ─────────────────────────────▶ active
+    │                                      │  checkpoint request
+    │ recover cannot prove ownership       ▼
+    ▼                                 checkpointing
+ orphaned                                  │  journal/ref recovery
+                                           ▼
+                                         active
+                                           │  close seals patch/result
+                                           ▼
+                                         closed
+                                           │  explicit integration
+                                           ▼
+                                       integrating
+                                       │         │
+                              no side  │         │ exact commit+journal
+                              effect   ▼         ▼
+                                     closed   integrated
+                                       │         │
+                                       └────┬────┘
+                                            │ guarded cleanup
+                                            ▼
+                                         dropping
+                                            │ journal recovery
+                                            ▼
+                                          dropped
 ```
 
-`creating` and `integrating` are write-ahead journal states. `recover` reconciles states where the Git side effect and manifest update were interrupted.
+`creating`, `checkpointing`, `integrating`, and `dropping` are journal states. Prepared checkpoint and integration commits are temporarily protected by namespaced Git refs until they become reachable from the capsule or target branch. `recover` completes only transitions whose worktree identity, Git ref or branch, commit parent, patch, and journal agree; ambiguous state remains available for explicit diagnosis.
 
 ## Result construction
 
 The result is always computed against the pinned base, not merely against `HEAD`.
 
-To include committed, staged, unstaged, untracked, deleted, renamed, and binary content without mutating the user's index, Change Capsule:
+To include committed, staged, unstaged, non-ignored untracked, deleted, renamed, and binary content without mutating the user's index, Change Capsule:
 
 1. creates a private temporary index;
 2. loads the base tree into that index;
 3. stages the complete worktree into the temporary index;
-4. emits `git diff --cached --binary --full-index <base>`;
+4. emits a deterministic `git diff --cached --binary --full-index --no-renames --no-color <base>`;
 5. emits a NUL-delimited changed-path inventory;
 6. hashes the patch with SHA-256.
 
-The real worktree index is not modified by status, diff, close, or drift checks.
+The real worktree index is not modified by status, diff, close, or drift checks. Git-ignored untracked files are intentionally outside the result unless the repository's ignore rules are changed to include them. Sparse/`skip-worktree` checkouts, dirty nested submodules, and unregistered embedded repositories are rejected rather than being misrepresented as complete snapshots.
 
 A closed result is:
 
 ```text
 schema version
-capsule ID
+capsule ID, label, and opaque links
 kind: no_change | commit | patch
 base and current HEAD commits
 complete patch SHA-256 and byte count
 changed paths
+checkpoint records
 caller-recorded evidence
-seal timestamp
+creation and seal timestamps
 ```
 
 `commit` means the worktree was clean and all changes from base were committed. `patch` means uncommitted state was included. Both carry the same complete patch and can be integrated identically.
@@ -140,7 +148,7 @@ Integration is intentionally conservative:
 - its `HEAD` must equal the capsule's exact pinned base;
 - the capsule workspace must still match its sealed HEAD and patch digest.
 
-The stored patch is applied with Git's indexed three-way apply and committed with an explicit identity. A journal record is written before the side effect. On failure, Change Capsule attempts to reset the target to its pre-integration commit and returns the capsule to `closed` only if rollback succeeds.
+The stored patch is applied to a private index and materialized as a candidate commit with an explicit identity. The candidate is checked for one exact parent and byte-for-byte reproduction of the sealed patch, protected by a namespaced pending ref, and only then fast-forwarded onto the target. The target Git directory, cleanliness, and `HEAD` are revalidated immediately before that side effect. Recovery finalizes only the exact journaled commit or restores a provably untouched target to `closed`; it never resets unrelated target work.
 
 No automatic rebase, merge, conflict resolution, or push occurs.
 

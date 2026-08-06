@@ -3,16 +3,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapsuleState {
     Creating,
+    Checkpointing,
     Active,
     Closed,
     Integrating,
     Integrated,
+    Dropping,
     Orphaned,
     Dropped,
 }
@@ -21,6 +23,8 @@ pub enum CapsuleState {
 pub struct Checkpoint {
     pub commit: String,
     pub message: String,
+    pub author_name: String,
+    pub author_email: String,
     pub created_at_unix: u64,
 }
 
@@ -38,6 +42,7 @@ pub struct ResultRef {
     pub kind: ResultKind,
     pub head_commit: String,
     pub patch_sha256: String,
+    pub result_sha256: String,
     pub patch_bytes: u64,
     pub changed_paths: usize,
     pub sealed_at_unix: u64,
@@ -54,12 +59,36 @@ pub enum ResultKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Integration {
     pub target_worktree: PathBuf,
+    pub target_git_dir: PathBuf,
+    pub target_head_ref: String,
     pub target_head_before: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_head_after: Option<String>,
+    pub commit_message: String,
+    pub author_name: String,
+    pub author_email: String,
     pub started_at_unix: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrated_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointJournal {
+    pub head_before: String,
+    pub head_after: String,
+    pub patch_sha256: String,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub started_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cleanup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_head: Option<String>,
+    pub require_sealed: bool,
+    pub started_at_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +102,8 @@ pub struct Capsule {
     pub state: CapsuleState,
     pub source_worktree: PathBuf,
     pub repository_common_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_git_dir: Option<PathBuf>,
     pub workspace_path: PathBuf,
     pub project_key: String,
     pub branch: String,
@@ -81,12 +112,16 @@ pub struct Capsule {
     pub updated_at_unix: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointJournal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<Integration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Cleanup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,13 +132,21 @@ pub struct Capsule {
 pub struct CapsuleResult {
     pub schema_version: u32,
     pub capsule_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, String>,
     pub kind: ResultKind,
     pub base_commit: String,
     pub head_commit: String,
     pub patch_sha256: String,
     pub patch_bytes: u64,
     pub changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+    pub created_at_unix: u64,
     pub sealed_at_unix: u64,
 }
 
@@ -115,6 +158,8 @@ pub enum CapsuleHealth {
     ForeignWorktree,
     DriftedAfterClose,
     IncompleteCreation,
+    IncompleteCheckpoint,
+    Orphaned,
     Dropped,
 }
 
@@ -128,6 +173,8 @@ pub struct CapsuleStatus {
     pub dirty: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commits_ahead: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -175,11 +175,51 @@ impl From<AuthorArgs> for Author {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let arguments: Vec<_> = std::env::args_os().collect();
+    let json_mode = arguments.iter().any(|argument| argument == "--json");
+    let cli = match Cli::try_parse_from(&arguments) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = u8::try_from(error.exit_code()).unwrap_or(2);
+            if exit_code == 0 {
+                if json_mode {
+                    let payload = json!({
+                        "ok": true,
+                        "kind": "cli_help",
+                        "output": error.to_string(),
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string(&payload).unwrap_or_else(|_| {
+                            "{\"ok\":false,\"error\":\"failed to serialize CLI help\",\"kind\":\"internal\"}"
+                                .to_owned()
+                        })
+                    );
+                } else {
+                    let _ = error.print();
+                }
+            } else if json_mode {
+                let payload = json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                    "kind": "cli",
+                });
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&payload).unwrap_or_else(|_| {
+                        "{\"ok\":false,\"error\":\"failed to serialize CLI error\",\"kind\":\"internal\"}"
+                            .to_owned()
+                    })
+                );
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(exit_code);
+        }
+    };
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let json_mode = std::env::args_os().any(|argument| argument == "--json");
             if json_mode {
                 let payload = json!({
                     "ok": false,
@@ -214,7 +254,15 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             let mut options = CreateOptions::new(arguments.repo);
             options.base = arguments.base;
             options.label = arguments.label;
-            options.links = arguments.link.into_iter().collect::<BTreeMap<_, _>>();
+            let mut links = BTreeMap::new();
+            for (key, value) in arguments.link {
+                if links.insert(key.clone(), value).is_some() {
+                    return Err(change_capsule::Error::InvalidInput(format!(
+                        "duplicate link key: {key:?}"
+                    )));
+                }
+            }
+            options.links = links;
             let capsule = manager.create(options)?;
             if cli.json {
                 print_json(&capsule)?;
@@ -266,11 +314,17 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                     println!("{}", output.display());
                 }
             } else if cli.json {
-                let status = manager.status(&arguments.id)?;
+                let changed_paths = match manager.result(&arguments.id) {
+                    Ok(result) => result.changed_paths,
+                    Err(change_capsule::Error::InvalidState { .. }) => {
+                        manager.status(&arguments.id)?.changed_paths
+                    }
+                    Err(error) => return Err(error),
+                };
                 print_json(&json!({
                     "id": arguments.id,
                     "bytes": patch.len(),
-                    "changed_paths": status.changed_paths,
+                    "changed_paths": changed_paths,
                     "hint": "pass --output <path> to write patch bytes",
                 }))?;
             } else {
@@ -390,21 +444,43 @@ fn print_json<T: Serialize>(value: &T) -> change_capsule::Result<()> {
 }
 
 fn write_output_file(path: &Path, bytes: &[u8]) -> change_capsule::Result<()> {
-    if path.exists() {
-        return Err(change_capsule::Error::InvalidInput(format!(
-            "refusing to overwrite output file: {}",
-            path.display()
-        )));
-    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| change_capsule::Error::Io {
         path: parent.to_path_buf(),
         source,
     })?;
-    fs::write(path, bytes).map_err(|source| change_capsule::Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| change_capsule::Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .write_all(bytes)
+        .map_err(|source| change_capsule::Error::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|source| change_capsule::Error::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        if error.error.kind() == io::ErrorKind::AlreadyExists {
+            change_capsule::Error::InvalidInput(format!(
+                "refusing to overwrite output file: {}",
+                path.display()
+            ))
+        } else {
+            change_capsule::Error::Io {
+                path: path.to_path_buf(),
+                source: error.error,
+            }
+        }
+    })?;
+    Ok(())
 }
 
 fn error_kind(error: &change_capsule::Error) -> &'static str {

@@ -1,10 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-
-use tempfile::tempfile;
+use std::thread;
 
 use crate::error::{Error, Result, io};
 
@@ -16,6 +15,7 @@ const PATCH_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 pub(crate) struct Repository {
     pub(crate) worktree: PathBuf,
     pub(crate) common_dir: PathBuf,
+    pub(crate) git_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -65,23 +65,38 @@ impl Git {
             path,
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
+        let git_dir = self.text(
+            path,
+            ["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+        )?;
         Ok(Repository {
             worktree: canonical_existing(Path::new(worktree.trim()))?,
             common_dir: canonical_existing(Path::new(common_dir.trim()))?,
+            git_dir: canonical_existing(Path::new(git_dir.trim()))?,
         })
     }
 
     pub(crate) fn resolve_commit(&self, repo: &Path, revision: &str) -> Result<String> {
-        if revision.is_empty() || revision.len() > 512 || revision.contains('\0') {
+        if revision.is_empty()
+            || revision.len() > 512
+            || revision.starts_with('-')
+            || revision.chars().any(char::is_control)
+        {
             return Err(Error::InvalidInput("invalid base revision".to_owned()));
         }
-        Ok(self
+        let commit = self
             .text(
                 repo,
                 ["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
             )?
             .trim()
-            .to_owned())
+            .to_owned();
+        if !valid_object_id(&commit) {
+            return Err(Error::InvalidInput(
+                "Git returned a malformed base commit ID".to_owned(),
+            ));
+        }
+        Ok(commit)
     }
 
     pub(crate) fn add_worktree(
@@ -115,8 +130,69 @@ impl Git {
         self.success(repo, args)
     }
 
-    pub(crate) fn delete_branch(&self, repo: &Path, branch: &str) -> Result<()> {
-        self.success(repo, ["branch", "-D", branch])
+    pub(crate) fn branch_head(&self, repo: &Path, branch: &str) -> Result<Option<String>> {
+        self.ref_head(repo, &format!("refs/heads/{branch}"))
+    }
+
+    pub(crate) fn create_ref(&self, repo: &Path, reference: &str, commit: &str) -> Result<()> {
+        let zero = "0".repeat(commit.len());
+        self.success(repo, ["update-ref", reference, commit, &zero])
+    }
+
+    pub(crate) fn delete_ref_if_matches(
+        &self,
+        repo: &Path,
+        reference: &str,
+        expected: &str,
+    ) -> Result<()> {
+        let Some(current) = self.ref_head(repo, reference)? else {
+            return Ok(());
+        };
+        if current != expected {
+            return Err(Error::UnsafeState(format!(
+                "refusing to delete ref {reference}: expected {expected}, found {current}"
+            )));
+        }
+        self.success(repo, ["update-ref", "-d", reference, expected])
+    }
+
+    pub(crate) fn ref_head(&self, repo: &Path, reference: &str) -> Result<Option<String>> {
+        let value = self.text(
+            repo,
+            ["for-each-ref", "--format=%(objectname)", "--", reference],
+        )?;
+        let value = value.trim();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value.to_owned()))
+        }
+    }
+
+    pub(crate) fn delete_branch_if_matches(
+        &self,
+        repo: &Path,
+        branch: &str,
+        expected: &str,
+    ) -> Result<()> {
+        let Some(current) = self.branch_head(repo, branch)? else {
+            return Ok(());
+        };
+        if current != expected {
+            return Err(Error::UnsafeState(format!(
+                "refusing to delete branch {branch}: expected {expected}, found {current}"
+            )));
+        }
+        if self
+            .registered_worktrees(repo)?
+            .iter()
+            .any(|record| record.branch.as_deref() == Some(branch))
+        {
+            return Err(Error::UnsafeState(format!(
+                "refusing to delete checked-out branch {branch}"
+            )));
+        }
+        self.delete_ref_if_matches(repo, &format!("refs/heads/{branch}"), expected)
     }
 
     pub(crate) fn registered_worktrees(&self, repo: &Path) -> Result<Vec<WorktreeRecord>> {
@@ -131,6 +207,20 @@ impl Git {
             .to_owned())
     }
 
+    pub(crate) fn head_ref(&self, worktree: &Path) -> Result<String> {
+        let reference = self
+            .text(worktree, ["rev-parse", "--symbolic-full-name", "HEAD"])?
+            .trim()
+            .to_owned();
+        if reference.is_empty() || reference.len() > 1024 || reference.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidInput(
+                "Git returned an invalid HEAD reference".to_owned(),
+            ));
+        }
+        Ok(reference)
+    }
+
     pub(crate) fn branch(&self, worktree: &Path) -> Result<String> {
         Ok(self
             .text(worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"])?
@@ -139,13 +229,74 @@ impl Git {
     }
 
     pub(crate) fn clean(&self, worktree: &Path) -> Result<bool> {
-        Ok(self
-            .output(
-                worktree,
-                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                None,
-            )?
-            .is_empty())
+        Ok(self.status_bytes(worktree, false)?.is_empty())
+    }
+
+    pub(crate) fn sparse_checkout(&self, worktree: &Path) -> Result<bool> {
+        let value = self.text(
+            worktree,
+            [
+                "config",
+                "--type=bool",
+                "--default=false",
+                "--get",
+                "core.sparseCheckout",
+            ],
+        )?;
+        match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(Error::InvalidInput(format!(
+                "Git returned invalid core.sparseCheckout value: {other:?}"
+            ))),
+        }
+    }
+
+    pub(crate) fn hidden_index_entries(&self, worktree: &Path) -> Result<bool> {
+        let output = self.output_with_env(
+            worktree,
+            ["ls-files", "-v", "-z"],
+            &[],
+            PATCH_OUTPUT_CAP,
+            None,
+        )?;
+        Ok(output.split(|byte| *byte == 0).any(|entry| {
+            entry
+                .first()
+                .is_some_and(|tag| *tag == b'S' || tag.is_ascii_lowercase())
+        }))
+    }
+
+    pub(crate) fn dirty_submodules(&self, worktree: &Path) -> Result<bool> {
+        Ok(self.status_bytes(worktree, false)? != self.status_bytes(worktree, true)?)
+    }
+
+    fn status_bytes(&self, worktree: &Path, ignore_dirty_submodules: bool) -> Result<Vec<u8>> {
+        let mut arguments = vec!["status", "--porcelain=v2", "-z", "--untracked-files=all"];
+        arguments.push(if ignore_dirty_submodules {
+            "--ignore-submodules=dirty"
+        } else {
+            "--ignore-submodules=none"
+        });
+        self.output(worktree, arguments, None)
+    }
+
+    pub(crate) fn ignored_paths(&self, worktree: &Path) -> Result<Vec<String>> {
+        let output = self.output_with_env(
+            worktree,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+            &[],
+            SMALL_OUTPUT_CAP,
+            None,
+        )?;
+        parse_nul_strings(&output)
     }
 
     pub(crate) fn commits_ahead(&self, worktree: &Path, base: &str) -> Result<u64> {
@@ -156,11 +307,56 @@ impl Git {
         })
     }
 
+    pub(crate) fn parents(&self, worktree: &Path, commit: &str) -> Result<Vec<String>> {
+        let value = self.text(worktree, ["rev-list", "--parents", "-n", "1", commit])?;
+        let mut fields = value.split_whitespace();
+        let Some(resolved) = fields.next() else {
+            return Err(Error::InvalidInput(
+                "Git returned an empty commit parent record".to_owned(),
+            ));
+        };
+        if resolved != commit || !valid_object_id(resolved) {
+            return Err(Error::InvalidInput(format!(
+                "Git resolved unexpected commit {resolved} while inspecting {commit}"
+            )));
+        }
+        Ok(fields.map(str::to_owned).collect())
+    }
+
     pub(crate) fn snapshot(&self, worktree: &Path, base: &str, index: &Path) -> Result<Snapshot> {
         let index_value = index.as_os_str().to_owned();
         let env = [(OsString::from("GIT_INDEX_FILE"), index_value)];
         self.success_with_env(worktree, ["read-tree", base], &env)?;
         self.success_with_env(worktree, ["add", "-A", "--", "."], &env)?;
+        let raw = self.output_with_env(
+            worktree,
+            [
+                "diff",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-renames",
+                base,
+                "--",
+            ],
+            &env,
+            PATCH_OUTPUT_CAP,
+            None,
+        )?;
+        for path in parse_changed_gitlinks(&raw)? {
+            self.output_with_env(
+                worktree,
+                ["submodule", "status", "--cached", "--", &path],
+                &env,
+                SMALL_OUTPUT_CAP,
+                None,
+            )
+            .map_err(|_| {
+                Error::InvalidInput(format!(
+                    "unregistered embedded Git repository cannot be represented safely: {path}"
+                ))
+            })?;
+        }
         let patch = self.output_with_env(
             worktree,
             [
@@ -169,6 +365,9 @@ impl Git {
                 "--binary",
                 "--full-index",
                 "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
                 base,
                 "--",
             ],
@@ -178,7 +377,15 @@ impl Git {
         )?;
         let paths = self.output_with_env(
             worktree,
-            ["diff", "--cached", "--name-only", "-z", base, "--"],
+            [
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base,
+                "--",
+            ],
             &env,
             SMALL_OUTPUT_CAP,
             None,
@@ -190,17 +397,49 @@ impl Git {
         })
     }
 
-    pub(crate) fn checkpoint(
+    pub(crate) fn commit_snapshot(
         &self,
-        worktree: &Path,
-        message: &str,
-        name: &str,
-        email: &str,
-    ) -> Result<String> {
-        self.success(worktree, ["add", "-A", "--", "."])?;
-        let env = identity_env(name, email);
-        self.success_with_env(worktree, ["commit", "--no-verify", "-m", message], &env)?;
-        self.head(worktree)
+        repo: &Path,
+        base: &str,
+        commit: &str,
+    ) -> Result<Snapshot> {
+        let patch = self.output_with_env(
+            repo,
+            [
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
+                base,
+                commit,
+                "--",
+            ],
+            &[],
+            PATCH_OUTPUT_CAP,
+            None,
+        )?;
+        let paths = self.output_with_env(
+            repo,
+            [
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base,
+                commit,
+                "--",
+            ],
+            &[],
+            SMALL_OUTPUT_CAP,
+            None,
+        )?;
+        Ok(Snapshot {
+            patch,
+            changed_paths: parse_nul_strings(&paths)?,
+        })
     }
 
     pub(crate) fn commit_patch(&self, request: &CommitPatch<'_>) -> Result<String> {
@@ -225,6 +464,26 @@ impl Git {
             Some(request.message.as_bytes()),
         )?;
         Ok(commit.trim().to_owned())
+    }
+
+    pub(crate) fn fast_forward(&self, worktree: &Path, commit: &str) -> Result<()> {
+        self.success(worktree, ["merge", "--ff-only", "--no-edit", commit])
+    }
+
+    pub(crate) fn advance_branch(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        commit: &str,
+        previous: &str,
+    ) -> Result<()> {
+        let reference = format!("refs/heads/{branch}");
+        self.success(worktree, ["update-ref", &reference, commit, previous])?;
+        self.success(worktree, ["reset", "--mixed", commit])
+    }
+
+    pub(crate) fn reset_index(&self, worktree: &Path, commit: &str) -> Result<()> {
+        self.success(worktree, ["reset", "--mixed", commit])
     }
 
     pub(crate) fn reset_hard(&self, worktree: &Path, commit: &str) -> Result<()> {
@@ -308,23 +567,20 @@ impl Git {
             .map(|argument| argument.as_ref().to_owned())
             .collect();
         let command_label = render_command(&self.executable, &arguments);
-        let mut stdout = tempfile().map_err(|error| io("temporary Git stdout", error))?;
-        let mut stderr = tempfile().map_err(|error| io("temporary Git stderr", error))?;
-        let stdout_child = stdout
-            .try_clone()
-            .map_err(|error| io("temporary Git stdout", error))?;
-        let stderr_child = stderr
-            .try_clone()
-            .map_err(|error| io("temporary Git stderr", error))?;
+        let hooks_directory =
+            tempfile::tempdir().map_err(|error| io("temporary Git hooks directory", error))?;
+        let mut hooks_config = OsString::from("core.hooksPath=");
+        hooks_config.push(hooks_directory.path());
 
         let mut command = Command::new(&self.executable);
         command.current_dir(directory);
         command.env_clear();
         command.envs(scrubbed_environment());
         command.envs(extra_env.iter().cloned());
+        command.arg("--no-optional-locks");
         command.args([
             OsString::from("-c"),
-            OsString::from("core.hooksPath="),
+            hooks_config,
             OsString::from("-c"),
             OsString::from("core.fsmonitor=false"),
             OsString::from("-c"),
@@ -333,8 +589,8 @@ impl Git {
             OsString::from("diff.external="),
         ]);
         command.args(&arguments);
-        command.stdout(Stdio::from(stdout_child));
-        command.stderr(Stdio::from(stderr_child));
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
         command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -344,31 +600,45 @@ impl Git {
         let mut child = command
             .spawn()
             .map_err(|error| io(&self.executable, error))?;
-        if let Some(bytes) = input {
-            let mut stdin = child.stdin.take().ok_or(Error::CaptureWorker)?;
-            stdin
-                .write_all(bytes)
-                .map_err(|error| io("Git stdin", error))?;
-        }
+        let child_stdout = child.stdout.take().ok_or(Error::CaptureWorker)?;
+        let child_stderr = child.stderr.take().ok_or(Error::CaptureWorker)?;
+        let stdout_worker = thread::spawn(move || capture_bounded(child_stdout, stdout_cap));
+        let stderr_worker = thread::spawn(move || capture_bounded(child_stderr, STDERR_CAP));
+
+        let input_error = if let Some(bytes) = input {
+            match child.stdin.take() {
+                Some(mut stdin) => stdin.write_all(bytes).err(),
+                None => Some(std::io::Error::other("Git stdin pipe was unavailable")),
+            }
+        } else {
+            None
+        };
         let status = child.wait().map_err(|error| io(&self.executable, error))?;
-        let stderr_bytes = read_file_bounded(&mut stderr, STDERR_CAP)?;
+        let stdout = stdout_worker
+            .join()
+            .map_err(|_| Error::CaptureWorker)?
+            .map_err(|error| io("Git stdout", error))?;
+        let stderr = stderr_worker
+            .join()
+            .map_err(|_| Error::CaptureWorker)?
+            .map_err(|error| io("Git stderr", error))?;
         if !status.success() {
             return Err(Error::Git {
                 command: command_label,
                 status: status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&stderr_bytes).trim().to_owned(),
+                stderr: String::from_utf8_lossy(&stderr.bytes).trim().to_owned(),
             });
         }
-        let stdout_metadata = stdout
-            .metadata()
-            .map_err(|error| io("temporary Git stdout", error))?;
-        if stdout_metadata.len() > stdout_cap as u64 {
+        if let Some(error) = input_error {
+            return Err(io("Git stdin", error));
+        }
+        if stdout.exceeded {
             return Err(Error::GitOutputTooLarge {
                 command: command_label,
                 cap: stdout_cap,
             });
         }
-        read_file_bounded(&mut stdout, stdout_cap)
+        Ok(stdout.bytes)
     }
 }
 
@@ -416,21 +686,38 @@ fn executable_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn canonical_existing(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|error| io(path, error))
 }
 
-fn read_file_bounded(file: &mut std::fs::File, cap: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| io("temporary Git output", error))?;
-    let mut bytes = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io("temporary Git output", error))?;
+#[derive(Debug)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn capture_bounded(mut stream: impl Read, cap: usize) -> std::io::Result<CapturedOutput> {
+    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = cap.saturating_add(1).saturating_sub(bytes.len());
+        let retained = count.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        exceeded |= count > retained || bytes.len() > cap;
+    }
     if bytes.len() > cap {
         bytes.truncate(cap);
     }
-    Ok(bytes)
+    Ok(CapturedOutput { bytes, exceeded })
 }
 
 fn render_command(executable: &Path, arguments: &[OsString]) -> String {
@@ -440,6 +727,39 @@ fn render_command(executable: &Path, arguments: &[OsString]) -> String {
         rendered.push_str(&argument.to_string_lossy());
     }
     rendered
+}
+
+fn parse_changed_gitlinks(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut fields = bytes
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    let mut paths = Vec::new();
+    while let Some(header) = fields.next() {
+        let header = std::str::from_utf8(header).map_err(|_| {
+            Error::InvalidInput("Git returned invalid raw diff metadata".to_owned())
+        })?;
+        let mut metadata = header.split_whitespace();
+        let _old_mode = metadata.next().unwrap_or_default().trim_start_matches(':');
+        let new_mode = metadata.next().unwrap_or_default();
+        let _old_object = metadata.next();
+        let _new_object = metadata.next();
+        let status = metadata.next().unwrap_or_default();
+        let path = fields.next().ok_or_else(|| {
+            Error::InvalidInput("Git returned an incomplete raw diff record".to_owned())
+        })?;
+        if status.starts_with('R') || status.starts_with('C') {
+            return Err(Error::UnsafeState(
+                "Git returned rename metadata despite --no-renames".to_owned(),
+            ));
+        }
+        if new_mode == "160000" {
+            paths.push(
+                String::from_utf8(path.to_vec())
+                    .map_err(|_| Error::InvalidInput("Git path is not valid UTF-8".to_owned()))?,
+            );
+        }
+    }
+    Ok(paths)
 }
 
 fn parse_nul_strings(bytes: &[u8]) -> Result<Vec<String>> {
