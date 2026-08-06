@@ -487,6 +487,117 @@ fn duplicate_link_keys_are_rejected_instead_of_silently_overwritten() {
 }
 
 #[test]
+fn ignored_content_added_after_close_is_detected_as_result_drift() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("ignored-drift");
+    fs::write(capsule.workspace_path.join(".gitignore"), "ignored.log\n")
+        .expect("write ignore rule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+    fs::write(
+        capsule.workspace_path.join("ignored.log"),
+        "late ignored content\n",
+    )
+    .expect("write ignored content after close");
+
+    let status = manager.status(&capsule.id).expect("drift status");
+    assert_eq!(status.health, CapsuleHealth::DriftedAfterClose);
+    assert_eq!(status.sealed, Some(false));
+    assert_eq!(status.ignored_paths, vec!["ignored.log"]);
+}
+
+#[test]
+fn malformed_or_missing_result_artifacts_report_drift_in_status() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let first = fixture.create("malformed-result");
+    fs::write(first.workspace_path.join("shared.txt"), "sealed\n").expect("edit capsule");
+    manager
+        .close(&first.id, CloseOptions::default())
+        .expect("close capsule");
+    fs::write(result_path(&fixture, &first.id), "not JSON\n").expect("corrupt result JSON");
+
+    let status = manager
+        .status(&first.id)
+        .expect("malformed artifact status");
+    assert_eq!(status.health, CapsuleHealth::DriftedAfterClose);
+    assert_eq!(status.sealed, Some(false));
+
+    let second = fixture.create("missing-patch");
+    fs::write(second.workspace_path.join("shared.txt"), "sealed again\n").expect("edit capsule");
+    manager
+        .close(&second.id, CloseOptions::default())
+        .expect("close second capsule");
+    fs::remove_file(
+        fixture
+            .state
+            .join("capsules")
+            .join(&second.id)
+            .join("result.patch"),
+    )
+    .expect("remove patch");
+    let status = manager.status(&second.id).expect("missing artifact status");
+    assert_eq!(status.health, CapsuleHealth::DriftedAfterClose);
+    assert_eq!(status.sealed, Some(false));
+}
+
+#[test]
+fn integration_into_a_detached_target_preserves_detached_head_identity() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("detached-target");
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "detached result\n",
+    )
+    .expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let detached = fixture.temp.path().join("detached-target");
+    git_success(
+        &fixture.repo,
+        [
+            "worktree",
+            "add",
+            "--detach",
+            detached.to_str().expect("utf8 detached path"),
+            "HEAD",
+        ],
+    );
+    let integrated = manager
+        .integrate(
+            &capsule.id,
+            &IntegrateOptions {
+                target: detached.clone(),
+                message: Some("integrate detached".to_owned()),
+                author: test_author(),
+            },
+        )
+        .expect("integrate into detached target");
+    assert_eq!(integrated.state, CapsuleState::Integrated);
+    assert_eq!(
+        integrated
+            .integration
+            .as_ref()
+            .expect("integration journal")
+            .target_head_ref,
+        "HEAD"
+    );
+    assert_eq!(
+        git_text(&detached, ["rev-parse", "--symbolic-full-name", "HEAD"]),
+        "HEAD"
+    );
+    assert_eq!(
+        fs::read_to_string(detached.join("shared.txt")).expect("read detached result"),
+        "detached result\n"
+    );
+}
+
+#[test]
 fn result_seal_covers_provenance_and_rejects_metadata_tampering() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

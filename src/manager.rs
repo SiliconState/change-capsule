@@ -192,22 +192,16 @@ impl CapsuleManager {
     pub fn diff(&self, id: &str) -> Result<Vec<u8>> {
         let capsule = self.show(id)?;
         match capsule.state {
-            CapsuleState::Closed
-            | CapsuleState::Integrating
-            | CapsuleState::Integrated
-            | CapsuleState::Dropping
-                if capsule.result.is_some() =>
-            {
-                self.sealed_artifacts(&capsule)
-                    .and_then(|(matches, _, patch)| {
-                        if matches {
-                            Ok(patch)
-                        } else {
-                            Err(Error::ResultDrift(capsule.id.clone()))
-                        }
-                    })
-            }
-            CapsuleState::Dropped if capsule.result.is_some() => self
+            CapsuleState::Closed | CapsuleState::Integrating | CapsuleState::Integrated => self
+                .sealed_artifacts(&capsule)
+                .and_then(|(matches, _, patch)| {
+                    if matches {
+                        Ok(patch)
+                    } else {
+                        Err(Error::ResultDrift(capsule.id.clone()))
+                    }
+                }),
+            CapsuleState::Dropping | CapsuleState::Dropped if capsule.result.is_some() => self
                 .sealed_artifacts(&capsule)
                 .and_then(|(matches, _, patch)| {
                     if matches {
@@ -224,11 +218,7 @@ impl CapsuleManager {
             CapsuleState::Creating | CapsuleState::Orphaned => {
                 Err(invalid_state(&capsule, "active or a sealed result"))
             }
-            CapsuleState::Closed
-            | CapsuleState::Integrating
-            | CapsuleState::Integrated
-            | CapsuleState::Dropping => Err(invalid_state(&capsule, "a sealed result")),
-            CapsuleState::Dropped => Ok(Vec::new()),
+            CapsuleState::Dropping | CapsuleState::Dropped => Ok(Vec::new()),
         }
     }
 
@@ -362,6 +352,7 @@ impl CapsuleManager {
             ));
         }
         let snapshot = self.snapshot(&capsule)?;
+        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
         let head = self.git.head(&capsule.workspace_path)?;
         let clean = self.git.clean(&capsule.workspace_path)?;
         let kind = if snapshot.patch.is_empty() {
@@ -384,6 +375,7 @@ impl CapsuleManager {
             patch_sha256: digest.clone(),
             patch_bytes: snapshot.patch.len() as u64,
             changed_paths: snapshot.changed_paths.clone(),
+            ignored_paths,
             checkpoints: capsule.checkpoints.clone(),
             evidence: capsule.evidence.clone(),
             created_at_unix: capsule.created_at_unix,
@@ -683,8 +675,6 @@ impl CapsuleManager {
             CapsuleHealth::IncompleteCreation
         } else if capsule.state == CapsuleState::Checkpointing {
             CapsuleHealth::IncompleteCheckpoint
-        } else if capsule.state == CapsuleState::Orphaned {
-            CapsuleHealth::Orphaned
         } else {
             CapsuleHealth::Healthy
         };
@@ -801,12 +791,18 @@ impl CapsuleManager {
         snapshot: &crate::git::Snapshot,
         head: &str,
     ) -> Result<bool> {
-        let (artifacts_match, result, stored_patch) = self.sealed_artifacts(capsule)?;
+        let (artifacts_match, result, stored_patch) = match self.sealed_artifacts(capsule) {
+            Ok(artifacts) => artifacts,
+            Err(Error::ResultDrift(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
         Ok(artifacts_match
             && result.head_commit == head
             && result.patch_sha256 == sha256_hex(&snapshot.patch)
             && result.patch_bytes == snapshot.patch.len() as u64
             && result.changed_paths == snapshot.changed_paths
+            && result.ignored_paths == ignored_paths
             && stored_patch == snapshot.patch)
     }
 
@@ -814,8 +810,14 @@ impl CapsuleManager {
         let Some(reference) = capsule.result.as_ref() else {
             return Err(invalid_state(capsule, "a sealed result"));
         };
-        let result = self.store.read_result(&capsule.id)?;
-        let stored_patch = self.store.read_patch(&capsule.id)?;
+        let result = self
+            .store
+            .read_result(&capsule.id)
+            .map_err(|error| artifact_error(&capsule.id, error))?;
+        let stored_patch = self
+            .store
+            .read_patch(&capsule.id)
+            .map_err(|error| artifact_error(&capsule.id, error))?;
         let stored_digest = sha256_hex(&stored_patch);
         let matches = reference.kind == result.kind
             && reference.head_commit == result.head_commit
@@ -1253,6 +1255,18 @@ impl CapsuleManager {
             ));
         }
         Ok(None)
+    }
+}
+
+fn artifact_error(id: &str, error: Error) -> Error {
+    match error {
+        Error::Io { ref source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            Error::ResultDrift(id.to_owned())
+        }
+        Error::Json { .. } | Error::UnsafeState(_) | Error::SchemaVersion { .. } => {
+            Error::ResultDrift(id.to_owned())
+        }
+        other => other,
     }
 }
 

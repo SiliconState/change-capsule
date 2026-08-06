@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +143,8 @@ pub struct CapsuleResult {
     pub patch_bytes: u64,
     pub changed_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
@@ -159,7 +161,6 @@ pub enum CapsuleHealth {
     DriftedAfterClose,
     IncompleteCreation,
     IncompleteCheckpoint,
-    Orphaned,
     Dropped,
 }
 
