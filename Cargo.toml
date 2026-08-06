@@ -1,0 +1,46 @@
+[package]
+name = "change-capsule"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Agent-neutral, recoverable change attempts backed by Git worktrees"
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/change-capsule"
+keywords = ["agents", "git", "worktree", "automation", "provenance"]
+categories = ["command-line-utilities", "development-tools"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[lib]
+name = "change_capsule"
+path = "src/lib.rs"
+
+[[bin]]
+name = "capsule"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+fs2 = "0.4"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+ulid = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
