@@ -14,8 +14,8 @@ use crate::model::{
     AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind,
     AuditEvent, AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth,
     CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint, CheckpointJournal,
-    Cleanup, Evidence, ExportReport, Integration, MetricsSnapshot, MigrationReport, RecoveryAction,
-    ResultKind, ResultRef, SCHEMA_VERSION, StateInspection,
+    Cleanup, Evidence, ExportReport, Integration, MetricsSnapshot, RecoveryAction, ResultKind,
+    ResultRef, SCHEMA_VERSION, StateInspection,
 };
 use crate::policy::{Policy, PolicyReport};
 use crate::state::{StateStore, default_state_root};
@@ -26,12 +26,20 @@ const LINK_VALUE_CAP: usize = 4096;
 const MESSAGE_CAP: usize = 16 * 1024;
 const EVIDENCE_COMMAND_CAP: usize = 16 * 1024;
 const EVIDENCE_SUMMARY_CAP: usize = 64 * 1024;
-const DEFAULT_AUTHOR_NAME: &str = "Change Capsule";
+const EVIDENCE_COUNT_CAP: usize = 64;
+const EVIDENCE_TOTAL_BYTES_CAP: usize = 256 * 1024;
+const DEFAULT_AUTHOR_NAME: &str = "Capsule";
 const DEFAULT_AUTHOR_EMAIL: &str = "capsule@localhost";
 
+/// Commit identity used for checkpoints and integration commits.
+///
+/// Always explicit: this crate never reads the ambient Git configuration to
+/// decide who authored a change it creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Author {
+    /// Name recorded as both author and committer.
     pub name: String,
+    /// Email recorded as both author and committer. Must contain `@`.
     pub email: String,
 }
 
@@ -44,15 +52,21 @@ impl Default for Author {
     }
 }
 
+/// Inputs for creating a capsule.
 #[derive(Debug, Clone)]
 pub struct CreateOptions {
+    /// Any path inside the source Git repository.
     pub repository: PathBuf,
+    /// Revision to pin, resolved to an immutable commit before work starts.
     pub base: String,
+    /// Optional human-facing description of the attempt.
     pub label: Option<String>,
+    /// Opaque caller metadata, at most 32 entries. No key is privileged.
     pub links: BTreeMap<String, String>,
 }
 
 impl CreateOptions {
+    /// Options for a capsule based on the repository's current `HEAD`.
     pub fn new(repository: impl Into<PathBuf>) -> Self {
         Self {
             repository: repository.into(),
@@ -63,37 +77,63 @@ impl CreateOptions {
     }
 }
 
+/// Inputs for committing the workspace's current state as a checkpoint.
 #[derive(Debug, Clone)]
 pub struct CheckpointOptions {
+    /// Message for the checkpoint commit.
     pub message: String,
+    /// Identity to record on the commit.
     pub author: Author,
 }
 
+/// A verification claim to attach to a capsule.
 #[derive(Debug, Clone)]
 pub struct EvidenceInput {
+    /// Exact command the caller ran.
     pub command: String,
+    /// Exit status the caller observed.
     pub exit_code: i32,
+    /// Optional bounded summary of what happened.
     pub summary: Option<String>,
 }
 
+/// Requirements a capsule must satisfy before its result is sealed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CloseOptions {
+    /// Refuse to seal unless evidence exists and every exit code is zero.
     pub require_successful_evidence: bool,
 }
 
+/// Inputs for applying a sealed result to a target worktree.
 #[derive(Debug, Clone)]
 pub struct IntegrateOptions {
+    /// Any path inside the destination worktree.
+    ///
+    /// It must belong to the same repository, be clean, and still be at the
+    /// capsule's pinned base.
     pub target: PathBuf,
+    /// Commit subject. Defaults to the capsule label, then a generated subject.
     pub message: Option<String>,
+    /// Identity to record on the integration commit.
     pub author: Author,
 }
 
-#[derive(Debug, Clone)]
-pub struct MigrationOptions {
-    pub from_version: u32,
-    pub backup: PathBuf,
-}
-
+/// Entry point for every capsule operation.
+///
+/// A manager owns one state directory and resolves the Git executable once when
+/// opened. Instances are cheap; operations serialize across processes through
+/// file locks, so several managers may safely share a state root.
+///
+/// # Example
+///
+/// ```no_run
+/// use change_capsule::{CapsuleManager, CreateOptions};
+///
+/// let manager = CapsuleManager::open_default()?;
+/// let capsule = manager.create(CreateOptions::new("."))?;
+/// println!("work in {}", capsule.workspace_path.display());
+/// # Ok::<(), change_capsule::Error>(())
+/// ```
 #[derive(Debug)]
 pub struct CapsuleManager {
     store: StateStore,
@@ -101,10 +141,14 @@ pub struct CapsuleManager {
 }
 
 impl CapsuleManager {
+    /// Open a manager on the default state directory.
+    ///
+    /// Honours `CAPSULE_HOME`, then the platform state directory.
     pub fn open_default() -> Result<Self> {
         Self::open(default_state_root()?)
     }
 
+    /// Open a manager on an explicit state directory, creating it if needed.
     pub fn open(state_root: impl Into<PathBuf>) -> Result<Self> {
         let state_root = state_root.into();
         Ok(Self {
@@ -113,14 +157,19 @@ impl CapsuleManager {
         })
     }
 
+    /// Directory holding this manager's durable state.
     pub fn state_root(&self) -> &Path {
         self.store.root()
     }
 
+    /// Read the effective policy; permissive defaults when none is installed.
     pub fn policy(&self) -> Result<Policy> {
         self.store.read_policy()
     }
 
+    /// Replace the stored policy atomically.
+    ///
+    /// Repository roots are canonicalized and must be existing directories.
     pub fn set_policy(&self, mut policy: Policy) -> Result<Policy> {
         let _lock = self.store.lock_global()?;
         let _project_locks = self.store.lock_all_projects()?;
@@ -140,6 +189,7 @@ impl CapsuleManager {
         Ok(policy)
     }
 
+    /// Evaluate current state against the effective policy without mutating it.
     pub fn policy_report(&self) -> Result<PolicyReport> {
         let _lock = self.store.lock_global()?;
         let _project_locks = self.store.lock_all_projects()?;
@@ -152,28 +202,25 @@ impl CapsuleManager {
         })
     }
 
+    /// Summarize stored records, including ones whose schema is unsupported.
     pub fn inspect_state(&self) -> Result<StateInspection> {
         self.store.inspect()
     }
 
+    /// Copy durable manifests, results, patches, and policy to a new directory.
+    ///
+    /// Live workspaces and Git object databases are deliberately excluded.
+    /// `backup.json` is written last as the completion marker.
     pub fn backup_state(&self, destination: impl AsRef<Path>) -> Result<BackupReport> {
         self.store.backup(destination.as_ref())
     }
 
-    pub fn migrate_state(&self, options: &MigrationOptions) -> Result<MigrationReport> {
-        if options.from_version != 2 || SCHEMA_VERSION != 3 {
-            return Err(Error::InvalidInput(format!(
-                "unsupported migration {} -> {SCHEMA_VERSION}; only 2 -> 3 is available",
-                options.from_version
-            )));
-        }
-        self.store.migrate_v2_to_v3(&options.backup)
-    }
-
+    /// Retained lifecycle events for one capsule, oldest first.
     pub fn audit_events(&self, id: &str) -> Result<Vec<AuditEvent>> {
         Ok(self.show(id)?.audit_events)
     }
 
+    /// Retained lifecycle events across all capsules, merged in time order.
     pub fn audit_log(&self) -> Result<Vec<AuditEvent>> {
         let _lock = self.store.lock_global()?;
         let _project_locks = self.store.lock_all_projects()?;
@@ -193,6 +240,7 @@ impl CapsuleManager {
         Ok(sequenced.into_iter().map(|(_, _, event)| event).collect())
     }
 
+    /// Compute an instantaneous snapshot of aggregate counters.
     pub fn metrics(&self) -> Result<MetricsSnapshot> {
         let _lock = self.store.lock_global()?;
         let _project_locks = self.store.lock_all_projects()?;
@@ -232,10 +280,14 @@ impl CapsuleManager {
         })
     }
 
+    /// Describe the sealed artifacts of a closed capsule.
+    ///
+    /// Revalidates the seal first, so descriptors always match live bytes.
     pub fn artifacts(&self, id: &str) -> Result<ArtifactBundle> {
         self.artifact_snapshot(id).map(|(bundle, _, _)| bundle)
     }
 
+    /// Open one sealed artifact as a bounded reader over a validated snapshot.
     pub fn open_artifact(&self, id: &str, kind: ArtifactKind) -> Result<ArtifactReader> {
         let (_, result, patch) = self.artifact_snapshot(id)?;
         Ok(ArtifactReader::new(match kind {
@@ -244,6 +296,7 @@ impl CapsuleManager {
         }))
     }
 
+    /// Stream every sealed artifact into a caller-provided sink.
     pub fn publish_artifacts<S: ArtifactSink + ?Sized>(
         &self,
         id: &str,
@@ -271,6 +324,11 @@ impl CapsuleManager {
         Ok(published)
     }
 
+    /// Write a sealed result to a new directory as a portable receipt.
+    ///
+    /// Produces `result.json`, `result.patch`, and finally `bundle.json` as the
+    /// completion marker. Verify the directory later with
+    /// [`verify_bundle`](crate::verify_bundle).
     pub fn export_artifacts(
         &self,
         id: &str,
@@ -302,6 +360,7 @@ impl CapsuleManager {
         })
     }
 
+    /// Create a capsule and its isolated worktree from a pinned commit.
     pub fn create(&self, options: CreateOptions) -> Result<Capsule> {
         validate_create_options(&options)?;
         let repository = self.git.repository(&options.repository)?;
@@ -374,6 +433,7 @@ impl CapsuleManager {
         Ok(capsule)
     }
 
+    /// Summarize every durable capsule record, ordered by identifier.
     pub fn list(&self) -> Result<Vec<CapsuleSummary>> {
         let _lock = self.store.lock_global()?;
         Ok(self
@@ -384,21 +444,25 @@ impl CapsuleManager {
             .collect())
     }
 
+    /// Read one capsule manifest, revalidating its identity fields.
     pub fn show(&self, id: &str) -> Result<Capsule> {
         self.store
             .read_capsule(id)
             .map_err(|error| not_found(id, error))
     }
 
+    /// Filesystem directory a capsule's attempt works in.
     pub fn workspace_path(&self, id: &str) -> Result<PathBuf> {
         Ok(self.show(id)?.workspace_path)
     }
 
+    /// Inspect a capsule's workspace health, changes, and seal state.
     pub fn status(&self, id: &str) -> Result<CapsuleStatus> {
         let capsule = self.show(id)?;
         self.status_for(capsule)
     }
 
+    /// Complete patch from the pinned base: sealed if closed, live if active.
     pub fn diff(&self, id: &str) -> Result<Vec<u8>> {
         let capsule = self.show(id)?;
         match capsule.state {
@@ -432,6 +496,7 @@ impl CapsuleManager {
         }
     }
 
+    /// Read a sealed result, failing on drift.
     pub fn result(&self, id: &str) -> Result<CapsuleResult> {
         let capsule = self.show(id)?;
         if capsule.result.is_none() {
@@ -447,6 +512,7 @@ impl CapsuleManager {
         Ok(result)
     }
 
+    /// Path to the sealed patch file, after confirming it still matches its seal.
     pub fn result_patch_path(&self, id: &str) -> Result<PathBuf> {
         let capsule = self.show(id)?;
         if capsule.result.is_none() {
@@ -459,6 +525,10 @@ impl CapsuleManager {
         Ok(self.store.capsule_dir(id)?.join("result.patch"))
     }
 
+    /// Commit the workspace's current state as a durable checkpoint.
+    ///
+    /// The commit is built through a private index and journaled before the
+    /// capsule branch advances, so an interrupted checkpoint is recoverable.
     pub fn checkpoint(&self, id: &str, options: CheckpointOptions) -> Result<Checkpoint> {
         validate_message(&options.message, "checkpoint message")?;
         validate_author(&options.author)?;
@@ -471,9 +541,8 @@ impl CapsuleManager {
         self.validate_owned_worktree(&capsule)?;
         let head_before = self.git.head(&capsule.workspace_path)?;
         let checkpoint_snapshot = self.snapshot_against(&capsule, &head_before)?;
-        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
-        let (ignored_bytes, _) =
-            ignored_content_inventory(&capsule.workspace_path, &ignored_paths)?;
+        let (ignored_paths, ignored_bytes) =
+            self.ignored_usage_for_policy(&policy, &capsule.workspace_path)?;
         if checkpoint_snapshot.patch.is_empty() {
             return Err(Error::InvalidInput("nothing to checkpoint".to_owned()));
         }
@@ -505,7 +574,7 @@ impl CapsuleManager {
             &policy,
             result_snapshot.patch.len() as u64,
             result_snapshot.changed_paths.len(),
-            ignored_paths.len(),
+            ignored_paths,
             ignored_bytes,
         )?;
         self.git.create_ref(
@@ -542,6 +611,9 @@ impl CapsuleManager {
         Ok(checkpoint)
     }
 
+    /// Attach a verification claim to an active capsule.
+    ///
+    /// Bounded to 64 records and 256 KiB of text per capsule.
     pub fn add_evidence(&self, id: &str, input: EvidenceInput) -> Result<Evidence> {
         validate_bounded_text(
             &input.command,
@@ -558,6 +630,22 @@ impl CapsuleManager {
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
         self.enforce_capsule_policy(&capsule)?;
+        if capsule.evidence.len() >= EVIDENCE_COUNT_CAP {
+            return Err(Error::InvalidInput(format!(
+                "a capsule retains at most {EVIDENCE_COUNT_CAP} evidence records"
+            )));
+        }
+        let stored_evidence_bytes: usize = capsule
+            .evidence
+            .iter()
+            .map(|item| item.command.len() + item.summary.as_ref().map_or(0, String::len))
+            .sum();
+        let pending_bytes = input.command.len() + input.summary.as_ref().map_or(0, String::len);
+        if stored_evidence_bytes.saturating_add(pending_bytes) > EVIDENCE_TOTAL_BYTES_CAP {
+            return Err(Error::InvalidInput(format!(
+                "total evidence payload would exceed the {EVIDENCE_TOTAL_BYTES_CAP}-byte capsule bound"
+            )));
+        }
         let evidence = Evidence {
             command: input.command,
             exit_code: input.exit_code,
@@ -585,6 +673,10 @@ impl CapsuleManager {
         Ok(evidence)
     }
 
+    /// Seal the capsule into an immutable result and patch.
+    ///
+    /// Captures committed, staged, unstaged, deleted, and non-ignored untracked
+    /// content as one complete change against the pinned base.
     pub fn close(&self, id: &str, options: CloseOptions) -> Result<CapsuleResult> {
         let mut capsule = self.show(id)?;
         let _global_lock = self.store.lock_global()?;
@@ -635,7 +727,6 @@ impl CapsuleManager {
             patch_sha256: digest.clone(),
             patch_bytes: snapshot.patch.len() as u64,
             changed_paths: snapshot.changed_paths.clone(),
-            ignored_paths_complete: true,
             ignored_bytes,
             ignored_content_sha256: Some(ignored_content_sha256),
             ignored_paths,
@@ -673,6 +764,12 @@ impl CapsuleManager {
         Ok(result)
     }
 
+    /// Apply a sealed result to a clean target still at the pinned base.
+    ///
+    /// The candidate commit is built in a private index, checked for one exact
+    /// parent and byte-identical reproduction of the sealed patch, protected by
+    /// a namespaced ref, and only then fast-forwarded. Never rebases, merges,
+    /// resolves conflicts, or pushes.
     pub fn integrate(&self, id: &str, options: &IntegrateOptions) -> Result<Capsule> {
         validate_author(&options.author)?;
         if let Some(message) = &options.message {
@@ -689,14 +786,13 @@ impl CapsuleManager {
             self.validate_integration_target(&capsule, &options.target)?;
         let result = self.store.read_result(id)?;
         let patch = self.store.read_patch(id)?;
-        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
-        let (ignored_bytes, _) =
-            ignored_content_inventory(&capsule.workspace_path, &ignored_paths)?;
+        let (ignored_paths, ignored_bytes) =
+            self.ignored_usage_for_policy(&policy, &capsule.workspace_path)?;
         Self::enforce_result_policy(
             &policy,
             patch.len() as u64,
             result.changed_paths.len(),
-            ignored_paths.len(),
+            ignored_paths,
             ignored_bytes,
         )?;
         self.start_integration(
@@ -828,6 +924,10 @@ impl CapsuleManager {
         self.store.write_capsule(capsule)
     }
 
+    /// Remove a capsule's owned worktree and branch, keeping its durable record.
+    ///
+    /// Refuses paths that no longer prove they are the worktree this capsule
+    /// created, even when `force` is set.
     pub fn drop_capsule(&self, id: &str, force: bool) -> Result<Capsule> {
         let mut capsule = self.show(id)?;
         let _global_lock = self.store.lock_global()?;
@@ -930,6 +1030,11 @@ impl CapsuleManager {
         Ok(capsule)
     }
 
+    /// Reconcile interrupted lifecycle transitions.
+    ///
+    /// Completes only transitions whose worktree identity, refs, commit parents,
+    /// patch digests, and journals all agree; anything ambiguous is left for
+    /// explicit inspection. Safe to call at process startup.
     pub fn recover(&self) -> Result<Vec<RecoveryAction>> {
         let _global_lock = self.store.lock_global()?;
         let capsules = self.store.list_capsules()?;
@@ -991,18 +1096,22 @@ impl CapsuleManager {
             live_count,
             policy.max_live_capsules,
         );
-        check_limit(
-            &mut violations,
-            "state bytes",
-            self.store.state_bytes()?,
-            policy.max_state_bytes,
-        );
-        check_limit(
-            &mut violations,
-            "workspace bytes",
-            self.store.workspace_bytes()?,
-            policy.max_workspace_bytes,
-        );
+        if policy.max_state_bytes.is_some() {
+            check_limit(
+                &mut violations,
+                "state bytes",
+                self.store.state_bytes()?,
+                policy.max_state_bytes,
+            );
+        }
+        if policy.max_workspace_bytes.is_some() {
+            check_limit(
+                &mut violations,
+                "workspace bytes",
+                self.store.workspace_bytes()?,
+                policy.max_workspace_bytes,
+            );
+        }
         let observed_at = now()?;
         for capsule in capsules {
             violations.extend(self.capsule_policy_violations(policy, capsule, observed_at));
@@ -1064,78 +1173,78 @@ impl CapsuleManager {
             reference.changed_paths as u64,
             policy.max_changed_paths,
         );
-        match self.sealed_artifacts(capsule) {
-            Ok((true, result, _)) => {
-                let (ignored_paths, ignored_bytes) = if capsule.workspace_path.exists() {
-                    if let Err(error) = self.validate_owned_worktree(capsule) {
+        let result = match self.sealed_artifacts(capsule) {
+            Ok((true, result, _)) => result,
+            Ok((false, _, _)) => {
+                violations.push(format!(
+                    "capsule {} sealed result artifacts do not match their manifest",
+                    capsule.id
+                ));
+                return;
+            }
+            Err(error) => {
+                violations.push(format!(
+                    "capsule {} result cannot be inspected: {error}",
+                    capsule.id
+                ));
+                return;
+            }
+        };
+        if policy.max_ignored_paths.is_none() && policy.max_ignored_bytes.is_none() {
+            return;
+        }
+        let (ignored_paths, ignored_bytes) = if capsule.workspace_path.exists() {
+            if let Err(error) = self.validate_owned_worktree(capsule) {
+                violations.push(format!(
+                    "capsule {} workspace cannot be inspected: {error}",
+                    capsule.id
+                ));
+                (result.ignored_paths.len() as u64, result.ignored_bytes)
+            } else {
+                match self.git.ignored_paths(&capsule.workspace_path) {
+                    Ok(paths) => {
+                        let bytes = if policy.max_ignored_bytes.is_some() {
+                            match ignored_usage(&capsule.workspace_path, &paths) {
+                                Ok(bytes) => bytes,
+                                Err(error) => {
+                                    violations.push(format!(
+                                        "capsule {} ignored bytes cannot be inspected: {error}",
+                                        capsule.id
+                                    ));
+                                    result.ignored_bytes
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        (paths.len() as u64, bytes)
+                    }
+                    Err(error) => {
                         violations.push(format!(
-                            "capsule {} workspace cannot be inspected: {error}",
+                            "capsule {} ignored paths cannot be inspected: {error}",
                             capsule.id
                         ));
                         (result.ignored_paths.len() as u64, result.ignored_bytes)
-                    } else {
-                        match self.git.ignored_paths(&capsule.workspace_path) {
-                            Ok(paths) => {
-                                let bytes = match ignored_content_inventory(
-                                    &capsule.workspace_path,
-                                    &paths,
-                                ) {
-                                    Ok((bytes, _)) => bytes,
-                                    Err(error) => {
-                                        violations.push(format!(
-                                            "capsule {} ignored bytes cannot be inspected: {error}",
-                                            capsule.id
-                                        ));
-                                        result.ignored_bytes
-                                    }
-                                };
-                                (paths.len() as u64, bytes)
-                            }
-                            Err(error) => {
-                                violations.push(format!(
-                                    "capsule {} ignored paths cannot be inspected: {error}",
-                                    capsule.id
-                                ));
-                                (result.ignored_paths.len() as u64, result.ignored_bytes)
-                            }
-                        }
                     }
-                } else {
-                    if !result.ignored_paths_complete
-                        && (policy.max_ignored_paths.is_some()
-                            || policy.max_ignored_bytes.is_some())
-                    {
-                        violations.push(format!(
-                            "capsule {} ignored usage is unknown after v2 migration and workspace removal",
-                            capsule.id
-                        ));
-                    }
-                    (result.ignored_paths.len() as u64, result.ignored_bytes)
-                };
-                check_capsule_limit(
-                    violations,
-                    &capsule.id,
-                    "ignored paths",
-                    ignored_paths,
-                    policy.max_ignored_paths,
-                );
-                check_capsule_limit(
-                    violations,
-                    &capsule.id,
-                    "ignored bytes",
-                    ignored_bytes,
-                    policy.max_ignored_bytes,
-                );
+                }
             }
-            Ok((false, _, _)) => violations.push(format!(
-                "capsule {} sealed result artifacts do not match their manifest",
-                capsule.id
-            )),
-            Err(error) => violations.push(format!(
-                "capsule {} result cannot be inspected: {error}",
-                capsule.id
-            )),
-        }
+        } else {
+            (result.ignored_paths.len() as u64, result.ignored_bytes)
+        };
+        check_capsule_limit(
+            violations,
+            &capsule.id,
+            "ignored paths",
+            ignored_paths,
+            policy.max_ignored_paths,
+        );
+        check_capsule_limit(
+            violations,
+            &capsule.id,
+            "ignored bytes",
+            ignored_bytes,
+            policy.max_ignored_bytes,
+        );
     }
 
     fn active_capsule_policy_violations(
@@ -1191,18 +1300,20 @@ impl CapsuleManager {
                     ignored.len() as u64,
                     policy.max_ignored_paths,
                 );
-                match ignored_content_inventory(&capsule.workspace_path, &ignored) {
-                    Ok((bytes, _)) => check_capsule_limit(
-                        violations,
-                        &capsule.id,
-                        "ignored bytes",
-                        bytes,
-                        policy.max_ignored_bytes,
-                    ),
-                    Err(error) => violations.push(format!(
-                        "capsule {} ignored bytes cannot be inspected: {error}",
-                        capsule.id
-                    )),
+                if policy.max_ignored_bytes.is_some() {
+                    match ignored_usage(&capsule.workspace_path, &ignored) {
+                        Ok(bytes) => check_capsule_limit(
+                            violations,
+                            &capsule.id,
+                            "ignored bytes",
+                            bytes,
+                            policy.max_ignored_bytes,
+                        ),
+                        Err(error) => violations.push(format!(
+                            "capsule {} ignored bytes cannot be inspected: {error}",
+                            capsule.id
+                        )),
+                    }
                 }
             }
             Err(error) => violations.push(format!(
@@ -1238,16 +1349,21 @@ impl CapsuleManager {
                 .count() as u64,
             policy.max_live_capsules,
         )?;
-        enforce_limit(
-            "state bytes",
-            self.store.state_bytes()?,
-            policy.max_state_bytes,
-        )?;
-        enforce_limit(
-            "workspace bytes",
-            self.store.workspace_bytes()?,
-            policy.max_workspace_bytes,
-        )
+        if policy.max_state_bytes.is_some() {
+            enforce_limit(
+                "state bytes",
+                self.store.state_bytes()?,
+                policy.max_state_bytes,
+            )?;
+        }
+        if policy.max_workspace_bytes.is_some() {
+            enforce_limit(
+                "workspace bytes",
+                self.store.workspace_bytes()?,
+                policy.max_workspace_bytes,
+            )?;
+        }
+        Ok(())
     }
 
     fn enforce_capsule_policy(&self, capsule: &Capsule) -> Result<Policy> {
@@ -1266,17 +1382,36 @@ impl CapsuleManager {
                 )));
             }
         }
-        enforce_limit(
-            "state bytes",
-            self.store.state_bytes()?,
-            policy.max_state_bytes,
-        )?;
-        enforce_limit(
-            "workspace bytes",
-            self.store.workspace_bytes()?,
-            policy.max_workspace_bytes,
-        )?;
+        if policy.max_state_bytes.is_some() {
+            enforce_limit(
+                "state bytes",
+                self.store.state_bytes()?,
+                policy.max_state_bytes,
+            )?;
+        }
+        if policy.max_workspace_bytes.is_some() {
+            enforce_limit(
+                "workspace bytes",
+                self.store.workspace_bytes()?,
+                policy.max_workspace_bytes,
+            )?;
+        }
         Ok(policy)
+    }
+
+    /// Ignored-content usage is measured only when a policy limit makes it
+    /// relevant; the byte walk uses file metadata rather than reading content.
+    fn ignored_usage_for_policy(&self, policy: &Policy, workspace: &Path) -> Result<(usize, u64)> {
+        if policy.max_ignored_paths.is_none() && policy.max_ignored_bytes.is_none() {
+            return Ok((0, 0));
+        }
+        let paths = self.git.ignored_paths(workspace)?;
+        let bytes = if policy.max_ignored_bytes.is_some() {
+            ignored_usage(workspace, &paths)?
+        } else {
+            0
+        };
+        Ok((paths.len(), bytes))
     }
 
     fn enforce_result_policy(
@@ -1495,25 +1630,14 @@ impl CapsuleManager {
             Err(Error::ResultDrift(_)) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
-        let ignored_inventory = if result.ignored_content_sha256.is_some() {
-            Some(ignored_content_inventory(
-                &capsule.workspace_path,
-                &ignored_paths,
-            )?)
-        } else {
-            None
-        };
+        // The ignored-content inventory sealed at close is provenance, not a gate:
+        // ignored files are exactly the content the repository declared irrelevant,
+        // so their later churn must not invalidate an otherwise intact result.
         Ok(artifacts_match
             && result.head_commit == head
             && result.patch_sha256 == sha256_hex(&snapshot.patch)
             && result.patch_bytes == snapshot.patch.len() as u64
             && result.changed_paths == snapshot.changed_paths
-            && (!result.ignored_paths_complete || result.ignored_paths == ignored_paths)
-            && ignored_inventory.as_ref().is_none_or(|(bytes, digest)| {
-                result.ignored_bytes == *bytes
-                    && result.ignored_content_sha256.as_deref() == Some(digest.as_str())
-            })
             && stored_patch == snapshot.patch)
     }
 
@@ -2183,25 +2307,68 @@ fn check_capsule_limit(
     }
 }
 
+fn safe_ignored_relative(ignored: &str) -> Result<&Path> {
+    let relative = Path::new(ignored.trim_end_matches('/'));
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(Error::UnsafeState(format!(
+            "Git returned an unsafe ignored path: {ignored:?}"
+        )));
+    }
+    Ok(relative)
+}
+
 fn ignored_content_inventory(workspace: &Path, ignored_paths: &[String]) -> Result<(u64, String)> {
     let mut digest = Sha256::new();
     let mut total = 0_u64;
     let mut seen = BTreeSet::new();
     for ignored in ignored_paths {
-        let relative = Path::new(ignored.trim_end_matches('/'));
-        if relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            return Err(Error::UnsafeState(format!(
-                "Git returned an unsafe ignored path: {ignored:?}"
-            )));
-        }
+        let relative = safe_ignored_relative(ignored)?;
         inventory_path(workspace, relative, &mut seen, &mut total, &mut digest)?;
     }
     Ok((total, hex::encode(digest.finalize())))
+}
+
+fn ignored_usage(workspace: &Path, ignored_paths: &[String]) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut seen = BTreeSet::new();
+    for ignored in ignored_paths {
+        let relative = safe_ignored_relative(ignored)?;
+        usage_path(workspace, relative, &mut seen, &mut total)?;
+    }
+    Ok(total)
+}
+
+fn usage_path(
+    workspace: &Path,
+    relative: &Path,
+    seen: &mut BTreeSet<PathBuf>,
+    total: &mut u64,
+) -> Result<()> {
+    if !seen.insert(relative.to_path_buf()) {
+        return Ok(());
+    }
+    let path = workspace.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let mut entries = fs::read_dir(&path)
+            .map_err(|error| io(&path, error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| io(&path, error))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            usage_path(workspace, &relative.join(entry.file_name()), seen, total)?;
+        }
+        return Ok(());
+    }
+    *total = total
+        .checked_add(metadata.len())
+        .ok_or_else(|| Error::UnsafeState("ignored byte count overflowed".to_owned()))?;
+    Ok(())
 }
 
 fn inventory_path(

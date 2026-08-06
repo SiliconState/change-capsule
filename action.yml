@@ -1,0 +1,110 @@
+name: Verify Capsule receipt
+description: >-
+  Verify a sealed Capsule receipt in CI, and optionally prove that the
+  tree being merged is exactly the pinned base plus the sealed patch.
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  bundle:
+    description: Directory containing bundle.json, result.json, and result.patch.
+    required: true
+  repo:
+    description: >-
+      Repository checkout to verify against. The pinned base must exist here and
+      the sealed patch must apply to it cleanly.
+    required: false
+    default: "."
+  require-successful-evidence:
+    description: >-
+      Reject receipts with no evidence or any non-zero evidence exit code.
+    required: false
+    default: "true"
+  verify-head:
+    description: >-
+      Also require that the checked-out tree equals the pinned base plus the
+      sealed patch. Needs a clean checkout whose history contains the base
+      (use actions/checkout with fetch-depth 0).
+    required: false
+    default: "false"
+  version:
+    description: >-
+      Version of the change-capsule crate to install. Defaults to the newest
+      published release.
+    required: false
+    default: ""
+
+outputs:
+  verified:
+    description: "true when the receipt passed every requested check."
+    value: ${{ steps.gate.outputs.verified }}
+  capsule-id:
+    description: Identifier of the verified capsule.
+    value: ${{ steps.gate.outputs.capsule-id }}
+  base-commit:
+    description: Commit the sealed result was pinned to.
+    value: ${{ steps.gate.outputs.base-commit }}
+  patch-sha256:
+    description: SHA-256 digest of the sealed patch.
+    value: ${{ steps.gate.outputs.patch-sha256 }}
+  changed-paths:
+    description: Number of paths changed by the sealed result.
+    value: ${{ steps.gate.outputs.changed-paths }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve capsule binary
+      id: resolve
+      shell: bash
+      run: |
+        if command -v capsule > /dev/null 2>&1; then
+          echo "install=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "install=true" >> "$GITHUB_OUTPUT"
+        fi
+        echo "cache-key=capsule-${RUNNER_OS}-${INPUT_VERSION:-latest}" >> "$GITHUB_OUTPUT"
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+
+    - name: Restore cached capsule binary
+      if: steps.resolve.outputs.install == 'true' && inputs.version != ''
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/capsule
+        key: ${{ steps.resolve.outputs.cache-key }}
+
+    - name: Install capsule
+      if: steps.resolve.outputs.install == 'true'
+      shell: bash
+      run: |
+        if command -v capsule > /dev/null 2>&1; then
+          echo "capsule restored from cache"
+          exit 0
+        fi
+        if [[ -n "$INPUT_VERSION" ]]; then
+          cargo install change-capsule --version "$INPUT_VERSION" --locked
+        else
+          cargo install change-capsule --locked
+        fi
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+
+    # Inputs reach the shell through the environment rather than template
+    # interpolation, so a value containing shell metacharacters cannot alter
+    # the command that runs.
+    - name: Verify receipt
+      id: gate
+      shell: bash
+      run: |
+        args=(--bundle "$INPUT_BUNDLE" --repo "$INPUT_REPO")
+        [[ "$INPUT_REQUIRE_EVIDENCE" == "true" ]] && args+=(--require-successful-evidence)
+        [[ "$INPUT_VERIFY_HEAD" == "true" ]] && args+=(--verify-head)
+        bash "$ACTION_PATH/scripts/verify-gate.sh" "${args[@]}"
+      env:
+        INPUT_BUNDLE: ${{ inputs.bundle }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_REQUIRE_EVIDENCE: ${{ inputs.require-successful-evidence }}
+        INPUT_VERIFY_HEAD: ${{ inputs.verify-head }}
+        ACTION_PATH: ${{ github.action_path }}

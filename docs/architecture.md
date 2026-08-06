@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-Change Capsule represents one code-change attempt as a durable state machine around an ordinary Git worktree.
+Capsule represents one code-change attempt as a durable state machine around an ordinary Git worktree.
 
 It deliberately does not represent:
 
@@ -114,7 +114,7 @@ Successful lifecycle operations retain the newest 128 versioned `AuditEvent` rec
 
 The result is always computed against the pinned base, not merely against `HEAD`.
 
-To include committed, staged, unstaged, non-ignored untracked, deleted, renamed, and binary content without mutating the user's index, Change Capsule:
+To include committed, staged, unstaged, non-ignored untracked, deleted, renamed, and binary content without mutating the user's index, Capsule:
 
 1. creates a private temporary index;
 2. loads the base tree into that index;
@@ -123,7 +123,7 @@ To include committed, staged, unstaged, non-ignored untracked, deleted, renamed,
 5. emits a NUL-delimited changed-path inventory;
 6. hashes the patch with SHA-256.
 
-The real worktree index is not modified by status, diff, close, or drift checks. Git-ignored untracked files are intentionally outside the patch unless the repository's ignore rules are changed to include them. Native v3 results seal their path inventory, total bytes, file/link/directory structure, symlink targets, and content SHA-256 so excluded content cannot change silently after close. Sparse/`skip-worktree` checkouts, dirty nested submodules, and unregistered embedded repositories are rejected rather than being misrepresented as complete snapshots.
+The real worktree index is not modified by status, diff, close, or drift checks. Git-ignored untracked files are intentionally outside the patch unless the repository's ignore rules are changed to include them. Close records the ignored-path inventory — paths, total bytes, and a structural content SHA-256 — in the sealed result as provenance, so a reviewer can see exactly what was excluded. That inventory is advisory: ignored content is what the repository declared irrelevant, so its later churn (build output, caches) does not invalidate the seal, block integration, or block cleanup. Drift detection covers tracked content: HEAD, patch bytes, digests, and changed paths. Sparse/`skip-worktree` checkouts, dirty nested submodules, and unregistered embedded repositories are rejected rather than being misrepresented as complete snapshots.
 
 A closed result is:
 
@@ -146,15 +146,17 @@ creation and seal timestamps
 
 A sealed result exposes two `ArtifactDescriptor` values for `result.json` and `result.patch`. Each descriptor contains a media type, byte length, SHA-256 digest, `sha256:` content address, and percent-encoded local `file://` URI. Embedders may open either artifact as a bounded `ArtifactReader`, publish streams through the runtime-neutral `ArtifactSink` trait, or export both artifacts into a no-clobber destination whose `bundle.json` completion marker is published last. Each operation reads and validates one immutable in-memory byte snapshot before exposing it, preventing later same-sized filesystem mutation from diverging from its descriptors. Core assigns no cloud, CAS, or runtime-specific transport.
 
+An exported bundle is a portable receipt. `verify_bundle` (CLI: `capsule verify`) re-checks it with no capsule state: descriptor digests and sizes, schema versions, and internal result consistency, plus — given a repository — that the pinned base exists and the sealed patch applies to it, reproducing exactly the sealed bytes and changed paths. Emitters and verifiers never need to share a machine.
+
 ## Policy and quotas
 
-`policy.json` has an independent schema version. An absent file means permissive defaults under the fixed 64 MiB patch safety bound. Policy may allowlist canonical repository roots and limit total/live records, age, observed state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes. Patch and changed-path limits always measure the complete base-to-current result, including at a checkpoint boundary rather than only that checkpoint's delta. Lifecycle mutations check applicable policy while holding the global and project locks. `policy_report` evaluates active and sealed results without mutating them and records uninspectable usage as a violation.
+`policy.json` has an independent schema version. An absent file means permissive defaults under the fixed 64 MiB patch safety bound. Policy may allowlist canonical repository roots and limit total/live records, age, observed state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes. Patch and changed-path limits always measure the complete base-to-current result, including at a checkpoint boundary rather than only that checkpoint's delta. Lifecycle mutations check applicable policy while holding the global and project locks. Usage that no configured limit references is not measured: with permissive defaults, lifecycle operations perform no state/workspace directory walks and no ignored-content inspection, and ignored-byte limits are measured from file metadata rather than by reading content. `policy_report` evaluates active and sealed results without mutating them and records uninspectable usage as a violation.
 
 Byte/count quotas are cooperative checkpoints, not kernel reservations: workers can grow workspaces between capsule operations, and another same-user process can consume disk independently. Every relevant core mutation rechecks observed usage; callers that need continuous hard enforcement must add filesystem or OS quotas.
 
 ## State administration
 
-`inspect_state` reports record schema/state summaries without deserializing records as the current schema. `backup_state` copies recognized durable manifests, results, patches, and policy under all known project locks; workspaces and Git repositories are deliberately excluded, and `backup.json` is the completion marker. `migrate_state` currently supports only v2 to v3, requires a new backup destination, validates typed v2 manifests and sealed result/patch digests before writing, and marks migrated ignored-path inventories incomplete because v2 did not seal that field. Migration is restartable across per-file atomic writes. A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
+`inspect_state` reports record schema/state summaries without deserializing records as the current schema. `backup_state` copies recognized durable manifests, results, patches, and policy under all known project locks; workspaces and Git repositories are deliberately excluded, and `backup.json` is the completion marker. There is no schema migration before a first stable release: incompatible state fails closed but remains inspectable and backupable. A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
 
 ## Integration
 

@@ -1,3 +1,9 @@
+//! `capsule`: a thin command-line adapter over the `change_capsule` crate.
+//!
+//! Each subcommand maps to exactly one library operation. With `--json`,
+//! successes print one JSON value to stdout and failures print one JSON object
+//! to stderr carrying a stable `kind` field for programmatic branching.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
@@ -6,7 +12,7 @@ use std::process::ExitCode;
 
 use change_capsule::{
     Author, CapsuleManager, CheckpointOptions, CloseOptions, CreateOptions, EvidenceInput,
-    IntegrateOptions, MigrationOptions, Policy,
+    IntegrateOptions, Policy, VerifyOptions, verify_bundle,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -51,13 +57,15 @@ enum Command {
     Artifacts(IdArgs),
     /// Export a self-describing sealed artifact directory.
     Export(ExportArgs),
+    /// Verify an exported bundle offline, without capsule state or a workspace.
+    Verify(VerifyArgs),
     /// Show structured lifecycle audit events for one capsule or all capsules.
     Audit(AuditArgs),
     /// Show an aggregate observability snapshot.
     Metrics,
     /// Read, replace, or evaluate resource and repository policy.
     Policy(PolicyArgs),
-    /// Inspect, back up, or migrate durable state.
+    /// Inspect or back up durable state.
     State(StateArgs),
     /// Commit the capsule's current changes as a durable checkpoint.
     Checkpoint(CheckpointArgs),
@@ -122,6 +130,20 @@ struct ExportArgs {
 }
 
 #[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Directory containing bundle.json, result.json, and result.patch.
+    bundle: PathBuf,
+
+    /// Also confirm the pinned base exists here and the sealed patch applies to it.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Reject bundles without evidence or with any non-zero evidence exit code.
+    #[arg(long)]
+    require_successful_evidence: bool,
+}
+
+#[derive(Debug, Args)]
 struct PolicyArgs {
     #[command(subcommand)]
     command: PolicyCommand,
@@ -154,13 +176,6 @@ enum StateCommand {
     Backup {
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Explicitly migrate a supported old schema after creating a backup.
-    Migrate {
-        #[arg(long)]
-        from: u32,
-        #[arg(long)]
-        backup: PathBuf,
     },
 }
 
@@ -228,7 +243,7 @@ struct DropArgs {
 
 #[derive(Debug, Args)]
 struct AuthorArgs {
-    #[arg(long, default_value = "Change Capsule")]
+    #[arg(long, default_value = "Capsule")]
     author_name: String,
 
     #[arg(long, default_value = "capsule@localhost")]
@@ -314,6 +329,17 @@ fn main() -> ExitCode {
 // library operation, keeping automation behavior auditable in one place.
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> change_capsule::Result<()> {
+    if let Command::Verify(arguments) = &cli.command {
+        let report = verify_bundle(
+            &arguments.bundle,
+            &VerifyOptions {
+                require_successful_evidence: arguments.require_successful_evidence,
+                repository: arguments.repo.clone(),
+            },
+        )?;
+        return print_value(&report, cli.json);
+    }
+
     let manager = match cli.home {
         Some(home) => CapsuleManager::open(home)?,
         None => CapsuleManager::open_default()?,
@@ -432,6 +458,7 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 cli.json,
             )?;
         }
+        Command::Verify(_) => unreachable!("verify is handled before state initialization"),
         Command::Audit(arguments) => {
             let events = match arguments.id {
                 Some(id) => manager.audit_events(&id)?,
@@ -452,15 +479,6 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             StateCommand::Inspect => print_value(&manager.inspect_state()?, cli.json)?,
             StateCommand::Backup { output } => {
                 print_value(&manager.backup_state(output)?, cli.json)?;
-            }
-            StateCommand::Migrate { from, backup } => {
-                print_value(
-                    &manager.migrate_state(&MigrationOptions {
-                        from_version: from,
-                        backup,
-                    })?,
-                    cli.json,
-                )?;
             }
         },
         Command::Checkpoint(arguments) => {
@@ -629,6 +647,7 @@ fn error_kind(error: &change_capsule::Error) -> &'static str {
         change_capsule::Error::InvalidState { .. } => "invalid_state",
         change_capsule::Error::PolicyViolation(_) => "policy",
         change_capsule::Error::ArtifactNotFound(_) => "artifact_not_found",
+        change_capsule::Error::Verification(_) => "verification",
         change_capsule::Error::UnsafeState(_) | change_capsule::Error::ForeignWorktree(_) => {
             "safety"
         }

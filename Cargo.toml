@@ -3,9 +3,11 @@ name = "change-capsule"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Agent-neutral, recoverable change attempts backed by Git worktrees"
+description = "Isolated Git worktree attempts for coding agents, sealed into portable verifiable receipts"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/SiliconState/change-capsule"
+homepage = "https://github.com/SiliconState/change-capsule"
 documentation = "https://docs.rs/change-capsule"
 keywords = ["agents", "git", "worktree", "automation", "provenance"]
 categories = ["command-line-utilities", "development-tools"]
@@ -34,8 +36,15 @@ tempfile = "3"
 thiserror = "2"
 ulid = "1"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints.rust]
 unsafe_code = "forbid"
+# Warn rather than deny: this applies when consumers compile the crate, and a
+# future compiler widening the lint must not break their builds. CI promotes it
+# to an error via `cargo clippy -- -D warnings`.
+missing_docs = "warn"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

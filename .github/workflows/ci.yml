@@ -22,3 +22,53 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --all-features
+      - name: Run the parallel-attempts walkthrough
+        run: CAPSULE_BIN="$PWD/target/debug/capsule" bash examples/parallel-attempts.sh
+
+  # Dogfoods the published action: seals a real result, then gates on its receipt.
+  receipt-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --all-features
+      - name: Put capsule on PATH
+        run: echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - name: Produce a sealed receipt and apply it
+        run: |
+          set -euo pipefail
+          git config --global user.name "Receipt Gate"
+          git config --global user.email "gate@example.test"
+          mkdir -p /tmp/demo-repo && cd /tmp/demo-repo
+          git init -q -b main
+          printf 'old\n' > app.txt
+          git add . && git commit -qm "base"
+          created=$(capsule --home /tmp/capsule-state create --repo . --label "ci attempt")
+          id=$(head -1 <<< "$created")
+          workspace=$(sed -n 's/^path=//p' <<< "$created")
+          printf 'new\n' > "$workspace/app.txt"
+          capsule --home /tmp/capsule-state evidence "$id" \
+            --command "true" --exit-code 0 --summary "ci verification"
+          capsule --home /tmp/capsule-state close "$id" --require-successful-evidence
+          capsule --home /tmp/capsule-state export "$id" --output /tmp/receipt
+          capsule --home /tmp/capsule-state integrate "$id" --target . -m "apply sealed result"
+      - name: Gate on the receipt
+        id: gate
+        uses: ./
+        with:
+          bundle: /tmp/receipt
+          repo: /tmp/demo-repo
+          require-successful-evidence: "true"
+          verify-head: "true"
+      - name: Confirm the gate reported a verified receipt
+        run: |
+          test "${{ steps.gate.outputs.verified }}" = "true"
+          test -n "${{ steps.gate.outputs.capsule-id }}"
+          echo "gate verified ${{ steps.gate.outputs.capsule-id }}"

@@ -1,6 +1,6 @@
 # Security Model
 
-Change Capsule protects local attempt identity, result integrity, and cleanup boundaries. It is not a sandbox for untrusted code.
+Capsule protects local attempt identity, result integrity, and cleanup boundaries. It is not a sandbox for untrusted code.
 
 ## Trust assumptions
 
@@ -22,8 +22,7 @@ State handling is fail-closed:
 - Unix state directories are `0700` and files are `0600`;
 - writes use an owner-private temporary file, file sync, atomic persistence, and directory sync;
 - lock and manifest names derive only from validated capsule IDs and project keys;
-- artifact exports and backups require a new non-symlink destination parent, atomically reserve the destination directory, and publish `bundle.json` or `backup.json` last as a completion marker;
-- v2-to-v3 migration takes a durable-state backup first and validates typed v2 identities, result metadata, patch bytes, and both stored digests before writing v3 records.
+- artifact exports and backups require a new non-symlink destination parent, atomically reserve the destination directory, and publish `bundle.json` or `backup.json` last as a completion marker.
 
 Opaque links and evidence summaries are stored locally but are not secret stores. Do not place credentials in them. Audit events are also local metadata; evidence commands are represented there by SHA-256 but remain present in the evidence record itself.
 
@@ -33,6 +32,8 @@ Artifact discovery first revalidates the sealed result. Descriptors report perce
 
 Export and backup never overwrite an existing destination and refuse destinations inside managed state. Export copies only a validated sealed result and emits descriptors for the exported paths. Backup copies recognized state files and policy, but intentionally excludes live workspaces, Git object databases, and lock files. A destination lacking its final `bundle.json` or `backup.json` marker is an interrupted, incomplete publication.
 
+Bundle verification (`capsule verify`) is bounded and fail-closed: reads are size-capped, artifact names and kinds are fixed, digests and sizes must match their descriptors, and the optional repository check applies the patch only to a private temporary index. Verification proves consistency and reproducibility of the receipt; it does not prove authorship. Receipts are unsigned, so a party who can rewrite the whole bundle can produce a different self-consistent one — signed attestations remain a separate future feature.
+
 ## Policy protections and limits
 
 Policy roots are canonicalized before persistence. Global counters are checked while the global lock and applicable project lock are held. Patch/path/ignored-content checks run before checkpoint or close side effects; age, state-byte, workspace-byte, and repository checks run at mutation boundaries.
@@ -41,7 +42,7 @@ These are cooperative policy checkpoints, not filesystem reservations or a secur
 
 ## Git process protections
 
-Change Capsule resolves and retains an absolute Git executable path when a manager opens. Each invocation:
+Capsule resolves and retains an absolute Git executable path when a manager opens. Each invocation:
 
 - clears inherited `GIT_*` variables;
 - preserves the ordinary non-Git environment needed to locate platform tools;
@@ -81,7 +82,7 @@ Before integration:
 
 The integration transition records the target worktree and its exact Git administration directory before any target change. A candidate commit is constructed through a private index, checked against the sealed patch, and protected by a namespaced pending ref. The target is revalidated immediately before a fast-forward. Recovery finalizes only that exact commit or restores a provably untouched journal to `closed`; it never hard-resets unrelated target work.
 
-Change Capsule does not push, pull, fetch, rebase, merge, or run hooks.
+Capsule does not push, pull, fetch, rebase, merge, or run hooks.
 
 ## Result integrity
 
@@ -94,7 +95,7 @@ A seal covers:
 - complete binary-capable patch bytes;
 - SHA-256 patch digest;
 - changed paths;
-- ignored-path inventory for native v3 results;
+- the close-time ignored-path inventory (recorded as provenance; later churn of ignored content does not invalidate the seal);
 - evidence present at close time.
 
 This detects accidental or same-user mutation after handoff. It does not provide authenticity against a same-user attacker who can rewrite both state and repository content. Signed attestations would be a separate feature.
@@ -104,7 +105,7 @@ This detects accidental or same-user mutation after handoff. It does not provide
 - Sparse checkout and `skip-worktree` entries are rejected because they can make an absent tracked file indistinguishable from an intended deletion.
 - Dirty nested submodule worktrees are rejected because their internal content is not representable by a top-level Git patch; committed gitlink changes remain supported.
 - Unregistered embedded Git repositories are rejected rather than silently converted into accidental gitlinks.
-- Migration supports only v2 to v3. It creates a backup first, validates old seals, and marks `ignored_paths_complete=false` because v2 did not seal ignored-path inventory; other schema versions fail closed.
+- There is no schema migration before a first stable release; incompatible state fails closed but remains inspectable and backupable.
 - Audit records retain the newest 128 events and report how many older events rolled off; they are validated but neither signed nor append-only against a same-user attacker who can rewrite state.
 - Aggregate metrics are instantaneous observations, not monotonic accounting or durable telemetry.
 - Policy quotas are checked at lifecycle boundaries rather than continuously enforced.

@@ -466,6 +466,66 @@ impl Git {
         Ok(commit.trim().to_owned())
     }
 
+    /// Apply a sealed patch onto the base tree in a private index and report
+    /// the reproduced patch and changed paths without creating a commit.
+    pub(crate) fn apply_patch_preview(
+        &self,
+        worktree: &Path,
+        base: &str,
+        patch: &[u8],
+        index: &Path,
+    ) -> Result<Snapshot> {
+        let env = [(
+            OsString::from("GIT_INDEX_FILE"),
+            index.as_os_str().to_owned(),
+        )];
+        self.success_with_env(worktree, ["read-tree", base], &env)?;
+        self.output_with_env(
+            worktree,
+            ["apply", "--cached", "--whitespace=nowarn", "-"],
+            &env,
+            SMALL_OUTPUT_CAP,
+            Some(patch),
+        )?;
+        let reproduced = self.output_with_env(
+            worktree,
+            [
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
+                base,
+                "--",
+            ],
+            &env,
+            PATCH_OUTPUT_CAP,
+            None,
+        )?;
+        let paths = self.output_with_env(
+            worktree,
+            [
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base,
+                "--",
+            ],
+            &env,
+            SMALL_OUTPUT_CAP,
+            None,
+        )?;
+        Ok(Snapshot {
+            patch: reproduced,
+            changed_paths: parse_nul_strings(&paths)?,
+        })
+    }
+
     pub(crate) fn fast_forward(&self, worktree: &Path, commit: &str) -> Result<()> {
         self.success(worktree, ["merge", "--ff-only", "--no-edit", commit])
     }

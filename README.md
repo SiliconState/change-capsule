@@ -1,8 +1,8 @@
-# Change Capsule
+# Capsule
 
-Change Capsule is an agent-neutral Rust library and CLI for creating isolated, recoverable, and inspectable code-change attempts.
+Capsule is an agent-neutral Rust library and CLI for isolated, recoverable code-change attempts — each sealed into a portable, verifiable receipt.
 
-It does not run an agent. It gives any agent or automation system a safe place to work and a durable result to hand back.
+It does not run an agent. It gives any agent or automation system a safe place to work, and it gives everyone downstream — reviewers, CI jobs, merge gates — a durable result whose integrity can be re-checked anywhere with `capsule verify`, without access to the original workspace, session, or state directory.
 
 ```text
 pinned Git commit
@@ -22,9 +22,10 @@ A capsule is more than a Git worktree. It records the complete boundary of an at
 - caller-recorded verification evidence;
 - complete binary-capable patch, changed-path inventory, and sealed provenance;
 - discoverable, streamable artifacts with file URIs and SHA-256 content addresses;
+- exported receipts that verify offline, with no capsule state required;
 - bounded structured lifecycle audit events and aggregate metrics;
 - configurable repository, count, age, size, patch, path, and ignored-content policy;
-- explicit state inspection, backup, and v2-to-v3 migration;
+- explicit state inspection and backup;
 - immutable result digest and drift detection;
 - explicit, journaled integration;
 - guarded cleanup and crash recovery.
@@ -33,15 +34,19 @@ No daemon, VFS, container, shell interpreter, object store, task tracker, model 
 
 ## Who can use it
 
-Any process that can consume a path or JSON can use Change Capsule: interactive coding agents, headless agents, IDE agents, CI jobs, eval harnesses, task trackers, multi-agent coordinators, and custom scripts.
+Any process that can consume a path or JSON can use Capsule: interactive coding agents, headless agents, IDE agents, CI jobs, eval harnesses, task trackers, multi-agent coordinators, and custom scripts.
 
-Change Capsule does not contain adapters for particular agents. This is intentional. The stable integration surface is:
+Capsule does not contain adapters for particular agents. This is intentional. The stable integration surface is:
 
 1. call the CLI with `--json` or embed the Rust crate;
 2. give the returned `workspace_path` to the agent as its working directory;
 3. let the agent use its existing file, search, shell, and Git tools;
 4. record optional evidence;
-5. close the capsule and inspect or integrate its result.
+5. close the capsule and inspect, verify, or integrate its result.
+
+The stable handoff surface is the exported receipt: `bundle.json`, `result.json`, and `result.patch`, content-addressed and verifiable by `capsule verify` on any machine with Git. A harness that emits receipts and a reviewer that checks them never need to share a filesystem, a state directory, or a tool version.
+
+For a complete runnable walkthrough — two competing attempts, sealed receipts, tamper detection, explicit integration — run [`examples/parallel-attempts.sh`](https://github.com/SiliconState/change-capsule/blob/main/examples/parallel-attempts.sh).
 
 ## Install
 
@@ -51,8 +56,10 @@ Prerequisites:
 - Rust 1.85 or newer when building from source.
 
 ```sh
-cargo install --path .
+cargo install change-capsule
 ```
+
+That installs the `capsule` binary. The crate is registered as `change-capsule` because `capsule` was already taken on crates.io; the command you run is `capsule`.
 
 For library-only use without the Clap CLI dependency:
 
@@ -106,6 +113,13 @@ capsule --json artifacts cap-01...
 capsule --json export cap-01... --output ./handoff
 ```
 
+Verify the receipt anywhere — on the same machine, in CI, or after copying `./handoff` to a reviewer. Verification needs no capsule state; `--repo` additionally proves the sealed patch applies to the pinned base and reproduces exactly the sealed bytes and changed paths:
+
+```sh
+capsule --json verify ./handoff --require-successful-evidence
+capsule --json verify ./handoff --repo . --require-successful-evidence
+```
+
 `artifacts` reports media types, byte lengths, `file://` URIs, and `sha256:` content addresses. Artifact readers, publishers, and exports consume one bounded, validated byte snapshot, so later filesystem mutation cannot change the bytes described by that operation. `export` reserves a new destination directory without clobbering, moves in `result.json` and `result.patch`, then publishes `bundle.json` last as the completion marker.
 
 Integrate only the selected result into a clean worktree that is still at the pinned base:
@@ -134,10 +148,11 @@ capsule diff         emit the complete current or sealed patch
 capsule result       show the sealed handoff manifest
 capsule artifacts    discover sealed artifacts, URIs, sizes, and content addresses
 capsule export       create a self-describing result artifact directory
+capsule verify       verify an exported receipt offline, optionally against a repository
 capsule audit        show one capsule's events or the administrative event stream
 capsule metrics      show aggregate lifecycle and storage counters
 capsule policy       show, replace, or evaluate resource/repository policy
-capsule state        inspect, back up, or explicitly migrate durable state
+capsule state        inspect or back up durable state
 capsule checkpoint   commit current work with an explicit identity
 capsule evidence     record externally-run verification evidence
 capsule close        seal patch, inventory, evidence, and digest
@@ -145,6 +160,40 @@ capsule integrate    explicitly apply one sealed result to its pinned base
 capsule drop         safely remove an owned worktree and branch
 capsule recover      reconcile interrupted journal states
 ```
+
+## Merge gate
+
+A receipt is only useful if something checks it. This repository ships a GitHub Action that verifies a receipt in CI and, with `verify-head`, refuses the merge unless the tree being merged is exactly the pinned base plus the sealed patch:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0          # the pinned base must be present
+- uses: SiliconState/change-capsule@v0.1.0
+  with:
+    bundle: ./receipt       # produced by `capsule export`
+    repo: .
+    require-successful-evidence: "true"
+    verify-head: "true"
+```
+
+The gate passes only when every one of these holds:
+
+1. the bundle's artifacts match their descriptor digests and byte counts;
+2. the sealed result is internally consistent and its schema is supported;
+3. the pinned base exists in the checkout and the sealed patch applies to it, reproducing exactly the sealed bytes and changed paths;
+4. evidence exists and every recorded exit code is zero;
+5. the checked-out tree equals base plus the sealed patch.
+
+Together those mean the diff being merged is the diff that was sealed and verified — established without trusting the machine that produced it. Outputs (`verified`, `capsule-id`, `base-commit`, `patch-sha256`, `changed-paths`) are available to later steps, and the run publishes a job summary table.
+
+The same checks run locally with no Action involved:
+
+```sh
+scripts/verify-gate.sh --bundle ./receipt --repo . --require-successful-evidence --verify-head
+```
+
+## CLI details
 
 `--json` is global. Errors are emitted as one JSON object on stderr in JSON mode. `capsule diff --json` returns metadata rather than embedding arbitrary patch bytes; pass `--output <file>` for patch data. Policy failures use error kind `policy`; unknown artifact requests use `artifact_not_found`.
 
@@ -161,7 +210,7 @@ capsule --json metrics
 capsule --json audit
 ```
 
-Policy supports allowed repository roots and optional limits for total/live capsule count, capsule age, state/workspace bytes, result patch bytes, changed paths, ignored paths, and ignored bytes. Result limits apply to the complete base-to-current result, including when a checkpoint contains only a smaller incremental change. Mutating operations fail before their principal side effect when the applicable limit is exceeded. `policy check` is observational: it evaluates active and sealed results and reports uninspectable workspaces or artifacts as violations rather than silently treating them as compliant. For example:
+Policy supports allowed repository roots and optional limits for total/live capsule count, capsule age, state/workspace bytes, result patch bytes, changed paths, ignored paths, and ignored bytes. Result limits apply to the complete base-to-current result, including when a checkpoint contains only a smaller incremental change. Mutating operations fail before their principal side effect when the applicable limit is exceeded. Usage that no configured limit references is not measured, so the permissive default policy adds no directory walks or content inspection to lifecycle operations. `policy check` is observational: it evaluates active and sealed results and reports uninspectable workspaces or artifacts as violations rather than silently treating them as compliant. For example:
 
 ```json
 {
@@ -184,10 +233,9 @@ State administration is explicit:
 ```sh
 capsule --json state inspect
 capsule --json state backup --output ./capsule-backup
-capsule --json state migrate --from 2 --backup ./pre-v3-backup
 ```
 
-Inspection reads schema/version summaries without requiring supported records. Backup and migration require a new destination and copy durable manifests, results, patches, and policy, not live workspaces or Git repositories. Backup publishes `backup.json` last as its completion marker. Migration currently supports only v2 to v3, validates typed v2 identities and result seals before writing, marks the historically unavailable ignored-path inventory incomplete, and always creates a backup first. An interrupted export or backup may leave a reserved destination without its completion marker; callers should treat it as incomplete and choose a new destination or remove it after inspection.
+Inspection reads schema/version summaries without requiring supported records. Backup requires a new destination and copies durable manifests, results, patches, and policy, not live workspaces or Git repositories. Backup publishes `backup.json` last as its completion marker. An interrupted export or backup may leave a reserved destination without its completion marker; callers should treat it as incomplete and choose a new destination or remove it after inspection.
 
 ## Rust API
 
@@ -214,33 +262,33 @@ The crate owns lifecycle, provenance, artifact descriptors/streams, policy check
 2. Each receives a separate ordinary Git worktree and branch.
 3. Attempts may change the same files independently.
 4. The source worktree remains untouched until explicit integration.
-5. Every result has a complete patch, changed-path inventory, digest, sealed provenance, and discoverable artifact descriptors/streams.
+5. Every result has a complete patch, changed-path inventory, digest, sealed provenance, and discoverable artifact descriptors/streams, and its exported receipt verifies offline on any machine.
 6. Lifecycle transitions produce bounded structured audit events; aggregate metrics are available without a daemon.
 7. Repository and resource policy is enforced at core mutation boundaries and can be evaluated against current state.
 8. Results and journaled checkpoint, integration, and cleanup transitions survive process restart and can be inspected or recovered by another process or agent.
 9. Missing, replaced, drifted, or unrepresentable workspaces fail closed.
 10. Cleanup refuses foreign directories even with `--force`.
 11. Integration is explicit and requires a clean target at the exact pinned base.
-12. State can be inspected, backed up, and explicitly migrated from v2 to v3 without a runtime-specific service.
+12. State can be inspected and backed up without a runtime-specific service; exported receipts can be verified with no state at all.
 
 ## Scope
 
-Change Capsule owns an attempt boundary, not work planning or agent orchestration.
+Capsule owns an attempt boundary, not work planning or agent orchestration.
 
 It composes with issue trackers, agent runners, coding agents, workflow engines, and CI rather than replacing them. An external task ID can be attached with `--link`; no tracker is privileged or required.
 
 See:
 
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/protocol.md`](docs/protocol.md)
-- [`docs/security.md`](docs/security.md)
-- [`docs/composition.md`](docs/composition.md)
+- [`docs/architecture.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/architecture.md)
+- [`docs/protocol.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/protocol.md)
+- [`docs/security.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/security.md)
+- [`docs/composition.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/composition.md)
 
 ## Status
 
-This release intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Sparse-checkout, `skip-worktree`, and `assume-unchanged` entries are rejected because an absent or hidden file cannot be distinguished safely from a requested deletion. Dirty nested submodule worktrees and unregistered embedded Git repositories are rejected rather than silently omitted or converted to accidental gitlinks; commit a registered submodule change first if the top-level gitlink should be captured. Ignored untracked paths are excluded but reported by `status.ignored_paths`. Remote execution, distributed persistence, background jobs, non-Git snapshots, automatic rebasing, merge queues, network services, signed attestations, continuous kernel-enforced quotas, and execution sandboxing remain out of scope.
+This release intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Sparse-checkout, `skip-worktree`, and `assume-unchanged` entries are rejected because an absent or hidden file cannot be distinguished safely from a requested deletion. Dirty nested submodule worktrees and unregistered embedded Git repositories are rejected rather than silently omitted or converted to accidental gitlinks; commit a registered submodule change first if the top-level gitlink should be captured. Ignored untracked paths are excluded from the patch but reported by `status.ignored_paths` and recorded — with byte count and content digest — in the sealed result as provenance; because ignored content is exactly what the repository declared irrelevant, its later churn (build output, caches, logs) does not invalidate the seal or block integration and cleanup. Remote execution, distributed persistence, background jobs, non-Git snapshots, automatic rebasing, merge queues, network services, signed attestations, continuous kernel-enforced quotas, and execution sandboxing remain out of scope.
 
-The on-disk capsule/result schema is version 3. Incompatible state fails closed. Explicit migration currently supports v2 to v3 and requires a new backup directory; other versions remain unsupported.
+The on-disk capsule/result schema is version 3. Incompatible state fails closed but remains inspectable and backupable; there is no schema migration before a first stable release.
 
 ## License
 

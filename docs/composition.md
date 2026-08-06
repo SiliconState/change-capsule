@@ -1,6 +1,6 @@
 # Composition
 
-Change Capsule is universal infrastructure at the attempt boundary. It is designed to sit below many different tools without knowing their concepts.
+Capsule is universal infrastructure at the attempt boundary. It is designed to sit below many different tools without knowing their concepts.
 
 ## Coding agents
 
@@ -22,6 +22,8 @@ An interactive agent can be launched manually from the path printed by `capsule 
 
 A CI job can create one capsule per candidate implementation, test each independently, record evidence, close all results, and compare their patches without allowing candidates to race on one checkout.
 
+A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. The gate then knows the diff it merges is the diff that was sealed, that it applies cleanly to the pinned base, and that the claimed verification actually recorded a passing exit code — without trusting the harness's machine or sharing its state.
+
 An evaluation harness can attach dimensions using links:
 
 ```sh
@@ -34,7 +36,7 @@ The result patch, manifest, artifact descriptors, exported bundle, and evidence 
 
 ## Task trackers
 
-A tracker answers what work exists. Change Capsule answers where one attempt happened and what it produced.
+A tracker answers what work exists. Capsule answers where one attempt happened and what it produced.
 
 Attach the tracker ID as opaque metadata:
 
@@ -61,7 +63,7 @@ task
 
 Workers may modify identical paths concurrently because their files and indexes are isolated. Reviewers consume sealed result manifests, patches, or self-describing exports. The coordinator chooses if and when to integrate. Lifecycle events and aggregate metrics are available through the same crate/CLI without requiring a coordinator-specific adapter.
 
-Change Capsule intentionally does not choose workers, route tasks, retry models, resolve conflicts, or select winners.
+Capsule intentionally does not choose workers, route tasks, retry models, resolve conflicts, or select winners.
 
 ## Editors and humans
 
@@ -77,9 +79,10 @@ The reusable API is `CapsuleManager`. Embedders can:
 - record checkpoints and evidence;
 - close and inspect results;
 - discover, stream, publish, or export sealed artifacts;
+- verify exported bundles offline with `verify_bundle`;
 - read per-capsule or administrative audit events and aggregate metrics;
 - install and evaluate repository/resource policy;
-- inspect, back up, and explicitly migrate durable state;
+- inspect and back up durable state;
 - integrate and drop explicitly;
 - call recovery at startup.
 
@@ -123,6 +126,6 @@ An adapter should not:
 - auto-integrate without an explicit policy decision;
 - claim that a worktree is a security sandbox;
 - place credentials in links or evidence;
-- make Change Capsule depend on one agent or tracker.
+- make Capsule depend on one agent or tracker.
 
 The stable abstraction is the attempt, not the surrounding product.

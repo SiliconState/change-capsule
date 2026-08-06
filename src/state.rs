@@ -1,20 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::error::{Error, Result, io};
 use crate::model::{
     AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, BackupReport, Capsule, CapsuleResult, CapsuleState,
-    Checkpoint, CheckpointJournal, Cleanup, Evidence, Integration, MigrationReport, ResultKind,
-    ResultRef, SCHEMA_VERSION, StateInspection, StateRecordInspection,
+    SCHEMA_VERSION, StateInspection, StateRecordInspection,
 };
 use crate::policy::{HARD_PATCH_BYTES, Policy};
 
@@ -22,6 +20,14 @@ const JSON_CAP: u64 = 1024 * 1024;
 const PATCH_CAP: u64 = HARD_PATCH_BYTES;
 const POLICY_CAP: u64 = 64 * 1024;
 
+/// Resolve the default state directory.
+///
+/// Honours `CAPSULE_HOME` first, then `XDG_STATE_HOME` on Unix-like platforms
+/// or `LOCALAPPDATA` on Windows, then `HOME`.
+///
+/// # Errors
+///
+/// Fails when none of those variables identify a usable location.
 pub fn default_state_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CAPSULE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
@@ -242,17 +248,6 @@ impl StateStore {
         let path = self.capsule_dir(id)?.join("result.json");
         let bytes = read_bytes_bounded(&path, JSON_CAP)?;
         let result: CapsuleResult = decode_versioned_json(&path, &bytes)?;
-        let mut canonical = serde_json::to_vec_pretty(&result).map_err(|source| Error::Json {
-            path: path.clone(),
-            source,
-        })?;
-        canonical.push(b'\n');
-        if bytes != canonical {
-            return Err(Error::UnsafeState(format!(
-                "result artifact is not in its canonical encoding: {}",
-                path.display()
-            )));
-        }
         if result.capsule_id != id {
             return Err(Error::UnsafeState(format!(
                 "result id {} does not match capsule {id}",
@@ -288,37 +283,6 @@ impl StateStore {
     pub(crate) fn read_patch(&self, id: &str) -> Result<Vec<u8>> {
         let path = self.capsule_dir(id)?.join("result.patch");
         read_bytes_bounded(&path, PATCH_CAP)
-    }
-
-    fn validate_current_result_artifacts(&self, capsule: &Capsule) -> Result<()> {
-        let Some(reference) = capsule.result.as_ref() else {
-            return Ok(());
-        };
-        let result = self.read_result(&capsule.id)?;
-        let patch = self.read_patch(&capsule.id)?;
-        let patch_digest = hex::encode(Sha256::digest(&patch));
-        let result_path = self.capsule_dir(&capsule.id)?.join("result.json");
-        let valid = reference.kind == result.kind
-            && reference.head_commit == result.head_commit
-            && reference.patch_sha256 == patch_digest
-            && reference.patch_sha256 == result.patch_sha256
-            && reference.result_sha256 == digest_json(&result, &result_path)?
-            && reference.patch_bytes == patch.len() as u64
-            && reference.patch_bytes == result.patch_bytes
-            && reference.changed_paths == result.changed_paths.len()
-            && reference.sealed_at_unix == result.sealed_at_unix
-            && result.capsule_id == capsule.id
-            && result.label == capsule.label
-            && result.links == capsule.links
-            && result.base_commit == capsule.base_commit
-            && result.checkpoints == capsule.checkpoints
-            && result.evidence == capsule.evidence
-            && result.created_at_unix == capsule.created_at_unix;
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::ResultDrift(capsule.id.clone()))
-        }
     }
 
     pub(crate) fn read_policy(&self) -> Result<Policy> {
@@ -432,105 +396,6 @@ impl StateStore {
         publish_staged_directory(&temporary, destination, "bundle.json")
     }
 
-    pub(crate) fn migrate_v2_to_v3(&self, backup: &Path) -> Result<MigrationReport> {
-        let backup = self.external_destination(backup)?;
-        let _lock = self.lock_global()?;
-        let _project_locks = self.lock_all_projects()?;
-        let backup_report = self.backup_locked(&backup)?;
-        let mut plans = Vec::new();
-        let directory = self.capsules_dir();
-        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
-            let entry = entry.map_err(|error| io(&directory, error))?;
-            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
-            if file_type.is_symlink() || !file_type.is_dir() {
-                continue;
-            }
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if let Some(plan) = self.plan_v2_migration(&entry.path(), id)? {
-                plans.push(plan);
-            }
-        }
-
-        let migrated_capsules = plans.iter().map(|plan| plan.id.clone()).collect();
-        for plan in plans {
-            if let Some(result) = &plan.result {
-                self.write_result(&plan.id, result)?;
-            }
-            self.write_capsule(&plan.capsule)?;
-            self.read_capsule(&plan.id)?;
-            if plan.result.is_some() {
-                self.read_result(&plan.id)?;
-            }
-        }
-        Ok(MigrationReport {
-            from_version: 2,
-            to_version: SCHEMA_VERSION,
-            migrated_capsules,
-            backup: Some(backup_report),
-        })
-    }
-
-    fn plan_v2_migration(&self, directory: &Path, id: String) -> Result<Option<MigrationPlan>> {
-        validate_id(&id)?;
-        let manifest_path = directory.join("capsule.json");
-        let manifest = read_json_value(&manifest_path, JSON_CAP)?;
-        let version = json_version(&manifest, &manifest_path)?;
-        if version == SCHEMA_VERSION {
-            let capsule = self.read_capsule(&id)?;
-            self.validate_current_result_artifacts(&capsule)?;
-            return Ok(None);
-        }
-        if version != 2 {
-            return Err(Error::SchemaVersion {
-                found: version,
-                supported: SCHEMA_VERSION,
-            });
-        }
-        let old_capsule: V2Capsule =
-            serde_json::from_value(manifest).map_err(|source| Error::Json {
-                path: manifest_path,
-                source,
-            })?;
-        if old_capsule.schema_version != 2 || old_capsule.id != id {
-            return Err(Error::UnsafeState(format!(
-                "v2 capsule identity does not match directory {id}"
-            )));
-        }
-        let old_result_ref = old_capsule.result.clone();
-        let mut capsule = Capsule::from(old_capsule);
-        validate_capsule_manifest(self, &capsule, &id)?;
-        let result_path = directory.join("result.json");
-        let patch_path = directory.join("result.patch");
-        let result = if let Some(reference) = old_result_ref.as_ref() {
-            let result = migrate_v2_result(&capsule, reference, &result_path, &patch_path)?;
-            capsule
-                .result
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::UnsafeState(format!(
-                        "capsule {id} lost its result reference during migration"
-                    ))
-                })?
-                .result_sha256 = digest_json(&result, &result_path)?;
-            Some(result)
-        } else {
-            if path_entry_exists(&result_path)? || path_entry_exists(&patch_path)? {
-                return Err(Error::UnsafeState(format!(
-                    "v2 capsule {id} has unreferenced result artifacts"
-                )));
-            }
-            None
-        };
-        validate_capsule_manifest(self, &capsule, &id)?;
-        Ok(Some(MigrationPlan {
-            id,
-            capsule,
-            result,
-        }))
-    }
-
     fn backup_locked(&self, destination: &Path) -> Result<BackupReport> {
         if path_entry_exists(destination)? {
             return Err(Error::InvalidInput(format!(
@@ -601,248 +466,6 @@ impl StateStore {
         drop(file);
         fs::remove_file(&path).map_err(|error| io(&path, error))?;
         Ok(TemporaryIndex { path })
-    }
-}
-
-#[derive(Debug)]
-struct MigrationPlan {
-    id: String,
-    capsule: Capsule,
-    result: Option<CapsuleResult>,
-}
-
-fn digest_json<T: Serialize>(value: &T, path: &Path) -> Result<String> {
-    let bytes = serde_json::to_vec(value).map_err(|source| Error::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn migrate_v2_result(
-    capsule: &Capsule,
-    reference: &ResultRef,
-    result_path: &Path,
-    patch_path: &Path,
-) -> Result<CapsuleResult> {
-    let patch = read_bytes_bounded(patch_path, PATCH_CAP)?;
-    let result_value = read_json_value(result_path, JSON_CAP)?;
-    let result_version = json_version(&result_value, result_path)?;
-    if result_version == 2 {
-        let old_result: V2Result =
-            serde_json::from_value(result_value).map_err(|source| Error::Json {
-                path: result_path.to_path_buf(),
-                source,
-            })?;
-        validate_v2_seal(capsule, reference, &old_result, &patch)?;
-        Ok(CapsuleResult::from(old_result))
-    } else if result_version == SCHEMA_VERSION {
-        let result: CapsuleResult =
-            serde_json::from_value(result_value).map_err(|source| Error::Json {
-                path: result_path.to_path_buf(),
-                source,
-            })?;
-        validate_interrupted_v3_result(capsule, reference, &result, &patch)?;
-        Ok(result)
-    } else {
-        Err(Error::SchemaVersion {
-            found: result_version,
-            supported: SCHEMA_VERSION,
-        })
-    }
-}
-
-fn validate_v2_seal(
-    capsule: &Capsule,
-    reference: &ResultRef,
-    result: &V2Result,
-    patch: &[u8],
-) -> Result<()> {
-    let result_path = PathBuf::from("v2 result digest");
-    let patch_digest = hex::encode(Sha256::digest(patch));
-    let result_digest = digest_json(result, &result_path)?;
-    let valid = result.schema_version == 2
-        && reference.kind == result.kind
-        && reference.head_commit == result.head_commit
-        && reference.patch_sha256 == patch_digest
-        && reference.patch_sha256 == result.patch_sha256
-        && reference.result_sha256 == result_digest
-        && reference.patch_bytes == patch.len() as u64
-        && reference.patch_bytes == result.patch_bytes
-        && reference.changed_paths == result.changed_paths.len()
-        && reference.sealed_at_unix == result.sealed_at_unix
-        && result.capsule_id == capsule.id
-        && result.label == capsule.label
-        && result.links == capsule.links
-        && result.base_commit == capsule.base_commit
-        && result.checkpoints == capsule.checkpoints
-        && result.evidence == capsule.evidence
-        && result.created_at_unix == capsule.created_at_unix;
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::ResultDrift(capsule.id.clone()))
-    }
-}
-
-fn validate_interrupted_v3_result(
-    capsule: &Capsule,
-    reference: &ResultRef,
-    result: &CapsuleResult,
-    patch: &[u8],
-) -> Result<()> {
-    let patch_digest = hex::encode(Sha256::digest(patch));
-    let v2_projection = V2Result {
-        schema_version: 2,
-        capsule_id: result.capsule_id.clone(),
-        label: result.label.clone(),
-        links: result.links.clone(),
-        kind: result.kind,
-        base_commit: result.base_commit.clone(),
-        head_commit: result.head_commit.clone(),
-        patch_sha256: result.patch_sha256.clone(),
-        patch_bytes: result.patch_bytes,
-        changed_paths: result.changed_paths.clone(),
-        checkpoints: result.checkpoints.clone(),
-        evidence: result.evidence.clone(),
-        created_at_unix: result.created_at_unix,
-        sealed_at_unix: result.sealed_at_unix,
-    };
-    let v2_digest = digest_json(&v2_projection, Path::new("v2 result projection"))?;
-    let valid = result.schema_version == SCHEMA_VERSION
-        && !result.ignored_paths_complete
-        && result.ignored_bytes == 0
-        && result.ignored_content_sha256.is_none()
-        && result.ignored_paths.is_empty()
-        && reference.kind == result.kind
-        && reference.head_commit == result.head_commit
-        && reference.patch_sha256 == patch_digest
-        && reference.patch_sha256 == result.patch_sha256
-        && reference.result_sha256 == v2_digest
-        && reference.patch_bytes == patch.len() as u64
-        && reference.patch_bytes == result.patch_bytes
-        && reference.changed_paths == result.changed_paths.len()
-        && reference.sealed_at_unix == result.sealed_at_unix
-        && result.capsule_id == capsule.id
-        && result.label == capsule.label
-        && result.links == capsule.links
-        && result.base_commit == capsule.base_commit
-        && result.checkpoints == capsule.checkpoints
-        && result.evidence == capsule.evidence
-        && result.created_at_unix == capsule.created_at_unix;
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::ResultDrift(capsule.id.clone()))
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct V2Capsule {
-    schema_version: u32,
-    id: String,
-    label: Option<String>,
-    #[serde(default)]
-    links: BTreeMap<String, String>,
-    state: CapsuleState,
-    source_worktree: PathBuf,
-    repository_common_dir: PathBuf,
-    workspace_git_dir: Option<PathBuf>,
-    workspace_path: PathBuf,
-    project_key: String,
-    branch: String,
-    base_commit: String,
-    created_at_unix: u64,
-    updated_at_unix: u64,
-    #[serde(default)]
-    checkpoints: Vec<Checkpoint>,
-    checkpoint: Option<CheckpointJournal>,
-    #[serde(default)]
-    evidence: Vec<Evidence>,
-    result: Option<ResultRef>,
-    integration: Option<Integration>,
-    cleanup: Option<Cleanup>,
-    closed_at_unix: Option<u64>,
-    dropped_at_unix: Option<u64>,
-}
-
-impl From<V2Capsule> for Capsule {
-    fn from(value: V2Capsule) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            id: value.id,
-            label: value.label,
-            links: value.links,
-            state: value.state,
-            source_worktree: value.source_worktree,
-            repository_common_dir: value.repository_common_dir,
-            workspace_git_dir: value.workspace_git_dir,
-            workspace_path: value.workspace_path,
-            project_key: value.project_key,
-            branch: value.branch,
-            base_commit: value.base_commit,
-            created_at_unix: value.created_at_unix,
-            updated_at_unix: value.updated_at_unix,
-            checkpoints: value.checkpoints,
-            checkpoint: value.checkpoint,
-            evidence: value.evidence,
-            audit_events: Vec::new(),
-            audit_events_dropped: 0,
-            result: value.result,
-            integration: value.integration,
-            cleanup: value.cleanup,
-            closed_at_unix: value.closed_at_unix,
-            dropped_at_unix: value.dropped_at_unix,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct V2Result {
-    schema_version: u32,
-    capsule_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    label: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    links: BTreeMap<String, String>,
-    kind: ResultKind,
-    base_commit: String,
-    head_commit: String,
-    patch_sha256: String,
-    patch_bytes: u64,
-    changed_paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    checkpoints: Vec<Checkpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    evidence: Vec<Evidence>,
-    created_at_unix: u64,
-    sealed_at_unix: u64,
-}
-
-impl From<V2Result> for CapsuleResult {
-    fn from(value: V2Result) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            capsule_id: value.capsule_id,
-            label: value.label,
-            links: value.links,
-            kind: value.kind,
-            base_commit: value.base_commit,
-            head_commit: value.head_commit,
-            patch_sha256: value.patch_sha256,
-            patch_bytes: value.patch_bytes,
-            changed_paths: value.changed_paths,
-            ignored_paths_complete: false,
-            ignored_bytes: 0,
-            ignored_content_sha256: None,
-            ignored_paths: Vec::new(),
-            checkpoints: value.checkpoints,
-            evidence: value.evidence,
-            created_at_unix: value.created_at_unix,
-            sealed_at_unix: value.sealed_at_unix,
-        }
     }
 }
 
@@ -1009,7 +632,7 @@ fn lifecycle_journals_consistent(capsule: &Capsule) -> bool {
     checkpoint_consistent && integration_consistent && cleanup_consistent
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     let valid = id.len() >= 8
         && id.len() <= 64
         && id.starts_with("cap-")
@@ -1234,7 +857,7 @@ fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> 
     decode_versioned_json(path, &bytes)
 }
 
-fn decode_versioned_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+pub(crate) fn decode_versioned_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
     let value = serde_json::from_slice(bytes).map_err(|source| Error::Json {
         path: path.to_path_buf(),
         source,
@@ -1252,7 +875,7 @@ fn decode_versioned_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Resu
     })
 }
 
-fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap {
         return Err(Error::UnsafeState(format!(

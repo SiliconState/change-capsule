@@ -1,6 +1,6 @@
 # Agent and Automation Protocol
 
-This document is the framework-neutral contract for using Change Capsule from an agent runner, coding agent, CI job, or orchestration system.
+This document is the framework-neutral contract for using Capsule from an agent runner, coding agent, CI job, or orchestration system.
 
 ## Core rule
 
@@ -29,7 +29,7 @@ The `base` input is resolved to an immutable commit before the attempt starts.
 
 ### 2. Launch any worker
 
-Use `workspace_path` as the worker's current directory. Change Capsule does not care whether the worker is an interactive agent, headless agent, editor, script, or human.
+Use `workspace_path` as the worker's current directory. Capsule does not care whether the worker is an interactive agent, headless agent, editor, script, or human.
 
 Pseudocode:
 
@@ -53,9 +53,9 @@ Status fields relevant to automation:
 - `health`: stop on anything other than `healthy` while active;
 - `dirty`: whether the real worktree has uncommitted changes;
 - `changed_paths`: complete non-ignored paths changed from the pinned base;
-- `ignored_paths`: ignored untracked files/directories deliberately excluded from the patch but covered by the native v3 excluded-content seal;
+- `ignored_paths`: ignored untracked files/directories deliberately excluded from the patch; their inventory is recorded in the sealed result at close as provenance;
 - `commits_ahead`: commits reachable from `HEAD` and not from the base;
-- `sealed`: after close, whether the worktree still matches the result.
+- `sealed`: after close, whether the worktree's tracked content still matches the result.
 
 ### 4. Optional checkpoint
 
@@ -70,7 +70,7 @@ Checkpoint constructs the commit through a private index, journals the exact par
 
 ### 5. Record evidence
 
-Change Capsule records evidence; it does not execute verification commands.
+Capsule records evidence; it does not execute verification commands.
 
 ```sh
 capsule --json evidence <id> \
@@ -79,7 +79,7 @@ capsule --json evidence <id> \
   --summary "5 integration tests passed"
 ```
 
-The caller is responsible for command execution, timeout, sandboxing, output retention, and honesty. Evidence is provenance, not a cryptographic attestation.
+The caller is responsible for command execution, timeout, sandboxing, output retention, and honesty. Evidence is provenance, not a cryptographic attestation. A capsule retains at most 64 evidence records totaling at most 256 KiB of command and summary text, so the durable manifest can never grow past its own storage bound.
 
 ### 6. Close
 
@@ -87,7 +87,7 @@ The caller is responsible for command execution, timeout, sandboxing, output ret
 capsule --json close <id> --require-successful-evidence
 ```
 
-After close, treat the worktree as read-only. Any subsequent mutation causes `status.health=drifted_after_close`, blocks ordinary cleanup, and blocks integration.
+After close, treat the worktree's tracked content as read-only. Any subsequent tracked-content mutation causes `status.health=drifted_after_close`, blocks ordinary cleanup, and blocks integration. Ignored content (build output, caches, logs) may keep changing after close; it is reported and its close-time inventory stays sealed as provenance, but its churn does not invalidate the result.
 
 The sealed result is available through:
 
@@ -100,7 +100,7 @@ capsule --json export <id> --output /tmp/capsule-result
 
 `artifacts` returns a versioned bundle with media types, byte counts, local `file://` URIs, SHA-256 digests, and `sha256:` content addresses. `export` reserves a new no-clobber directory, moves in `result.json` and `result.patch`, and publishes `bundle.json` last as the completion marker. Rust embedders can call `open_artifact` for a bounded stream or implement `ArtifactSink` to publish to any local, object-store, or CAS backend without coupling core to that backend. Each stream, publication, or export uses one fully read and validated byte snapshot, so a later artifact mutation cannot change bytes already paired with descriptors.
 
-### 7. Review or compare
+### 7. Review, verify, or compare
 
 Reviewers do not need access to the original worker session. They can consume:
 
@@ -110,6 +110,15 @@ Reviewers do not need access to the original worker session. They can consume:
 - a self-describing export through `capsule export`;
 - the preserved workspace path while it remains present;
 - evidence and external links in the manifest.
+
+An exported bundle is verifiable anywhere, with no capsule state:
+
+```sh
+capsule --json verify /tmp/capsule-result --require-successful-evidence
+capsule --json verify /tmp/capsule-result --repo /path/to/repository
+```
+
+Offline verification re-checks descriptor digests, sizes, schema versions, and internal result consistency. With `--repo`, it additionally proves the pinned base exists and that applying the sealed patch to it reproduces exactly the sealed bytes and changed paths. A CI merge gate can therefore require: the bundle verifies, evidence is successful, and the PR diff equals `result.patch`.
 
 Several capsules may share one task link. A coordinator can compare their changed paths, patches, evidence, and review outcomes before selecting one.
 
@@ -150,6 +159,7 @@ Current error kinds are:
 - `invalid_state`
 - `policy`
 - `artifact_not_found`
+- `verification`
 - `safety`
 - `unsealed_result`
 - `dirty_target`
@@ -174,7 +184,7 @@ Policy is checked at core lifecycle boundaries. It is not a continuous filesyste
 
 ## State administration
 
-`capsule state inspect` reports record versions and states even when normal schema deserialization would fail. `capsule state backup --output <new-directory>` copies recognized durable state and policy, excluding workspaces and Git repositories, and publishes `backup.json` last as the completion marker. `capsule state migrate --from 2 --backup <new-directory>` is the only supported migration; it always backs up first, validates typed v2 identities and result seals, and marks the unavailable v2 ignored-path inventory incomplete. Migration uses atomic per-file writes and is safe to retry after interruption. `bundle.json` similarly marks a complete artifact export; a reserved destination lacking its marker is incomplete and is not reused implicitly.
+`capsule state inspect` reports record versions and states even when normal schema deserialization would fail. `capsule state backup --output <new-directory>` copies recognized durable state and policy, excluding workspaces and Git repositories, and publishes `backup.json` last as the completion marker. There is no schema migration before a first stable release; incompatible state fails closed but remains inspectable and backupable. `bundle.json` similarly marks a complete artifact export; a reserved destination lacking its marker is incomplete and is not reused implicitly.
 
 ## Links
 
@@ -192,7 +202,7 @@ No key has privileged semantics in core.
 
 ## Concurrency
 
-Operations that mutate one repository's capsules take a project-scoped file lock. Policy-sensitive mutations also take the global lock so global counters cannot race. Backup, migration, policy replacement/checking, metrics, inspection, and the administrative audit stream take the global lock plus every known project lock in deterministic order. Multiple active capsules remain independent Git worktrees.
+Operations that mutate one repository's capsules take a project-scoped file lock. Policy-sensitive mutations also take the global lock so global counters cannot race. Backup, policy replacement/checking, metrics, inspection, and the administrative audit stream take the global lock plus every known project lock in deterministic order. Multiple active capsules remain independent Git worktrees.
 
 The caller should still avoid issuing two mutating commands against the same capsule simultaneously. Locks serialize them, but a stale caller may receive a state error after the first operation completes.
 
