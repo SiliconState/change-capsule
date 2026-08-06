@@ -1,18 +1,26 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::error::{Error, Result, io};
-use crate::model::{Capsule, CapsuleResult, CapsuleState, SCHEMA_VERSION};
+use crate::model::{
+    AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, BackupReport, Capsule, CapsuleResult, CapsuleState,
+    Checkpoint, CheckpointJournal, Cleanup, Evidence, Integration, MigrationReport, ResultKind,
+    ResultRef, SCHEMA_VERSION, StateInspection, StateRecordInspection,
+};
+use crate::policy::{HARD_PATCH_BYTES, Policy};
 
 const JSON_CAP: u64 = 1024 * 1024;
-const PATCH_CAP: u64 = 64 * 1024 * 1024;
+const PATCH_CAP: u64 = HARD_PATCH_BYTES;
+const POLICY_CAP: u64 = 64 * 1024;
 
 pub fn default_state_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CAPSULE_HOME").filter(|value| !value.is_empty()) {
@@ -106,6 +114,32 @@ impl StateStore {
         self.lock_file(&format!("project-{project_key}"))
     }
 
+    pub(crate) fn lock_all_projects(&self) -> Result<Vec<StateLock>> {
+        let mut keys = BTreeSet::new();
+        let directory = self.locks_dir();
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(key) = name
+                .strip_prefix("project-")
+                .and_then(|value| value.strip_suffix(".lock"))
+            else {
+                continue;
+            };
+            validate_project_key(key)?;
+            keys.insert(key.to_owned());
+        }
+        keys.into_iter()
+            .map(|key| self.lock_project(&key))
+            .collect()
+    }
+
     fn lock_file(&self, name: &str) -> Result<StateLock> {
         let path = self.locks_dir().join(format!("{name}.lock"));
         reject_symlink_or_non_file_if_present(&path)?;
@@ -174,7 +208,7 @@ impl StateStore {
                 continue;
             }
             let manifest = entry.path().join("capsule.json");
-            if !manifest.exists() {
+            if !path_entry_exists(&manifest)? {
                 continue;
             }
             capsules.push(self.read_capsule(&id)?);
@@ -218,6 +252,10 @@ impl StateStore {
         if !valid_object_id(&result.base_commit)
             || !valid_object_id(&result.head_commit)
             || !valid_sha256(&result.patch_sha256)
+            || result
+                .ignored_content_sha256
+                .as_ref()
+                .is_some_and(|digest| !valid_sha256(digest))
             || result.patch_bytes > PATCH_CAP
         {
             return Err(Error::UnsafeState(format!(
@@ -242,6 +280,329 @@ impl StateStore {
         read_bytes_bounded(&path, PATCH_CAP)
     }
 
+    fn validate_current_result_artifacts(&self, capsule: &Capsule) -> Result<()> {
+        let Some(reference) = capsule.result.as_ref() else {
+            return Ok(());
+        };
+        let result = self.read_result(&capsule.id)?;
+        let patch = self.read_patch(&capsule.id)?;
+        let patch_digest = hex::encode(Sha256::digest(&patch));
+        let result_path = self.capsule_dir(&capsule.id)?.join("result.json");
+        let valid = reference.kind == result.kind
+            && reference.head_commit == result.head_commit
+            && reference.patch_sha256 == patch_digest
+            && reference.patch_sha256 == result.patch_sha256
+            && reference.result_sha256 == digest_json(&result, &result_path)?
+            && reference.patch_bytes == patch.len() as u64
+            && reference.patch_bytes == result.patch_bytes
+            && reference.changed_paths == result.changed_paths.len()
+            && reference.sealed_at_unix == result.sealed_at_unix
+            && result.capsule_id == capsule.id
+            && result.label == capsule.label
+            && result.links == capsule.links
+            && result.base_commit == capsule.base_commit
+            && result.checkpoints == capsule.checkpoints
+            && result.evidence == capsule.evidence
+            && result.created_at_unix == capsule.created_at_unix;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::ResultDrift(capsule.id.clone()))
+        }
+    }
+
+    pub(crate) fn result_bytes(&self, id: &str) -> Result<Vec<u8>> {
+        let path = self.capsule_dir(id)?.join("result.json");
+        read_bytes_bounded(&path, JSON_CAP)
+    }
+
+    pub(crate) fn open_artifact(&self, id: &str, name: &str) -> Result<File> {
+        let path = self.capsule_dir(id)?.join(name);
+        let cap = if name == "result.patch" {
+            PATCH_CAP
+        } else if name == "result.json" {
+            JSON_CAP
+        } else {
+            return Err(Error::ArtifactNotFound(name.to_owned()));
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap {
+            return Err(Error::UnsafeState(format!(
+                "artifact is unsafe or exceeds {cap} bytes: {}",
+                path.display()
+            )));
+        }
+        File::open(&path).map_err(|error| io(&path, error))
+    }
+
+    pub(crate) fn read_policy(&self) -> Result<Policy> {
+        let path = self.root.join("policy.json");
+        if !path_entry_exists(&path)? {
+            return Ok(Policy::default());
+        }
+        let policy: Policy = read_json(&path, POLICY_CAP)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub(crate) fn write_policy(&self, policy: &Policy) -> Result<()> {
+        policy.validate()?;
+        write_json_atomic_bounded(&self.root.join("policy.json"), policy, POLICY_CAP)
+    }
+
+    pub(crate) fn state_bytes(&self) -> Result<u64> {
+        directory_size(&self.root, &["locks", "workspaces"])
+    }
+
+    pub(crate) fn workspace_bytes(&self) -> Result<u64> {
+        directory_size(&self.workspaces_dir(), &[])
+    }
+
+    pub(crate) fn inspect(&self) -> Result<StateInspection> {
+        let _lock = self.lock_global()?;
+        let _project_locks = self.lock_all_projects()?;
+        let mut records = Vec::new();
+        let directory = self.capsules_dir();
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let manifest = entry.path().join("capsule.json");
+            let result = entry.path().join("result.json");
+            match inspect_manifest(&manifest) {
+                Ok((schema_version, state)) => records.push(StateRecordInspection {
+                    id,
+                    schema_version,
+                    state,
+                    has_result: result.is_file(),
+                    error: None,
+                }),
+                Err(error) => records.push(StateRecordInspection {
+                    id,
+                    schema_version: None,
+                    state: None,
+                    has_result: result.is_file(),
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(StateInspection {
+            state_root: self.root.clone(),
+            supported_schema_version: SCHEMA_VERSION,
+            state_bytes: self.state_bytes()?,
+            records,
+        })
+    }
+
+    pub(crate) fn external_destination(&self, destination: &Path) -> Result<PathBuf> {
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(parent).map_err(|error| io(parent, error))?;
+        let name = destination.file_name().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "destination must name a new directory: {}",
+                destination.display()
+            ))
+        })?;
+        let normalized = parent.join(name);
+        if normalized.starts_with(&self.root) {
+            return Err(Error::InvalidInput(format!(
+                "destination must be outside managed state: {}",
+                destination.display()
+            )));
+        }
+        Ok(normalized)
+    }
+
+    pub(crate) fn backup(&self, destination: &Path) -> Result<BackupReport> {
+        let destination = self.external_destination(destination)?;
+        let _lock = self.lock_global()?;
+        let _project_locks = self.lock_all_projects()?;
+        self.backup_locked(&destination)
+    }
+
+    pub(crate) fn export_artifacts(destination: &Path, files: &[(&str, &[u8])]) -> Result<()> {
+        if path_entry_exists(destination)? {
+            return Err(Error::InvalidInput(format!(
+                "export destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        validate_existing_directory(parent)?;
+        let temporary = tempfile::Builder::new()
+            .prefix("change-capsule-export-")
+            .tempdir_in(parent)
+            .map_err(|error| io(parent, error))?;
+        for (name, content) in files {
+            write_bytes_atomic(&temporary.path().join(name), content)?;
+        }
+        publish_staged_directory(&temporary, destination, "bundle.json")
+    }
+
+    pub(crate) fn migrate_v2_to_v3(&self, backup: &Path) -> Result<MigrationReport> {
+        let backup = self.external_destination(backup)?;
+        let _lock = self.lock_global()?;
+        let _project_locks = self.lock_all_projects()?;
+        let backup_report = self.backup_locked(&backup)?;
+        let mut plans = Vec::new();
+        let directory = self.capsules_dir();
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(plan) = self.plan_v2_migration(&entry.path(), id)? {
+                plans.push(plan);
+            }
+        }
+
+        let migrated_capsules = plans.iter().map(|plan| plan.id.clone()).collect();
+        for plan in plans {
+            if let Some(result) = &plan.result {
+                self.write_result(&plan.id, result)?;
+            }
+            self.write_capsule(&plan.capsule)?;
+            self.read_capsule(&plan.id)?;
+            if plan.result.is_some() {
+                self.read_result(&plan.id)?;
+            }
+        }
+        Ok(MigrationReport {
+            from_version: 2,
+            to_version: SCHEMA_VERSION,
+            migrated_capsules,
+            backup: Some(backup_report),
+        })
+    }
+
+    fn plan_v2_migration(&self, directory: &Path, id: String) -> Result<Option<MigrationPlan>> {
+        validate_id(&id)?;
+        let manifest_path = directory.join("capsule.json");
+        let manifest = read_json_value(&manifest_path, JSON_CAP)?;
+        let version = json_version(&manifest, &manifest_path)?;
+        if version == SCHEMA_VERSION {
+            let capsule = self.read_capsule(&id)?;
+            self.validate_current_result_artifacts(&capsule)?;
+            return Ok(None);
+        }
+        if version != 2 {
+            return Err(Error::SchemaVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let old_capsule: V2Capsule =
+            serde_json::from_value(manifest).map_err(|source| Error::Json {
+                path: manifest_path,
+                source,
+            })?;
+        if old_capsule.schema_version != 2 || old_capsule.id != id {
+            return Err(Error::UnsafeState(format!(
+                "v2 capsule identity does not match directory {id}"
+            )));
+        }
+        let old_result_ref = old_capsule.result.clone();
+        let mut capsule = Capsule::from(old_capsule);
+        validate_capsule_manifest(self, &capsule, &id)?;
+        let result_path = directory.join("result.json");
+        let patch_path = directory.join("result.patch");
+        let result = if let Some(reference) = old_result_ref.as_ref() {
+            let result = migrate_v2_result(&capsule, reference, &result_path, &patch_path)?;
+            capsule
+                .result
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::UnsafeState(format!(
+                        "capsule {id} lost its result reference during migration"
+                    ))
+                })?
+                .result_sha256 = digest_json(&result, &result_path)?;
+            Some(result)
+        } else {
+            if path_entry_exists(&result_path)? || path_entry_exists(&patch_path)? {
+                return Err(Error::UnsafeState(format!(
+                    "v2 capsule {id} has unreferenced result artifacts"
+                )));
+            }
+            None
+        };
+        validate_capsule_manifest(self, &capsule, &id)?;
+        Ok(Some(MigrationPlan {
+            id,
+            capsule,
+            result,
+        }))
+    }
+
+    fn backup_locked(&self, destination: &Path) -> Result<BackupReport> {
+        if path_entry_exists(destination)? {
+            return Err(Error::InvalidInput(format!(
+                "backup destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        validate_existing_directory(parent)?;
+        let temporary = tempfile::Builder::new()
+            .prefix("change-capsule-backup-")
+            .tempdir_in(parent)
+            .map_err(|error| io(parent, error))?;
+        let root = temporary.path();
+        ensure_private_dir(&root.join("capsules"))?;
+        let mut files = 0;
+        let mut bytes = 0;
+        let capsules = self.capsules_dir();
+        for entry in fs::read_dir(&capsules).map_err(|error| io(&capsules, error))? {
+            let entry = entry.map_err(|error| io(&capsules, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let target = root.join("capsules").join(entry.file_name());
+            ensure_private_dir(&target)?;
+            for (name, cap) in [
+                ("capsule.json", JSON_CAP),
+                ("result.json", JSON_CAP),
+                ("result.patch", PATCH_CAP),
+            ] {
+                let source = entry.path().join(name);
+                if path_entry_exists(&source)? {
+                    let content = read_bytes_bounded(&source, cap)?;
+                    write_bytes_atomic(&target.join(name), &content)?;
+                    files += 1;
+                    bytes += content.len() as u64;
+                }
+            }
+        }
+        let policy_path = self.root.join("policy.json");
+        if path_entry_exists(&policy_path)? {
+            let content = read_bytes_bounded(&policy_path, POLICY_CAP)?;
+            write_bytes_atomic(&root.join("policy.json"), &content)?;
+            files += 1;
+            bytes += content.len() as u64;
+        }
+        let report = BackupReport {
+            source: self.root.clone(),
+            destination: destination.to_path_buf(),
+            files,
+            bytes,
+        };
+        write_json_atomic_bounded(&root.join("backup.json"), &report, JSON_CAP)?;
+        publish_staged_directory(&temporary, destination, "backup.json")?;
+        Ok(report)
+    }
+
     pub(crate) fn temporary_index(&self, id: &str) -> Result<TemporaryIndex> {
         let directory = self.capsule_dir(id)?;
         let temporary = tempfile::Builder::new()
@@ -254,6 +615,248 @@ impl StateStore {
         drop(file);
         fs::remove_file(&path).map_err(|error| io(&path, error))?;
         Ok(TemporaryIndex { path })
+    }
+}
+
+#[derive(Debug)]
+struct MigrationPlan {
+    id: String,
+    capsule: Capsule,
+    result: Option<CapsuleResult>,
+}
+
+fn digest_json<T: Serialize>(value: &T, path: &Path) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn migrate_v2_result(
+    capsule: &Capsule,
+    reference: &ResultRef,
+    result_path: &Path,
+    patch_path: &Path,
+) -> Result<CapsuleResult> {
+    let patch = read_bytes_bounded(patch_path, PATCH_CAP)?;
+    let result_value = read_json_value(result_path, JSON_CAP)?;
+    let result_version = json_version(&result_value, result_path)?;
+    if result_version == 2 {
+        let old_result: V2Result =
+            serde_json::from_value(result_value).map_err(|source| Error::Json {
+                path: result_path.to_path_buf(),
+                source,
+            })?;
+        validate_v2_seal(capsule, reference, &old_result, &patch)?;
+        Ok(CapsuleResult::from(old_result))
+    } else if result_version == SCHEMA_VERSION {
+        let result: CapsuleResult =
+            serde_json::from_value(result_value).map_err(|source| Error::Json {
+                path: result_path.to_path_buf(),
+                source,
+            })?;
+        validate_interrupted_v3_result(capsule, reference, &result, &patch)?;
+        Ok(result)
+    } else {
+        Err(Error::SchemaVersion {
+            found: result_version,
+            supported: SCHEMA_VERSION,
+        })
+    }
+}
+
+fn validate_v2_seal(
+    capsule: &Capsule,
+    reference: &ResultRef,
+    result: &V2Result,
+    patch: &[u8],
+) -> Result<()> {
+    let result_path = PathBuf::from("v2 result digest");
+    let patch_digest = hex::encode(Sha256::digest(patch));
+    let result_digest = digest_json(result, &result_path)?;
+    let valid = result.schema_version == 2
+        && reference.kind == result.kind
+        && reference.head_commit == result.head_commit
+        && reference.patch_sha256 == patch_digest
+        && reference.patch_sha256 == result.patch_sha256
+        && reference.result_sha256 == result_digest
+        && reference.patch_bytes == patch.len() as u64
+        && reference.patch_bytes == result.patch_bytes
+        && reference.changed_paths == result.changed_paths.len()
+        && reference.sealed_at_unix == result.sealed_at_unix
+        && result.capsule_id == capsule.id
+        && result.label == capsule.label
+        && result.links == capsule.links
+        && result.base_commit == capsule.base_commit
+        && result.checkpoints == capsule.checkpoints
+        && result.evidence == capsule.evidence
+        && result.created_at_unix == capsule.created_at_unix;
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::ResultDrift(capsule.id.clone()))
+    }
+}
+
+fn validate_interrupted_v3_result(
+    capsule: &Capsule,
+    reference: &ResultRef,
+    result: &CapsuleResult,
+    patch: &[u8],
+) -> Result<()> {
+    let patch_digest = hex::encode(Sha256::digest(patch));
+    let v2_projection = V2Result {
+        schema_version: 2,
+        capsule_id: result.capsule_id.clone(),
+        label: result.label.clone(),
+        links: result.links.clone(),
+        kind: result.kind,
+        base_commit: result.base_commit.clone(),
+        head_commit: result.head_commit.clone(),
+        patch_sha256: result.patch_sha256.clone(),
+        patch_bytes: result.patch_bytes,
+        changed_paths: result.changed_paths.clone(),
+        checkpoints: result.checkpoints.clone(),
+        evidence: result.evidence.clone(),
+        created_at_unix: result.created_at_unix,
+        sealed_at_unix: result.sealed_at_unix,
+    };
+    let v2_digest = digest_json(&v2_projection, Path::new("v2 result projection"))?;
+    let valid = result.schema_version == SCHEMA_VERSION
+        && !result.ignored_paths_complete
+        && result.ignored_bytes == 0
+        && result.ignored_content_sha256.is_none()
+        && result.ignored_paths.is_empty()
+        && reference.kind == result.kind
+        && reference.head_commit == result.head_commit
+        && reference.patch_sha256 == patch_digest
+        && reference.patch_sha256 == result.patch_sha256
+        && reference.result_sha256 == v2_digest
+        && reference.patch_bytes == patch.len() as u64
+        && reference.patch_bytes == result.patch_bytes
+        && reference.changed_paths == result.changed_paths.len()
+        && reference.sealed_at_unix == result.sealed_at_unix
+        && result.capsule_id == capsule.id
+        && result.label == capsule.label
+        && result.links == capsule.links
+        && result.base_commit == capsule.base_commit
+        && result.checkpoints == capsule.checkpoints
+        && result.evidence == capsule.evidence
+        && result.created_at_unix == capsule.created_at_unix;
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::ResultDrift(capsule.id.clone()))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct V2Capsule {
+    schema_version: u32,
+    id: String,
+    label: Option<String>,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
+    state: CapsuleState,
+    source_worktree: PathBuf,
+    repository_common_dir: PathBuf,
+    workspace_git_dir: Option<PathBuf>,
+    workspace_path: PathBuf,
+    project_key: String,
+    branch: String,
+    base_commit: String,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    #[serde(default)]
+    checkpoints: Vec<Checkpoint>,
+    checkpoint: Option<CheckpointJournal>,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
+    result: Option<ResultRef>,
+    integration: Option<Integration>,
+    cleanup: Option<Cleanup>,
+    closed_at_unix: Option<u64>,
+    dropped_at_unix: Option<u64>,
+}
+
+impl From<V2Capsule> for Capsule {
+    fn from(value: V2Capsule) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            id: value.id,
+            label: value.label,
+            links: value.links,
+            state: value.state,
+            source_worktree: value.source_worktree,
+            repository_common_dir: value.repository_common_dir,
+            workspace_git_dir: value.workspace_git_dir,
+            workspace_path: value.workspace_path,
+            project_key: value.project_key,
+            branch: value.branch,
+            base_commit: value.base_commit,
+            created_at_unix: value.created_at_unix,
+            updated_at_unix: value.updated_at_unix,
+            checkpoints: value.checkpoints,
+            checkpoint: value.checkpoint,
+            evidence: value.evidence,
+            audit_events: Vec::new(),
+            audit_events_dropped: 0,
+            result: value.result,
+            integration: value.integration,
+            cleanup: value.cleanup,
+            closed_at_unix: value.closed_at_unix,
+            dropped_at_unix: value.dropped_at_unix,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct V2Result {
+    schema_version: u32,
+    capsule_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    links: BTreeMap<String, String>,
+    kind: ResultKind,
+    base_commit: String,
+    head_commit: String,
+    patch_sha256: String,
+    patch_bytes: u64,
+    changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checkpoints: Vec<Checkpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<Evidence>,
+    created_at_unix: u64,
+    sealed_at_unix: u64,
+}
+
+impl From<V2Result> for CapsuleResult {
+    fn from(value: V2Result) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            capsule_id: value.capsule_id,
+            label: value.label,
+            links: value.links,
+            kind: value.kind,
+            base_commit: value.base_commit,
+            head_commit: value.head_commit,
+            patch_sha256: value.patch_sha256,
+            patch_bytes: value.patch_bytes,
+            changed_paths: value.changed_paths,
+            ignored_paths_complete: false,
+            ignored_bytes: 0,
+            ignored_content_sha256: None,
+            ignored_paths: Vec::new(),
+            checkpoints: value.checkpoints,
+            evidence: value.evidence,
+            created_at_unix: value.created_at_unix,
+            sealed_at_unix: value.sealed_at_unix,
+        }
     }
 }
 
@@ -356,6 +959,41 @@ fn malformed_capsule_identity(
             .as_ref()
             .and_then(|cleanup| cleanup.branch_head.as_ref())
             .is_some_and(|head| !valid_object_id(head))
+        || capsule.audit_events_dropped > 0 && capsule.audit_events.len() < AUDIT_EVENT_CAP
+        || invalid_audit_events(capsule)
+}
+
+fn invalid_audit_events(capsule: &Capsule) -> bool {
+    if capsule.audit_events.len() > AUDIT_EVENT_CAP {
+        return true;
+    }
+    let mut previous_time = capsule.created_at_unix;
+    for event in &capsule.audit_events {
+        let valid_id = event.event_id.len() == 30
+            && event.event_id.starts_with("evt-")
+            && event
+                .event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if event.schema_version != AUDIT_SCHEMA_VERSION
+            || !valid_id
+            || event.capsule_id.as_deref() != Some(capsule.id.as_str())
+            || event.project_key.as_deref() != Some(capsule.project_key.as_str())
+            || event.state.is_none()
+            || event.occurred_at_unix < previous_time
+            || event.attributes.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 64
+                    || value.len() > 4096
+                    || key.chars().any(char::is_control)
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return true;
+        }
+        previous_time = event.occurred_at_unix;
+    }
+    false
 }
 
 fn lifecycle_journals_consistent(capsule: &Capsule) -> bool {
@@ -471,14 +1109,129 @@ fn reject_symlink_or_non_file_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
+fn publish_staged_directory(
+    staged: &tempfile::TempDir,
+    destination: &Path,
+    completion_marker: &str,
+) -> Result<()> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    match fs::create_dir(destination) {
+        Ok(()) => set_private_dir_permissions(destination)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(Error::InvalidInput(format!(
+                "destination already exists: {}",
+                destination.display()
+            )));
+        }
+        Err(error) => return Err(io(destination, error)),
+    }
+
+    let marker = staged.path().join(completion_marker);
+    let mut entries = fs::read_dir(staged.path())
+        .map_err(|error| io(staged.path(), error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| io(staged.path(), error))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if entry.path() == marker {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        fs::rename(entry.path(), &target).map_err(|error| io(&target, error))?;
+    }
+    let target_marker = destination.join(completion_marker);
+    fs::rename(&marker, &target_marker).map_err(|error| io(&target_marker, error))?;
+    sync_directory(destination)?;
+    sync_directory(parent)
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io(path, error)),
+    }
+}
+
+fn validate_existing_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::UnsafeState(format!(
+            "expected an existing non-symlink directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn directory_size(root: &Path, excluded_root_names: &[&str]) -> Result<u64> {
+    validate_existing_directory(root)?;
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            if directory == root
+                && excluded_root_names
+                    .iter()
+                    .any(|name| entry.file_name() == std::ffi::OsStr::new(name))
+            {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                total = total
+                    .checked_add(
+                        entry
+                            .metadata()
+                            .map_err(|error| io(entry.path(), error))?
+                            .len(),
+                    )
+                    .ok_or_else(|| {
+                        Error::UnsafeState("filesystem byte count overflowed".to_owned())
+                    })?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn inspect_manifest(path: &Path) -> Result<(Option<u32>, Option<String>)> {
+    let value = read_json_value(path, JSON_CAP)?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let state = value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok((version, state))
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
+    let value = read_json_value(path, cap)?;
+    serde_json::from_value(value).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_json_value(path: &Path, cap: u64) -> Result<serde_json::Value> {
     let bytes = read_bytes_bounded(path, cap)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|source| Error::Json {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let found = value
+    serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn json_version(value: &serde_json::Value, path: &Path) -> Result<u32> {
+    value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
@@ -487,7 +1240,12 @@ fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> 
                 "state JSON has no valid schema_version: {}",
                 path.display()
             ))
-        })?;
+        })
+}
+
+fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
+    let value = read_json_value(path, cap)?;
+    let found = json_version(&value, path)?;
     if found != SCHEMA_VERSION {
         return Err(Error::SchemaVersion {
             found,

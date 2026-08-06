@@ -30,7 +30,7 @@ An evaluation harness can attach dimensions using links:
 --link sample=184
 ```
 
-The result patch and evidence are stable artifacts even after the worktree is dropped.
+The result patch, manifest, artifact descriptors, exported bundle, and evidence remain stable after the worktree is dropped. Harnesses may implement `ArtifactSink` to stream sealed bytes into their own object store or CAS without adding that backend to core.
 
 ## Task trackers
 
@@ -59,7 +59,7 @@ task
 └── capsule candidate-c
 ```
 
-Workers may modify identical paths concurrently because their files and indexes are isolated. Reviewers consume sealed result manifests and patches. The coordinator chooses if and when to integrate.
+Workers may modify identical paths concurrently because their files and indexes are isolated. Reviewers consume sealed result manifests, patches, or self-describing exports. The coordinator chooses if and when to integrate. Lifecycle events and aggregate metrics are available through the same crate/CLI without requiring a coordinator-specific adapter.
 
 Change Capsule intentionally does not choose workers, route tasks, retry models, resolve conflicts, or select winners.
 
@@ -76,6 +76,10 @@ The reusable API is `CapsuleManager`. Embedders can:
 - retrieve paths and status;
 - record checkpoints and evidence;
 - close and inspect results;
+- discover, stream, publish, or export sealed artifacts;
+- read per-capsule or administrative audit events and aggregate metrics;
+- install and evaluate repository/resource policy;
+- inspect, back up, and explicitly migrate durable state;
 - integrate and drop explicitly;
 - call recovery at startup.
 
@@ -107,7 +111,7 @@ capsule --json evidence "$id" \
 capsule --json close "$id"
 ```
 
-Production runners should avoid shell parsing by calling the Rust library or decoding JSON in their native language.
+Production runners should avoid shell parsing by calling the Rust library or decoding JSON in their native language. No cloud, agent, or workflow wrapper is required: any caller can invoke the crate API or `capsule` binary directly.
 
 ## Non-goals for adapters
 

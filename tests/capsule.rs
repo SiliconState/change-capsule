@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use change_capsule::{
-    Author, CapsuleHealth, CapsuleManager, CapsuleState, CheckpointOptions, CloseOptions,
-    CreateOptions, Error, EvidenceInput, IntegrateOptions, ResultKind,
+    ArtifactDescriptor, ArtifactKind, ArtifactSink, AuditEventKind, Author, CapsuleHealth,
+    CapsuleManager, CapsuleState, CheckpointOptions, CloseOptions, CreateOptions, Error,
+    EvidenceInput, IntegrateOptions, MigrationOptions, Policy, ResultKind,
 };
 use tempfile::TempDir;
 
@@ -509,6 +511,39 @@ fn ignored_content_added_after_close_is_detected_as_result_drift() {
 }
 
 #[test]
+fn ignored_content_modified_after_close_is_detected_as_result_drift() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("ignored-content-drift");
+    fs::write(capsule.workspace_path.join(".gitignore"), "ignored.log\n")
+        .expect("write ignore rule");
+    fs::write(
+        capsule.workspace_path.join("ignored.log"),
+        "sealed ignored content\n",
+    )
+    .expect("write ignored content before close");
+    let result = manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+    assert_eq!(result.ignored_paths, vec!["ignored.log"]);
+    assert!(result.ignored_bytes > 0);
+    assert!(result.ignored_content_sha256.is_some());
+
+    fs::write(
+        capsule.workspace_path.join("ignored.log"),
+        "mutated ignored content\n",
+    )
+    .expect("mutate ignored content after close");
+    let status = manager.status(&capsule.id).expect("drift status");
+    assert_eq!(status.health, CapsuleHealth::DriftedAfterClose);
+    assert_eq!(status.sealed, Some(false));
+    assert!(matches!(
+        manager.drop_capsule(&capsule.id, false),
+        Err(Error::ResultDrift(id)) if id == capsule.id
+    ));
+}
+
+#[test]
 fn malformed_or_missing_result_artifacts_report_drift_in_status() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -595,6 +630,266 @@ fn integration_into_a_detached_target_preserves_detached_head_identity() {
         fs::read_to_string(detached.join("shared.txt")).expect("read detached result"),
         "detached result\n"
     );
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TestV2Result {
+    schema_version: u32,
+    capsule_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    links: BTreeMap<String, String>,
+    kind: ResultKind,
+    base_commit: String,
+    head_commit: String,
+    patch_sha256: String,
+    patch_bytes: u64,
+    changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checkpoints: Vec<change_capsule::Checkpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<change_capsule::Evidence>,
+    created_at_unix: u64,
+    sealed_at_unix: u64,
+}
+
+#[derive(Default)]
+struct MemorySink {
+    artifacts: Vec<(String, Vec<u8>)>,
+}
+
+impl ArtifactSink for MemorySink {
+    fn put(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        source: &mut dyn Read,
+    ) -> change_capsule::Result<String> {
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(|source| Error::Io {
+            path: PathBuf::from(&descriptor.name),
+            source,
+        })?;
+        self.artifacts.push((descriptor.name.clone(), bytes));
+        Ok(format!("memory://{}", descriptor.content_address))
+    }
+}
+
+#[test]
+fn sealed_artifacts_support_discovery_streaming_publication_and_export() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("artifacts");
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "artifact result\n",
+    )
+    .expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let bundle = manager.artifacts(&capsule.id).expect("discover artifacts");
+    assert_eq!(bundle.capsule_id, capsule.id);
+    assert_eq!(bundle.artifacts.len(), 2);
+    assert!(bundle.artifacts.iter().all(|artifact| {
+        artifact.uri.starts_with("file://")
+            && artifact.content_address == format!("sha256:{}", artifact.sha256)
+            && artifact.bytes > 0
+    }));
+
+    let mut patch = String::new();
+    manager
+        .open_artifact(&capsule.id, ArtifactKind::ResultPatch)
+        .expect("open patch stream")
+        .read_to_string(&mut patch)
+        .expect("read patch stream");
+    assert!(patch.contains("artifact result"));
+
+    let mut sink = MemorySink::default();
+    let published = manager
+        .publish_artifacts(&capsule.id, &mut sink)
+        .expect("publish artifacts");
+    assert_eq!(published.len(), 2);
+    assert_eq!(sink.artifacts.len(), 2);
+    assert!(
+        published
+            .iter()
+            .all(|artifact| artifact.uri.starts_with("memory://sha256:"))
+    );
+
+    let output = fixture.temp.path().join("exported");
+    let report = manager
+        .export_artifacts(&capsule.id, &output)
+        .expect("export artifacts");
+    assert_eq!(report.output_directory, output);
+    assert!(output.join("bundle.json").is_file());
+    assert!(output.join("result.json").is_file());
+    assert!(output.join("result.patch").is_file());
+    assert!(
+        report
+            .bundle
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.content_address.starts_with("sha256:"))
+    );
+}
+
+#[test]
+fn lifecycle_audit_events_and_metrics_are_runtime_neutral() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("audit");
+    fs::write(capsule.workspace_path.join("shared.txt"), "audited\n").expect("edit capsule");
+    manager
+        .add_evidence(
+            &capsule.id,
+            EvidenceInput {
+                command: "cargo test".to_owned(),
+                exit_code: 0,
+                summary: Some("passed".to_owned()),
+            },
+        )
+        .expect("add evidence");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let events = manager.audit_events(&capsule.id).expect("audit events");
+    assert_eq!(
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        vec![
+            AuditEventKind::Created,
+            AuditEventKind::EvidenceAdded,
+            AuditEventKind::Closed,
+        ]
+    );
+    assert!(events.windows(2).all(|events| {
+        events[0].occurred_at_unix <= events[1].occurred_at_unix
+            && events[0].event_id != events[1].event_id
+    }));
+    let metrics = manager.metrics().expect("metrics");
+    assert_eq!(metrics.capsules, 1);
+    assert_eq!(metrics.live_capsules, 1);
+    assert_eq!(metrics.sealed_results, 1);
+    assert_eq!(metrics.audit_events, 3);
+    assert_eq!(metrics.states.get("closed"), Some(&1));
+}
+
+#[test]
+fn policy_enforces_repository_count_patch_and_ignored_limits() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let policy = Policy {
+        allowed_repository_roots: vec![fixture.temp.path().to_path_buf()],
+        max_capsules: Some(1),
+        max_patch_bytes: 8,
+        max_ignored_paths: Some(0),
+        ..Policy::default()
+    };
+    manager.set_policy(policy).expect("set policy");
+
+    let capsule = fixture.create("policy");
+    assert!(matches!(
+        manager.create(CreateOptions::new(&fixture.repo)),
+        Err(Error::PolicyViolation(message)) if message.contains("capsule records")
+    ));
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "larger than eight bytes\n",
+    )
+    .expect("edit capsule");
+    assert!(matches!(
+        manager.close(&capsule.id, CloseOptions::default()),
+        Err(Error::PolicyViolation(message)) if message.contains("patch bytes")
+    ));
+
+    let mut policy = manager.policy().expect("read policy");
+    policy.max_patch_bytes = change_capsule::HARD_PATCH_BYTES;
+    manager.set_policy(policy).expect("relax patch policy");
+    fs::write(capsule.workspace_path.join(".gitignore"), "ignored.log\n")
+        .expect("write ignore rule");
+    fs::write(capsule.workspace_path.join("ignored.log"), "ignored\n")
+        .expect("write ignored content");
+    assert!(matches!(
+        manager.close(&capsule.id, CloseOptions::default()),
+        Err(Error::PolicyViolation(message)) if message.contains("ignored paths")
+    ));
+    assert!(!manager.policy_report().expect("policy report").compliant);
+}
+
+#[test]
+fn state_inspection_backup_and_explicit_v2_migration_preserve_results() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration");
+    fs::write(capsule.workspace_path.join("shared.txt"), "migrated\n").expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let manifest_path = manifest_path(&fixture, &capsule.id);
+    let result_path = result_path(&fixture, &capsule.id);
+    let mut manifest = read_json(&manifest_path);
+    let mut result = read_json(&result_path);
+    manifest["schema_version"] = serde_json::json!(2);
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("audit_events");
+    result["schema_version"] = serde_json::json!(2);
+    let result_object = result.as_object_mut().expect("result object");
+    result_object.remove("ignored_paths_complete");
+    result_object.remove("ignored_bytes");
+    result_object.remove("ignored_content_sha256");
+    let old_result: TestV2Result =
+        serde_json::from_value(result.clone()).expect("decode authentic v2 result");
+    let old_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&old_result).expect("encode old result"),
+        ))
+    };
+    manifest["result"]["result_sha256"] = serde_json::Value::String(old_digest);
+    write_json(&result_path, &result);
+    write_json(&manifest_path, &manifest);
+
+    assert!(matches!(
+        manager.show(&capsule.id),
+        Err(Error::SchemaVersion {
+            found: 2,
+            supported: 3
+        })
+    ));
+    let inspection = manager.inspect_state().expect("inspect old state");
+    assert_eq!(inspection.records[0].schema_version, Some(2));
+    assert!(inspection.records[0].error.is_none());
+
+    let backup = fixture.temp.path().join("migration-backup");
+    let report = manager
+        .migrate_state(&MigrationOptions {
+            from_version: 2,
+            backup: backup.clone(),
+        })
+        .expect("migrate state");
+    assert_eq!(report.migrated_capsules, vec![capsule.id.clone()]);
+    assert!(
+        backup
+            .join("capsules")
+            .join(&capsule.id)
+            .join("capsule.json")
+            .is_file()
+    );
+    assert_eq!(
+        manager
+            .show(&capsule.id)
+            .expect("migrated capsule")
+            .schema_version,
+        3
+    );
+    let migrated = manager.result(&capsule.id).expect("migrated result");
+    assert!(!migrated.ignored_paths_complete);
+    assert_eq!(migrated.changed_paths, vec!["shared.txt"]);
 }
 
 #[test]
@@ -880,6 +1175,216 @@ fn status_reports_ignored_untracked_content_excluded_from_results() {
 }
 
 #[test]
+fn cli_exposes_artifacts_observability_policy_and_state_tools() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("cli-surfaces");
+    fs::write(capsule.workspace_path.join("shared.txt"), "cli result\n").expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    for (command, assertion) in [("artifacts", "artifacts"), ("audit", "created")] {
+        let output = capsule_cli(&fixture, [command, &capsule.id]);
+        assert_success(&output);
+        let rendered = String::from_utf8(output.stdout).expect("utf8 CLI JSON");
+        assert!(rendered.contains(assertion));
+    }
+    for command in [["metrics", ""], ["policy", "show"], ["state", "inspect"]] {
+        let args: Vec<_> = command
+            .into_iter()
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        let output = capsule_cli(&fixture, args);
+        assert_success(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("parse CLI JSON");
+    }
+
+    let exported = fixture.temp.path().join("cli-export");
+    let output = capsule_cli(
+        &fixture,
+        [
+            "export",
+            &capsule.id,
+            "--output",
+            exported.to_str().expect("utf8 export path"),
+        ],
+    );
+    assert_success(&output);
+    assert!(exported.join("bundle.json").is_file());
+
+    let backup = fixture.temp.path().join("cli-backup");
+    let output = capsule_cli(
+        &fixture,
+        [
+            "state",
+            "backup",
+            "--output",
+            backup.to_str().expect("utf8 backup path"),
+        ],
+    );
+    assert_success(&output);
+    assert!(backup.join("capsules").join(&capsule.id).is_dir());
+}
+
+#[test]
+fn migration_rejects_tampered_v2_result_after_taking_backup() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration-tamper");
+    fs::write(capsule.workspace_path.join("shared.txt"), "sealed\n").expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let manifest_path = manifest_path(&fixture, &capsule.id);
+    let result_path = result_path(&fixture, &capsule.id);
+    let mut manifest = read_json(&manifest_path);
+    let mut result = read_json(&result_path);
+    manifest["schema_version"] = serde_json::json!(2);
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("audit_events");
+    result["schema_version"] = serde_json::json!(2);
+    let result_object = result.as_object_mut().expect("result object");
+    result_object.remove("ignored_paths_complete");
+    result_object.remove("ignored_bytes");
+    result_object.remove("ignored_content_sha256");
+    result["changed_paths"] = serde_json::json!(["forged.txt"]);
+    write_json(&manifest_path, &manifest);
+    write_json(&result_path, &result);
+
+    let backup = fixture.temp.path().join("tamper-backup");
+    assert!(matches!(
+        manager.migrate_state(&MigrationOptions {
+            from_version: 2,
+            backup: backup.clone(),
+        }),
+        Err(Error::ResultDrift(id)) if id == capsule.id
+    ));
+    assert!(
+        backup
+            .join("capsules")
+            .join(&capsule.id)
+            .join("result.json")
+            .is_file()
+    );
+    assert_eq!(read_json(&manifest_path)["schema_version"], 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_and_backup_refuse_dangling_symlink_destinations() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("dangling-output");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let export = fixture.temp.path().join("export-link");
+    symlink("missing-export-target", &export).expect("create dangling export link");
+    assert!(matches!(
+        manager.export_artifacts(&capsule.id, &export),
+        Err(Error::InvalidInput(message)) if message.contains("already exists")
+    ));
+    assert!(
+        fs::symlink_metadata(&export)
+            .expect("export link survives")
+            .file_type()
+            .is_symlink()
+    );
+
+    let backup = fixture.temp.path().join("backup-link");
+    symlink("missing-backup-target", &backup).expect("create dangling backup link");
+    assert!(matches!(
+        manager.backup_state(&backup),
+        Err(Error::InvalidInput(message)) if message.contains("already exists")
+    ));
+    assert!(
+        fs::symlink_metadata(&backup)
+            .expect("backup link survives")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn interrupted_v2_migration_accepts_only_the_exact_v3_projection() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration-resume");
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "resume migration\n",
+    )
+    .expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    let manifest_path = manifest_path(&fixture, &capsule.id);
+    let result_path = result_path(&fixture, &capsule.id);
+    let mut manifest = read_json(&manifest_path);
+    let mut result = read_json(&result_path);
+    manifest["schema_version"] = serde_json::json!(2);
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("audit_events");
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("audit_events_dropped");
+    result["schema_version"] = serde_json::json!(2);
+    let result_object = result.as_object_mut().expect("result object");
+    result_object.remove("ignored_paths_complete");
+    result_object.remove("ignored_bytes");
+    result_object.remove("ignored_content_sha256");
+    let old_result: TestV2Result =
+        serde_json::from_value(result.clone()).expect("decode authentic v2 result");
+    let old_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&old_result).expect("encode old result"),
+        ))
+    };
+    manifest["result"]["result_sha256"] = serde_json::Value::String(old_digest);
+    write_json(&manifest_path, &manifest);
+
+    result["schema_version"] = serde_json::json!(3);
+    result["ignored_paths_complete"] = serde_json::Value::Bool(false);
+    result["ignored_bytes"] = serde_json::json!(0);
+    result["ignored_paths"] = serde_json::json!([]);
+    write_json(&result_path, &result);
+
+    let backup = fixture.temp.path().join("resume-backup");
+    let report = manager
+        .migrate_state(&MigrationOptions {
+            from_version: 2,
+            backup,
+        })
+        .expect("resume migration");
+    assert_eq!(report.migrated_capsules, vec![capsule.id.clone()]);
+    assert_eq!(
+        manager
+            .show(&capsule.id)
+            .expect("migrated record")
+            .schema_version,
+        3
+    );
+    assert!(
+        !manager
+            .result(&capsule.id)
+            .expect("migrated result")
+            .ignored_paths_complete
+    );
+}
+
+#[test]
 fn unregistered_embedded_repository_is_rejected_instead_of_becoming_a_gitlink() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -1047,6 +1552,22 @@ where
         .expect("utf8 git output")
         .trim()
         .to_owned()
+}
+
+fn capsule_cli<I, S>(fixture: &Fixture, args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args([
+            "--home",
+            fixture.state.to_str().expect("utf8 state path"),
+            "--json",
+        ])
+        .args(args)
+        .output()
+        .expect("run capsule CLI")
 }
 
 fn assert_success(output: &Output) {

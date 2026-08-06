@@ -53,7 +53,7 @@ Status fields relevant to automation:
 - `health`: stop on anything other than `healthy` while active;
 - `dirty`: whether the real worktree has uncommitted changes;
 - `changed_paths`: complete non-ignored paths changed from the pinned base;
-- `ignored_paths`: ignored untracked files/directories deliberately excluded from the capsule result;
+- `ignored_paths`: ignored untracked files/directories deliberately excluded from the patch but covered by the native v3 excluded-content seal;
 - `commits_ahead`: commits reachable from `HEAD` and not from the base;
 - `sealed`: after close, whether the worktree still matches the result.
 
@@ -94,7 +94,11 @@ The sealed result is available through:
 ```sh
 capsule --json result <id>
 capsule diff <id> --output /tmp/result.patch
+capsule --json artifacts <id>
+capsule --json export <id> --output /tmp/capsule-result
 ```
+
+`artifacts` returns a versioned bundle with media types, byte counts, local `file://` URIs, SHA-256 digests, and `sha256:` content addresses. `export` reserves a new no-clobber directory, moves in `result.json` and `result.patch`, and publishes `bundle.json` last as the completion marker. Rust embedders can call `open_artifact` for a bounded stream or implement `ArtifactSink` to publish to any local, object-store, or CAS backend without coupling core to that backend.
 
 ### 7. Review or compare
 
@@ -102,6 +106,8 @@ Reviewers do not need access to the original worker session. They can consume:
 
 - `result.json` through `capsule result`;
 - `result.patch` through `capsule diff`;
+- descriptor discovery through `capsule artifacts`;
+- a self-describing export through `capsule export`;
 - the preserved workspace path while it remains present;
 - evidence and external links in the manifest.
 
@@ -142,6 +148,8 @@ Current error kinds are:
 - `not_found`
 - `invalid_input`
 - `invalid_state`
+- `policy`
+- `artifact_not_found`
 - `safety`
 - `unsealed_result`
 - `dirty_target`
@@ -150,7 +158,23 @@ Current error kinds are:
 - `schema_version`
 - `internal`
 
-Consumers should branch on `kind` and retain the message for diagnosis. `cli` covers argument-parser failures; JSON help and version requests instead succeed with `kind=cli_help` and an `output` field. All other listed error kinds come from library operations. The on-disk manifest and result format is currently schema version 2. Incompatible schemas fail closed; additive JSON output fields may appear within the same major package line.
+Consumers should branch on `kind` and retain the message for diagnosis. `cli` covers argument-parser failures; JSON help and version requests instead succeed with `kind=cli_help` and an `output` field. All other listed error kinds come from library operations. The on-disk manifest and result format is schema version 3. Incompatible schemas fail closed; additive JSON output fields may appear within the same major package line.
+
+## Audit and metrics
+
+Every successful lifecycle mutation retains a versioned event in the capsule manifest, up to the newest 128 events. When older events roll off, `audit_events_dropped` increments and aggregate metrics report the dropped count. Read one stream with `capsule --json audit <id>` or all retained records with `capsule --json audit`. Events include transition identities and bounded attributes; evidence commands are represented by digest rather than duplicated verbatim. They are an administrative history, not a cryptographically signed or append-only ledger.
+
+`capsule --json metrics` computes an instantaneous snapshot of capsule states, live/sealed counts, result patch bytes, state/workspace bytes, and retained/dropped event counts. Core does not run a collector or transmit telemetry. Callers may scrape this command or use `CapsuleManager::metrics`.
+
+## Policy
+
+An absent policy means permissive defaults under hard safety bounds. `capsule policy set --file <json>` atomically replaces versioned policy; `capsule policy check` evaluates current records. Policy may allowlist canonical repository roots and limit total/live records, age, state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes.
+
+Policy is checked at core lifecycle boundaries. It is not a continuous filesystem reservation: a worker may grow a workspace between commands. Use OS/filesystem quotas when hard continuous enforcement is required.
+
+## State administration
+
+`capsule state inspect` reports record versions and states even when normal schema deserialization would fail. `capsule state backup --output <new-directory>` copies recognized durable state and policy, excluding workspaces and Git repositories, and publishes `backup.json` last as the completion marker. `capsule state migrate --from 2 --backup <new-directory>` is the only supported migration; it always backs up first, validates typed v2 identities and result seals, and marks the unavailable v2 ignored-path inventory incomplete. Migration uses atomic per-file writes and is safe to retry after interruption. `bundle.json` similarly marks a complete artifact export; a reserved destination lacking its marker is incomplete and is not reused implicitly.
 
 ## Links
 
@@ -168,7 +192,7 @@ No key has privileged semantics in core.
 
 ## Concurrency
 
-Operations that mutate one repository's capsules take a project-scoped file lock. Multiple repositories do not block one another. Multiple active capsules in one repository remain independent Git worktrees.
+Operations that mutate one repository's capsules take a project-scoped file lock. Policy-sensitive mutations also take the global lock so global counters cannot race. Backup, migration, policy replacement/checking, metrics, inspection, and the administrative audit stream take the global lock plus every known project lock in deterministic order. Multiple active capsules remain independent Git worktrees.
 
 The caller should still avoid issuing two mutating commands against the same capsule simultaneously. Locks serialize them, but a stale caller may receive a state error after the first operation completes.
 

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use change_capsule::{
     Author, CapsuleManager, CheckpointOptions, CloseOptions, CreateOptions, EvidenceInput,
-    IntegrateOptions,
+    IntegrateOptions, MigrationOptions, Policy,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -47,6 +47,18 @@ enum Command {
     Diff(DiffArgs),
     /// Show the sealed result manifest.
     Result(IdArgs),
+    /// Discover sealed artifacts with media types, file URIs, sizes, and digests.
+    Artifacts(IdArgs),
+    /// Export a self-describing sealed artifact directory.
+    Export(ExportArgs),
+    /// Show structured lifecycle audit events for one capsule or all capsules.
+    Audit(AuditArgs),
+    /// Show an aggregate observability snapshot.
+    Metrics,
+    /// Read, replace, or evaluate resource and repository policy.
+    Policy(PolicyArgs),
+    /// Inspect, back up, or migrate durable state.
+    State(StateArgs),
     /// Commit the capsule's current changes as a durable checkpoint.
     Checkpoint(CheckpointArgs),
     /// Attach externally-run verification evidence to an active capsule.
@@ -92,6 +104,64 @@ struct DiffArgs {
     /// Write patch bytes to a file instead of standard output.
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct AuditArgs {
+    /// Capsule ID. Omit to read the administrative event stream.
+    id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    id: String,
+
+    /// New directory that will receive bundle.json, result.json, and result.patch.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    command: PolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Show the effective policy; absent policy.json means permissive defaults.
+    Show,
+    /// Evaluate all current records and workspaces against the effective policy.
+    Check,
+    /// Replace policy.json from a versioned JSON document.
+    Set {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Debug, Args)]
+struct StateArgs {
+    #[command(subcommand)]
+    command: StateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StateCommand {
+    /// Inspect records without requiring their schema to be supported.
+    Inspect,
+    /// Copy durable manifests, results, patches, and policy to a new directory.
+    Backup {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Explicitly migrate a supported old schema after creating a backup.
+    Migrate {
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        backup: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -353,6 +423,46 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 }
             }
         }
+        Command::Artifacts(arguments) => {
+            print_value(&manager.artifacts(&arguments.id)?, cli.json)?;
+        }
+        Command::Export(arguments) => {
+            print_value(
+                &manager.export_artifacts(&arguments.id, arguments.output)?,
+                cli.json,
+            )?;
+        }
+        Command::Audit(arguments) => {
+            let events = match arguments.id {
+                Some(id) => manager.audit_events(&id)?,
+                None => manager.audit_log()?,
+            };
+            print_value(&events, cli.json)?;
+        }
+        Command::Metrics => print_value(&manager.metrics()?, cli.json)?,
+        Command::Policy(arguments) => match arguments.command {
+            PolicyCommand::Show => print_value(&manager.policy()?, cli.json)?,
+            PolicyCommand::Check => print_value(&manager.policy_report()?, cli.json)?,
+            PolicyCommand::Set { file } => {
+                let policy: Policy = read_json_file(&file, 64 * 1024)?;
+                print_value(&manager.set_policy(policy)?, cli.json)?;
+            }
+        },
+        Command::State(arguments) => match arguments.command {
+            StateCommand::Inspect => print_value(&manager.inspect_state()?, cli.json)?,
+            StateCommand::Backup { output } => {
+                print_value(&manager.backup_state(output)?, cli.json)?;
+            }
+            StateCommand::Migrate { from, backup } => {
+                print_value(
+                    &manager.migrate_state(&MigrationOptions {
+                        from_version: from,
+                        backup,
+                    })?,
+                    cli.json,
+                )?;
+            }
+        },
         Command::Checkpoint(arguments) => {
             let checkpoint = manager.checkpoint(
                 &arguments.id,
@@ -419,6 +529,32 @@ fn parse_link(value: &str) -> Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| "links must use KEY=VALUE".to_owned())?;
     Ok((key.to_owned(), value.to_owned()))
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    cap: u64,
+) -> change_capsule::Result<T> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| change_capsule::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap {
+        return Err(change_capsule::Error::InvalidInput(format!(
+            "JSON input must be a regular non-symlink file no larger than {cap} bytes: {}",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|source| change_capsule::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| {
+        change_capsule::Error::InvalidInput(format!(
+            "invalid JSON input at {}: {source}",
+            path.display()
+        ))
+    })
 }
 
 fn print_value<T: Serialize + std::fmt::Debug>(
@@ -491,6 +627,8 @@ fn error_kind(error: &change_capsule::Error) -> &'static str {
             "invalid_input"
         }
         change_capsule::Error::InvalidState { .. } => "invalid_state",
+        change_capsule::Error::PolicyViolation(_) => "policy",
+        change_capsule::Error::ArtifactNotFound(_) => "artifact_not_found",
         change_capsule::Error::UnsafeState(_) | change_capsule::Error::ForeignWorktree(_) => {
             "safety"
         }

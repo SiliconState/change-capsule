@@ -21,6 +21,10 @@ A capsule is more than a Git worktree. It records the complete boundary of an at
 - checkpoints created during the attempt, including crash-recoverable checkpoint journals;
 - caller-recorded verification evidence;
 - complete binary-capable patch, changed-path inventory, and sealed provenance;
+- discoverable, streamable artifacts with file URIs and SHA-256 content addresses;
+- bounded structured lifecycle audit events and aggregate metrics;
+- configurable repository, count, age, size, patch, path, and ignored-content policy;
+- explicit state inspection, backup, and v2-to-v3 migration;
 - immutable result digest and drift detection;
 - explicit, journaled integration;
 - guarded cleanup and crash recovery.
@@ -93,12 +97,16 @@ capsule --json evidence cap-01... \
   --summary "all tests passed"
 ```
 
-Seal the result. `--require-successful-evidence` rejects missing or failed evidence:
+Seal and discover the result. `--require-successful-evidence` rejects missing or failed evidence:
 
 ```sh
 capsule --json close cap-01... --require-successful-evidence
 capsule --json result cap-01...
+capsule --json artifacts cap-01...
+capsule --json export cap-01... --output ./handoff
 ```
+
+`artifacts` reports media types, byte lengths, `file://` URIs, and `sha256:` content addresses. `export` reserves a new destination directory without clobbering, moves in `result.json` and `result.patch`, then publishes `bundle.json` last as the completion marker.
 
 Integrate only the selected result into a clean worktree that is still at the pinned base:
 
@@ -124,6 +132,12 @@ capsule path         print the ordinary filesystem workspace path
 capsule status       inspect health, changed paths, commits, and seal state
 capsule diff         emit the complete current or sealed patch
 capsule result       show the sealed handoff manifest
+capsule artifacts    discover sealed artifacts, URIs, sizes, and content addresses
+capsule export       create a self-describing result artifact directory
+capsule audit        show one capsule's events or the administrative event stream
+capsule metrics      show aggregate lifecycle and storage counters
+capsule policy       show, replace, or evaluate resource/repository policy
+capsule state        inspect, back up, or explicitly migrate durable state
 capsule checkpoint   commit current work with an explicit identity
 capsule evidence     record externally-run verification evidence
 capsule close        seal patch, inventory, evidence, and digest
@@ -132,9 +146,48 @@ capsule drop         safely remove an owned worktree and branch
 capsule recover      reconcile interrupted journal states
 ```
 
-`--json` is global. Errors are emitted as one JSON object on stderr in JSON mode. `capsule diff --json` returns metadata rather than embedding arbitrary patch bytes; pass `--output <file>` for patch data.
+`--json` is global. Errors are emitted as one JSON object on stderr in JSON mode. `capsule diff --json` returns metadata rather than embedding arbitrary patch bytes; pass `--output <file>` for patch data. Policy failures use error kind `policy`; unknown artifact requests use `artifact_not_found`.
 
 State defaults to the platform state directory and can be overridden with `CAPSULE_HOME` or `--home`.
+
+## Policy and operations
+
+An absent `policy.json` means permissive defaults subject to hard safety bounds. Replace policy atomically from a versioned JSON document and evaluate existing state separately:
+
+```sh
+capsule --json policy set --file ./capsule-policy.json
+capsule --json policy check
+capsule --json metrics
+capsule --json audit
+```
+
+Policy supports allowed repository roots and optional limits for total/live capsule count, capsule age, state/workspace bytes, result patch bytes, changed paths, ignored paths, and ignored bytes. Mutating operations fail before their principal side effect when the applicable limit is exceeded. `policy check` is observational and reports existing violations. For example:
+
+```json
+{
+  "schema_version": 1,
+  "allowed_repository_roots": ["/srv/repositories"],
+  "max_capsules": 200,
+  "max_live_capsules": 20,
+  "max_patch_bytes": 16777216,
+  "max_changed_paths": 500,
+  "max_ignored_paths": 20,
+  "max_ignored_bytes": 104857600,
+  "max_capsule_age_seconds": 604800,
+  "max_state_bytes": 1073741824,
+  "max_workspace_bytes": 10737418240
+}
+```
+
+State administration is explicit:
+
+```sh
+capsule --json state inspect
+capsule --json state backup --output ./capsule-backup
+capsule --json state migrate --from 2 --backup ./pre-v3-backup
+```
+
+Inspection reads schema/version summaries without requiring supported records. Backup and migration require a new destination and copy durable manifests, results, patches, and policy, not live workspaces or Git repositories. Backup publishes `backup.json` last as its completion marker. Migration currently supports only v2 to v3, validates typed v2 identities and result seals before writing, marks the historically unavailable ignored-path inventory incomplete, and always creates a backup first. An interrupted export or backup may leave a reserved destination without its completion marker; callers should treat it as incomplete and choose a new destination or remove it after inspection.
 
 ## Rust API
 
@@ -153,7 +206,7 @@ let result = manager.close(&capsule.id, CloseOptions::default())?;
 # Ok::<(), change_capsule::Error>(())
 ```
 
-The crate owns lifecycle and provenance. The caller owns process launch, model choice, prompts, credentials, sandboxing, and verification execution.
+The crate owns lifecycle, provenance, artifact descriptors/streams, policy checkpoints, audit records, and state administration. The caller owns process launch, model choice, prompts, credentials, sandboxing, verification execution, and any remote artifact transport.
 
 ## Guarantees in the first milestone
 
@@ -161,11 +214,14 @@ The crate owns lifecycle and provenance. The caller owns process launch, model c
 2. Each receives a separate ordinary Git worktree and branch.
 3. Attempts may change the same files independently.
 4. The source worktree remains untouched until explicit integration.
-5. Every result has a complete patch, changed-path inventory, digest, and sealed provenance, including label, links, checkpoints, and evidence.
-6. Results and journaled checkpoint, integration, and cleanup transitions survive process restart and can be inspected or recovered by another process or agent.
-7. Missing, replaced, drifted, or unrepresentable workspaces fail closed.
-8. Cleanup refuses foreign directories even with `--force`.
-9. Integration is explicit and requires a clean target at the exact pinned base.
+5. Every result has a complete patch, changed-path inventory, digest, sealed provenance, and discoverable artifact descriptors/streams.
+6. Lifecycle transitions produce bounded structured audit events; aggregate metrics are available without a daemon.
+7. Repository and resource policy is enforced at core mutation boundaries and can be evaluated against current state.
+8. Results and journaled checkpoint, integration, and cleanup transitions survive process restart and can be inspected or recovered by another process or agent.
+9. Missing, replaced, drifted, or unrepresentable workspaces fail closed.
+10. Cleanup refuses foreign directories even with `--force`.
+11. Integration is explicit and requires a clean target at the exact pinned base.
+12. State can be inspected, backed up, and explicitly migrated from v2 to v3 without a runtime-specific service.
 
 ## Scope
 
@@ -182,9 +238,9 @@ See:
 
 ## Status
 
-This is the smallest convincing milestone. It intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Sparse-checkout, `skip-worktree`, and `assume-unchanged` entries are rejected because an absent or hidden file cannot be distinguished safely from a requested deletion. Dirty nested submodule worktrees and unregistered embedded Git repositories are rejected rather than silently omitted or converted to accidental gitlinks; commit a registered submodule change first if the top-level gitlink should be captured. Ignored untracked paths are excluded but reported by `status.ignored_paths`. Remote execution, distributed persistence, background jobs, non-Git snapshots, automatic rebasing, merge queues, network services, signed attestations, quotas, and execution sandboxing remain out of scope.
+This release intentionally supports Git repositories only and expects UTF-8 paths in result inventories. Sparse-checkout, `skip-worktree`, and `assume-unchanged` entries are rejected because an absent or hidden file cannot be distinguished safely from a requested deletion. Dirty nested submodule worktrees and unregistered embedded Git repositories are rejected rather than silently omitted or converted to accidental gitlinks; commit a registered submodule change first if the top-level gitlink should be captured. Ignored untracked paths are excluded but reported by `status.ignored_paths`. Remote execution, distributed persistence, background jobs, non-Git snapshots, automatic rebasing, merge queues, network services, signed attestations, continuous kernel-enforced quotas, and execution sandboxing remain out of scope.
 
-The on-disk schema is currently version 2. This pre-release build fails closed on incompatible state rather than silently interpreting an older schema.
+The on-disk capsule/result schema is version 3. Incompatible state fails closed. Explicit migration currently supports v2 to v3 and requires a new backup directory; other versions remain unsupported.
 
 ## License
 

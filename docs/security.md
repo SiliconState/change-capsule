@@ -21,9 +21,23 @@ State handling is fail-closed:
 - patches are capped at 64 MiB;
 - Unix state directories are `0700` and files are `0600`;
 - writes use an owner-private temporary file, file sync, atomic persistence, and directory sync;
-- lock and manifest names derive only from validated capsule IDs and project keys.
+- lock and manifest names derive only from validated capsule IDs and project keys;
+- artifact exports and backups require a new non-symlink destination parent, atomically reserve the destination directory, and publish `bundle.json` or `backup.json` last as a completion marker;
+- v2-to-v3 migration takes a durable-state backup first and validates typed v2 identities, result metadata, patch bytes, and both stored digests before writing v3 records.
 
-Opaque links and evidence summaries are stored locally but are not secret stores. Do not place credentials in them.
+Opaque links and evidence summaries are stored locally but are not secret stores. Do not place credentials in them. Audit events are also local metadata; evidence commands are represented there by SHA-256 but remain present in the evidence record itself.
+
+## Artifact protections
+
+Artifact discovery first revalidates the sealed result. Descriptors report percent-encoded local `file://` URIs and `sha256:` content addresses; these identify bytes but do not grant access or prove authorship. `open_artifact` rechecks regular-file shape and size before returning a bounded local stream. `ArtifactSink` implementations are caller code and inherit the caller's trust, authentication, retention, and transport responsibilities.
+
+Export and backup never overwrite an existing destination and refuse destinations inside managed state. Export copies only a validated sealed result and emits descriptors for the exported paths. Backup copies recognized state files and policy, but intentionally excludes live workspaces, Git object databases, and lock files. A destination lacking its final `bundle.json` or `backup.json` marker is an interrupted, incomplete publication.
+
+## Policy protections and limits
+
+Policy roots are canonicalized before persistence. Global counters are checked while the global lock and applicable project lock are held. Patch/path/ignored-content checks run before checkpoint or close side effects; age, state-byte, workspace-byte, and repository checks run at mutation boundaries.
+
+These are cooperative policy checkpoints, not filesystem reservations or a security sandbox. A worker can consume disk between operations, ignored content can disappear before it is measured, and same-user processes can bypass the crate. Use OS/filesystem quotas and process isolation for continuous hard limits.
 
 ## Git process protections
 
@@ -80,6 +94,7 @@ A seal covers:
 - complete binary-capable patch bytes;
 - SHA-256 patch digest;
 - changed paths;
+- ignored-path inventory for native v3 results;
 - evidence present at close time.
 
 This detects accidental or same-user mutation after handoff. It does not provide authenticity against a same-user attacker who can rewrite both state and repository content. Signed attestations would be a separate feature.
@@ -89,7 +104,10 @@ This detects accidental or same-user mutation after handoff. It does not provide
 - Sparse checkout and `skip-worktree` entries are rejected because they can make an absent tracked file indistinguishable from an intended deletion.
 - Dirty nested submodule worktrees are rejected because their internal content is not representable by a top-level Git patch; committed gitlink changes remain supported.
 - Unregistered embedded Git repositories are rejected rather than silently converted into accidental gitlinks.
-- State schema upgrades currently fail closed and require explicit migration or a fresh state root.
+- Migration supports only v2 to v3. It creates a backup first, validates old seals, and marks `ignored_paths_complete=false` because v2 did not seal ignored-path inventory; other schema versions fail closed.
+- Audit records retain the newest 128 events and report how many older events rolled off; they are validated but neither signed nor append-only against a same-user attacker who can rewrite state.
+- Aggregate metrics are instantaneous observations, not monotonic accounting or durable telemetry.
+- Policy quotas are checked at lifecycle boundaries rather than continuously enforced.
 - Same-user replacement between individual checks remains possible on hostile filesystems; cleanup and integration revalidate Git identities immediately before destructive or target-mutating operations, but the design is not a kernel-enforced capability system.
 - UTF-8 paths are required for the changed-path JSON inventory.
 - File locks are advisory.

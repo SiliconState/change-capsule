@@ -38,6 +38,10 @@ pub enum Error {
     NonUtf8Path(PathBuf),
     #[error("state schema version {found} is incompatible with supported version {supported}")]
     SchemaVersion { found: u32, supported: u32 },
+    #[error("policy violation: {0}")]
+    PolicyViolation(String),
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(String),
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
