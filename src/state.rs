@@ -235,13 +235,23 @@ impl StateStore {
     }
 
     pub(crate) fn read_result(&self, id: &str) -> Result<CapsuleResult> {
+        self.read_result_artifact(id).map(|(result, _)| result)
+    }
+
+    pub(crate) fn read_result_artifact(&self, id: &str) -> Result<(CapsuleResult, Vec<u8>)> {
         let path = self.capsule_dir(id)?.join("result.json");
-        let result: CapsuleResult = read_versioned_json(&path, JSON_CAP)?;
-        if result.schema_version != SCHEMA_VERSION {
-            return Err(Error::SchemaVersion {
-                found: result.schema_version,
-                supported: SCHEMA_VERSION,
-            });
+        let bytes = read_bytes_bounded(&path, JSON_CAP)?;
+        let result: CapsuleResult = decode_versioned_json(&path, &bytes)?;
+        let mut canonical = serde_json::to_vec_pretty(&result).map_err(|source| Error::Json {
+            path: path.clone(),
+            source,
+        })?;
+        canonical.push(b'\n');
+        if bytes != canonical {
+            return Err(Error::UnsafeState(format!(
+                "result artifact is not in its canonical encoding: {}",
+                path.display()
+            )));
         }
         if result.capsule_id != id {
             return Err(Error::UnsafeState(format!(
@@ -262,7 +272,7 @@ impl StateStore {
                 "result for capsule {id} contains malformed identity or size data"
             )));
         }
-        Ok(result)
+        Ok((result, bytes))
     }
 
     pub(crate) fn write_patch(&self, id: &str, patch: &[u8]) -> Result<()> {
@@ -309,30 +319,6 @@ impl StateStore {
         } else {
             Err(Error::ResultDrift(capsule.id.clone()))
         }
-    }
-
-    pub(crate) fn result_bytes(&self, id: &str) -> Result<Vec<u8>> {
-        let path = self.capsule_dir(id)?.join("result.json");
-        read_bytes_bounded(&path, JSON_CAP)
-    }
-
-    pub(crate) fn open_artifact(&self, id: &str, name: &str) -> Result<File> {
-        let path = self.capsule_dir(id)?.join(name);
-        let cap = if name == "result.patch" {
-            PATCH_CAP
-        } else if name == "result.json" {
-            JSON_CAP
-        } else {
-            return Err(Error::ArtifactNotFound(name.to_owned()));
-        };
-        let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap {
-            return Err(Error::UnsafeState(format!(
-                "artifact is unsafe or exceeds {cap} bytes: {}",
-                path.display()
-            )));
-        }
-        File::open(&path).map_err(|error| io(&path, error))
     }
 
     pub(crate) fn read_policy(&self) -> Result<Policy> {
@@ -1244,7 +1230,15 @@ fn json_version(value: &serde_json::Value, path: &Path) -> Result<u32> {
 }
 
 fn read_versioned_json<T: DeserializeOwned>(path: &Path, cap: u64) -> Result<T> {
-    let value = read_json_value(path, cap)?;
+    let bytes = read_bytes_bounded(path, cap)?;
+    decode_versioned_json(path, &bytes)
+}
+
+fn decode_versioned_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let value = serde_json::from_slice(bytes).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let found = json_version(&value, path)?;
     if found != SCHEMA_VERSION {
         return Err(Error::SchemaVersion {

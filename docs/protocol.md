@@ -98,7 +98,7 @@ capsule --json artifacts <id>
 capsule --json export <id> --output /tmp/capsule-result
 ```
 
-`artifacts` returns a versioned bundle with media types, byte counts, local `file://` URIs, SHA-256 digests, and `sha256:` content addresses. `export` reserves a new no-clobber directory, moves in `result.json` and `result.patch`, and publishes `bundle.json` last as the completion marker. Rust embedders can call `open_artifact` for a bounded stream or implement `ArtifactSink` to publish to any local, object-store, or CAS backend without coupling core to that backend.
+`artifacts` returns a versioned bundle with media types, byte counts, local `file://` URIs, SHA-256 digests, and `sha256:` content addresses. `export` reserves a new no-clobber directory, moves in `result.json` and `result.patch`, and publishes `bundle.json` last as the completion marker. Rust embedders can call `open_artifact` for a bounded stream or implement `ArtifactSink` to publish to any local, object-store, or CAS backend without coupling core to that backend. Each stream, publication, or export uses one fully read and validated byte snapshot, so a later artifact mutation cannot change bytes already paired with descriptors.
 
 ### 7. Review or compare
 
@@ -168,7 +168,7 @@ Every successful lifecycle mutation retains a versioned event in the capsule man
 
 ## Policy
 
-An absent policy means permissive defaults under hard safety bounds. `capsule policy set --file <json>` atomically replaces versioned policy; `capsule policy check` evaluates current records. Policy may allowlist canonical repository roots and limit total/live records, age, state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes.
+An absent policy means permissive defaults under hard safety bounds. `capsule policy set --file <json>` atomically replaces versioned policy; `capsule policy check` evaluates current records. Policy may allowlist canonical repository roots and limit total/live records, age, state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes. Patch and changed-path limits apply to the complete base-to-current result at close and checkpoint boundaries, not only the newest checkpoint delta. Policy checking evaluates active and sealed results and reports unavailable or invalid usage as a violation.
 
 Policy is checked at core lifecycle boundaries. It is not a continuous filesystem reservation: a worker may grow a workspace between commands. Use OS/filesystem quotas when hard continuous enforcement is required.
 

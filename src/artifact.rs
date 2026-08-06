@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{Read, Take};
+use std::io::{Cursor, Read};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,13 +6,13 @@ use crate::{ArtifactDescriptor, Result};
 
 #[derive(Debug)]
 pub struct ArtifactReader {
-    inner: Take<File>,
+    inner: Cursor<Vec<u8>>,
 }
 
 impl ArtifactReader {
-    pub(crate) fn new(file: File, bytes: u64) -> Self {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self {
-            inner: file.take(bytes),
+            inner: Cursor::new(bytes),
         }
     }
 }

@@ -106,7 +106,7 @@ capsule --json artifacts cap-01...
 capsule --json export cap-01... --output ./handoff
 ```
 
-`artifacts` reports media types, byte lengths, `file://` URIs, and `sha256:` content addresses. `export` reserves a new destination directory without clobbering, moves in `result.json` and `result.patch`, then publishes `bundle.json` last as the completion marker.
+`artifacts` reports media types, byte lengths, `file://` URIs, and `sha256:` content addresses. Artifact readers, publishers, and exports consume one bounded, validated byte snapshot, so later filesystem mutation cannot change the bytes described by that operation. `export` reserves a new destination directory without clobbering, moves in `result.json` and `result.patch`, then publishes `bundle.json` last as the completion marker.
 
 Integrate only the selected result into a clean worktree that is still at the pinned base:
 
@@ -161,7 +161,7 @@ capsule --json metrics
 capsule --json audit
 ```
 
-Policy supports allowed repository roots and optional limits for total/live capsule count, capsule age, state/workspace bytes, result patch bytes, changed paths, ignored paths, and ignored bytes. Mutating operations fail before their principal side effect when the applicable limit is exceeded. `policy check` is observational and reports existing violations. For example:
+Policy supports allowed repository roots and optional limits for total/live capsule count, capsule age, state/workspace bytes, result patch bytes, changed paths, ignored paths, and ignored bytes. Result limits apply to the complete base-to-current result, including when a checkpoint contains only a smaller incremental change. Mutating operations fail before their principal side effect when the applicable limit is exceeded. `policy check` is observational: it evaluates active and sealed results and reports uninspectable workspaces or artifacts as violations rather than silently treating them as compliant. For example:
 
 ```json
 {

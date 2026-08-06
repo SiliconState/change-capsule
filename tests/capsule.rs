@@ -659,6 +659,38 @@ struct MemorySink {
     artifacts: Vec<(String, Vec<u8>)>,
 }
 
+struct MutatingSink {
+    artifact_directory: PathBuf,
+    artifacts: Vec<(String, Vec<u8>)>,
+}
+
+impl ArtifactSink for MutatingSink {
+    fn put(
+        &mut self,
+        descriptor: &ArtifactDescriptor,
+        source: &mut dyn Read,
+    ) -> change_capsule::Result<String> {
+        let path = self.artifact_directory.join(&descriptor.name);
+        let mut tampered = fs::read(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let first = tampered.first_mut().expect("non-empty sealed artifact");
+        *first ^= 1;
+        fs::write(&path, tampered).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        let mut bytes = Vec::new();
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|source| Error::Io { path, source })?;
+        self.artifacts.push((descriptor.name.clone(), bytes));
+        Ok(format!("memory://{}", descriptor.content_address))
+    }
+}
+
 impl ArtifactSink for MemorySink {
     fn put(
         &mut self,
@@ -733,6 +765,48 @@ fn sealed_artifacts_support_discovery_streaming_publication_and_export() {
             .iter()
             .all(|artifact| artifact.content_address.starts_with("sha256:"))
     );
+}
+
+#[test]
+fn artifact_publication_uses_one_validated_byte_snapshot() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("artifact-snapshot");
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "stable publication\n",
+    )
+    .expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+
+    manager
+        .artifacts(&capsule.id)
+        .expect("validate artifacts before publication");
+    let mut sink = MutatingSink {
+        artifact_directory: fixture.state.join("capsules").join(&capsule.id),
+        artifacts: Vec::new(),
+    };
+    let published = manager
+        .publish_artifacts(&capsule.id, &mut sink)
+        .expect("publish validated snapshot despite later file mutation");
+
+    assert_eq!(published.len(), sink.artifacts.len());
+    for (published, (name, bytes)) in published.iter().zip(&sink.artifacts) {
+        assert_eq!(&published.descriptor.name, name);
+        assert_eq!(published.descriptor.bytes, bytes.len() as u64);
+        assert_eq!(
+            published.descriptor.sha256,
+            hex::encode(Sha256::digest(bytes))
+        );
+    }
+    assert!(matches!(
+        manager.result(&capsule.id),
+        Err(Error::ResultDrift(id)) if id == capsule.id
+    ));
 }
 
 #[test]
@@ -816,6 +890,114 @@ fn policy_enforces_repository_count_patch_and_ignored_limits() {
         Err(Error::PolicyViolation(message)) if message.contains("ignored paths")
     ));
     assert!(!manager.policy_report().expect("policy report").compliant);
+}
+
+#[test]
+fn checkpoint_policy_applies_to_the_complete_capsule_result() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("checkpoint-policy");
+    fs::write(capsule.workspace_path.join("first.txt"), "first\n").expect("first edit");
+    manager
+        .checkpoint(
+            &capsule.id,
+            CheckpointOptions {
+                message: "first checkpoint".to_owned(),
+                author: test_author(),
+            },
+        )
+        .expect("first checkpoint");
+
+    let mut policy = manager.policy().expect("read policy");
+    policy.max_changed_paths = Some(1);
+    manager.set_policy(policy).expect("set path policy");
+    assert_eq!(
+        manager
+            .policy()
+            .expect("read path policy")
+            .max_changed_paths,
+        Some(1)
+    );
+    let head_before = git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]);
+    fs::write(capsule.workspace_path.join("second.txt"), "second\n").expect("second edit");
+    assert_eq!(
+        manager.status(&capsule.id).expect("status").changed_paths,
+        vec!["first.txt", "second.txt"]
+    );
+
+    let attempt = manager.checkpoint(
+        &capsule.id,
+        CheckpointOptions {
+            message: "second checkpoint".to_owned(),
+            author: test_author(),
+        },
+    );
+    assert!(
+        matches!(
+            attempt,
+            Err(Error::PolicyViolation(ref message)) if message.contains("changed paths")
+        ),
+        "unexpected checkpoint result: {attempt:?}"
+    );
+    assert_eq!(
+        git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]),
+        head_before
+    );
+    assert_eq!(
+        manager
+            .show(&capsule.id)
+            .expect("show capsule")
+            .checkpoints
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn policy_report_evaluates_active_results_and_reports_uninspectable_workspaces() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("active-policy-report");
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "active violation\n",
+    )
+    .expect("active edit");
+
+    let mut policy = manager.policy().expect("read policy");
+    policy.max_changed_paths = Some(0);
+    manager.set_policy(policy).expect("set path policy");
+    assert_eq!(
+        manager
+            .policy()
+            .expect("read path policy")
+            .max_changed_paths,
+        Some(0)
+    );
+    assert_eq!(
+        manager.status(&capsule.id).expect("status").changed_paths,
+        vec!["shared.txt"]
+    );
+    let report = manager.policy_report().expect("report active violation");
+    assert!(!report.compliant, "unexpected report: {report:?}");
+    assert!(report.violations.iter().any(|violation| {
+        violation.contains(&capsule.id) && violation.contains("changed paths")
+    }));
+
+    git_success(
+        &fixture.repo,
+        [
+            "worktree",
+            "remove",
+            "--force",
+            capsule.workspace_path.to_str().expect("utf8 workspace"),
+        ],
+    );
+    let report = manager.policy_report().expect("report missing workspace");
+    assert!(!report.compliant);
+    assert!(report.violations.iter().any(|violation| {
+        violation.contains(&capsule.id) && violation.contains("cannot be inspected")
+    }));
 }
 
 #[test]
