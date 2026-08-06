@@ -941,7 +941,10 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| io(path, error))
 }
 
+// The non-Unix stubs mirror the fallible Unix signatures so every call site
+// stays platform-independent; they cannot fail, hence the allow.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -953,6 +956,7 @@ fn set_private_file_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_private_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -965,6 +969,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
