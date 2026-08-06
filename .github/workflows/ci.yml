@@ -12,6 +12,8 @@ permissions:
 jobs:
   test:
     strategy:
+      # Report every platform's result; one failure must not mask the others.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}

@@ -454,6 +454,9 @@ pub struct ExportReport {
     /// Bundle as written, with URIs pointing at the exported copies.
     pub bundle: ArtifactBundle,
     /// Directory the artifacts were written to.
+    ///
+    /// Canonicalized, so it may differ textually from the requested path when
+    /// a parent directory is a symlink.
     pub output_directory: PathBuf,
 }
 

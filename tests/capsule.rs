@@ -745,7 +745,15 @@ fn sealed_artifacts_support_discovery_streaming_publication_and_export() {
     let report = manager
         .export_artifacts(&capsule.id, &output)
         .expect("export artifacts");
-    assert_eq!(report.output_directory, output);
+    // The reported directory is canonical, which differs from the requested
+    // path on platforms where the temporary root is itself a symlink.
+    assert_eq!(
+        report
+            .output_directory
+            .canonicalize()
+            .expect("canonical reported path"),
+        output.canonicalize().expect("canonical requested path")
+    );
     assert!(output.join("bundle.json").is_file());
     assert!(output.join("result.json").is_file());
     assert!(output.join("result.patch").is_file());
