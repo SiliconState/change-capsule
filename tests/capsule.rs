@@ -29,6 +29,11 @@ impl Fixture {
         let state = temp.path().join("state");
         fs::create_dir(&repo).expect("create repo");
         git_success(&repo, ["init", "-b", "main"]);
+        // Pin end-of-line handling so assertions compare capsule behaviour
+        // rather than the host's Git EOL configuration. Linked worktrees and
+        // integration targets share this repository config.
+        git_success(&repo, ["config", "core.autocrlf", "false"]);
+        git_success(&repo, ["config", "core.eol", "lf"]);
         fs::write(repo.join("shared.txt"), "base\n").expect("seed file");
         git_success(&repo, ["add", "."]);
         git_success(
