@@ -1656,6 +1656,69 @@ fn cli_verify_reports_verification_failures_with_their_own_error_kind() {
 }
 
 #[test]
+fn checkpoint_growth_is_refused_before_it_can_wedge_the_manifest() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("checkpoint-bound");
+    let message = "m".repeat(16 * 1024 - 64);
+
+    let mut accepted = 0_usize;
+    let mut refusal = None;
+    for round in 0..400 {
+        fs::write(
+            capsule.workspace_path.join(format!("file-{round}.txt")),
+            format!("change {round}\n"),
+        )
+        .expect("workspace edit");
+        match manager.checkpoint(
+            &capsule.id,
+            CheckpointOptions {
+                message: message.clone(),
+                author: test_author(),
+            },
+        ) {
+            Ok(_) => accepted += 1,
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+
+    let refusal = refusal.expect("checkpoint growth must eventually be refused");
+    assert!(
+        matches!(&refusal, Error::InvalidInput(message)
+            if message.contains("manifest") || message.contains("checkpoints")),
+        "unexpected refusal after {accepted} accepted checkpoint(s): {refusal:?}"
+    );
+    assert!(accepted > 0, "no checkpoint was ever accepted");
+
+    // The refusal must leave the capsule exactly as usable as before: still
+    // active, still sealable, with the rejected checkpoint absent from both the
+    // manifest and the branch.
+    let after = manager.show(&capsule.id).expect("capsule survives refusal");
+    assert_eq!(after.state, CapsuleState::Active);
+    assert_eq!(after.checkpoints.len(), accepted);
+    assert!(after.checkpoint.is_none());
+    assert_eq!(
+        manager.status(&capsule.id).expect("status").health,
+        CapsuleHealth::Healthy
+    );
+    assert_eq!(
+        git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]),
+        after
+            .checkpoints
+            .last()
+            .expect("at least one checkpoint")
+            .commit,
+        "the refused checkpoint must not have advanced the branch"
+    );
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("a capsule that refused a checkpoint must still seal");
+}
+
+#[test]
 fn evidence_payload_is_bounded_before_it_can_wedge_the_manifest() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

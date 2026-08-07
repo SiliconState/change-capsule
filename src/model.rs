@@ -179,6 +179,7 @@ pub struct CheckpointJournal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cleanup {
     /// Capsule branch tip observed when cleanup started, if the branch existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_head: Option<String>,
     /// Whether cleanup must still prove the result seal before removing anything.
     pub require_sealed: bool,

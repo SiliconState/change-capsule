@@ -28,6 +28,7 @@ const EVIDENCE_COMMAND_CAP: usize = 16 * 1024;
 const EVIDENCE_SUMMARY_CAP: usize = 64 * 1024;
 const EVIDENCE_COUNT_CAP: usize = 64;
 const EVIDENCE_TOTAL_BYTES_CAP: usize = 256 * 1024;
+const CHECKPOINT_COUNT_CAP: usize = 128;
 const DEFAULT_AUTHOR_NAME: &str = "Capsule";
 const DEFAULT_AUTHOR_EMAIL: &str = "capsule@localhost";
 
@@ -577,14 +578,11 @@ impl CapsuleManager {
             ignored_paths,
             ignored_bytes,
         )?;
-        self.git.create_ref(
-            &capsule.workspace_path,
-            &checkpoint_ref(&capsule),
-            &head_after,
-        )?;
+        // Prove the manifest can still record this checkpoint before the branch
+        // advances. Failing afterwards would strand the capsule in
+        // `Checkpointing`, and every recovery attempt would fail the same way.
         let started_at = now()?;
-        capsule.state = CapsuleState::Checkpointing;
-        capsule.checkpoint = Some(CheckpointJournal {
+        let journal = CheckpointJournal {
             head_before: head_before.clone(),
             head_after: head_after.clone(),
             patch_sha256: sha256_hex(&checkpoint_snapshot.patch),
@@ -592,7 +590,15 @@ impl CapsuleManager {
             author_name: options.author.name,
             author_email: options.author.email,
             started_at_unix: started_at,
-        });
+        };
+        Self::project_checkpoint(&capsule, &journal)?;
+        self.git.create_ref(
+            &capsule.workspace_path,
+            &checkpoint_ref(&capsule),
+            &head_after,
+        )?;
+        capsule.state = CapsuleState::Checkpointing;
+        capsule.checkpoint = Some(journal);
         capsule.updated_at_unix = started_at;
         self.store.write_capsule(&capsule)?;
 
@@ -652,6 +658,11 @@ impl CapsuleManager {
             summary: input.summary,
             recorded_at_unix: now()?,
         };
+        // The byte caps above count raw input; JSON escaping can still inflate
+        // it, so confirm the encoded manifest fits before recording anything.
+        let mut projected = capsule.clone();
+        projected.evidence.push(evidence.clone());
+        crate::state::ensure_manifest_capacity(&projected)?;
         capsule.evidence.push(evidence.clone());
         capsule.updated_at_unix = now()?;
         let evidence_index = capsule.evidence.len() - 1;
@@ -1412,6 +1423,43 @@ impl CapsuleManager {
             0
         };
         Ok((paths.len(), bytes))
+    }
+
+    /// Confirm both manifests a checkpoint persists still fit.
+    ///
+    /// A checkpoint writes the manifest twice: once carrying the journal before
+    /// the branch moves, and once carrying the finished checkpoint afterwards.
+    /// The journaled form is the larger of the two, so checking only the final
+    /// form would still let the first write fail and strand the capsule.
+    fn project_checkpoint(capsule: &Capsule, journal: &CheckpointJournal) -> Result<()> {
+        if capsule.checkpoints.len() >= CHECKPOINT_COUNT_CAP {
+            return Err(Error::InvalidInput(format!(
+                "a capsule retains at most {CHECKPOINT_COUNT_CAP} checkpoints; close this capsule and start another"
+            )));
+        }
+        let mut journaled = capsule.clone();
+        journaled.state = CapsuleState::Checkpointing;
+        journaled.checkpoint = Some(journal.clone());
+        crate::state::ensure_manifest_capacity(&journaled)?;
+
+        let mut completed = capsule.clone();
+        completed.state = CapsuleState::Active;
+        completed.checkpoint = None;
+        completed.checkpoints.push(Checkpoint {
+            commit: journal.head_after.clone(),
+            message: journal.message.clone(),
+            author_name: journal.author_name.clone(),
+            author_email: journal.author_email.clone(),
+            created_at_unix: journal.started_at_unix,
+        });
+        append_event(
+            &mut completed,
+            AuditEventKind::Checkpointed,
+            Some(CapsuleState::Checkpointing),
+            CapsuleState::Active,
+            BTreeMap::from([("commit".to_owned(), journal.head_after.clone())]),
+        )?;
+        crate::state::ensure_manifest_capacity(&completed)
     }
 
     fn enforce_result_policy(

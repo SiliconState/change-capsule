@@ -632,6 +632,27 @@ fn lifecycle_journals_consistent(capsule: &Capsule) -> bool {
     checkpoint_consistent && integration_consistent && cleanup_consistent
 }
 
+/// Reject a manifest that would not fit the durable storage bound.
+///
+/// Call this with the exact capsule a transition intends to persist, before
+/// that transition takes an irreversible Git side effect. Otherwise a capsule
+/// can be advanced into a state its own manifest cannot record, leaving it
+/// stuck in a journal state that every retry fails to complete.
+pub(crate) fn ensure_manifest_capacity(capsule: &Capsule) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(capsule).map_err(|source| Error::Json {
+        path: PathBuf::from("capsule manifest"),
+        source,
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > JSON_CAP {
+        return Err(Error::InvalidInput(format!(
+            "this operation would grow the capsule manifest to {} bytes, past the {JSON_CAP}-byte limit; close this capsule and start another",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_id(id: &str) -> Result<()> {
     let valid = id.len() >= 8
         && id.len() <= 64
