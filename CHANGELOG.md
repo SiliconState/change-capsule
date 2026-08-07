@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 — 2026-08-06
 
 First public release: agent-neutral, isolated code-change attempts backed by
 ordinary Git worktrees, sealed into portable, verifiable receipts.

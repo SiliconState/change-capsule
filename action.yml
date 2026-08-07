@@ -28,12 +28,15 @@ inputs:
       (use actions/checkout with fetch-depth 0).
     required: false
     default: "false"
+  # Keep this default in step with the release: pinning a concrete version is
+  # what lets the binary cache engage, so gated CI runs skip the ~90s
+  # `cargo install` after their first run.
   version:
     description: >-
-      Version of the change-capsule crate to install. Defaults to the newest
-      published release.
+      Version of the change-capsule crate to install. Pass an empty string to
+      install the newest published release (disables the binary cache).
     required: false
-    default: ""
+    default: "0.1.0"
 
 outputs:
   verified:

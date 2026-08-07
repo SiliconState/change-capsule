@@ -1,5 +1,9 @@
 # Capsule
 
+[![crates.io](https://img.shields.io/crates/v/change-capsule)](https://crates.io/crates/change-capsule)
+[![docs.rs](https://img.shields.io/docsrs/change-capsule)](https://docs.rs/change-capsule)
+[![CI](https://github.com/SiliconState/change-capsule/actions/workflows/ci.yml/badge.svg)](https://github.com/SiliconState/change-capsule/actions/workflows/ci.yml)
+
 Capsule is an agent-neutral Rust library and CLI for isolated, recoverable code-change attempts — each sealed into a portable, verifiable receipt.
 
 It does not run an agent. It gives any agent or automation system a safe place to work, and it gives everyone downstream — reviewers, CI jobs, merge gates — a durable result whose integrity can be re-checked anywhere with `capsule verify`, without access to the original workspace, session, or state directory.
