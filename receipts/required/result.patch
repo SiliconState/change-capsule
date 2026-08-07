@@ -1,79 +1,61 @@
-diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 9e4d92cbea72bf0c2dd4ca8a4fa126003290f8e8..c18b4bb2de1d643d73f2e29d779f32bc52283954 100644
---- a/.github/workflows/ci.yml
-+++ b/.github/workflows/ci.yml
-@@ -59,7 +59,7 @@ jobs:
-             --output "$RUNNER_TEMP/capsule-sealed-tree"
-       - name: Gate on the committed receipt with the published action
-         id: gate
--        uses: SiliconState/change-capsule@v0.1.0
-+        uses: SiliconState/change-capsule@v0
-         with:
-           bundle: ./receipts/required
-           repo: ${{ steps.receipt.outputs.repo }}
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index a5461e67e0a8718af0f7bd6662b083ade51fcf7f..d178ad8728606eb42cdcf640d7de8fbe01f07c7f 100644
+index d178ad8728606eb42cdcf640d7de8fbe01f07c7f..45160fcc5011c8e052dd877527b42e1c5c6c7525 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -1,5 +1,23 @@
+@@ -1,5 +1,18 @@
  # Changelog
  
-+## 0.1.1 — 2026-08-06
-+
-+Bug fixes. Upgrading is recommended for anyone creating checkpoints.
++## 0.1.2 — 2026-08-06
 +
 +### Fixed
 +
-+- A capsule could permanently wedge itself. Checkpoints had no growth bound, so
-+  a long-running attempt could reach a point where the branch advanced but the
-+  manifest recording it exceeded the durable storage cap. The capsule was then
-+  stuck in `checkpointing`, and every `capsule recover` retried the same
-+  oversized write and failed identically. Checkpointing now proves both
-+  manifests it persists still fit before taking any irreversible Git side
-+  effect, and refuses cleanly instead, leaving the capsule active and sealable.
-+  A capsule also retains at most 128 checkpoints.
-+- Recording evidence now verifies the encoded manifest size rather than only the
-+  raw input size, so JSON escaping cannot push a manifest past its cap.
-+- `Cleanup.branch_head` serialized an explicit `null` instead of being omitted.
++- Exported receipts embedded the absolute path of the machine that produced
++  them in `bundle.json`. A receipt is meant to travel, so committing one to a
++  repository or publishing it to an artifact store disclosed the exporting
++  machine's directory layout, and the recorded location was meaningless to
++  whoever verified the receipt elsewhere. Exported artifacts are now referenced
++  by name, relative to the bundle directory. Verification is unaffected: it has
++  always matched artifacts by name, digest, and byte count. Artifacts still held
++  in capsule state keep their absolute local `file://` URIs.
 +
- ## 0.1.0 — 2026-08-06
+ ## 0.1.1 — 2026-08-06
  
- First public release: agent-neutral, isolated code-change attempts backed by
+ Bug fixes. Upgrading is recommended for anyone creating checkpoints.
 diff --git a/Cargo.lock b/Cargo.lock
-index c2bd9739a1f86b3a7210303f99d19bdd8c34d3f3..ce83db57d5f81a47a911a4cb99b84e5b0b5efc43 100644
+index ce83db57d5f81a47a911a4cb99b84e5b0b5efc43..a1f1945e0366f38e514393b825a5205122e49561 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -81,7 +81,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
  
  [[package]]
  name = "change-capsule"
--version = "0.1.0"
-+version = "0.1.1"
+-version = "0.1.1"
++version = "0.1.2"
  dependencies = [
   "clap",
   "fs2",
 diff --git a/Cargo.toml b/Cargo.toml
-index 29d4ddd6fd9655bb06316980561d281e2683fa29..76b0d8db631e3980709a8ccc9dc3485c85daff95 100644
+index 76b0d8db631e3980709a8ccc9dc3485c85daff95..cf3617485d41ff23d83c00139c417fa80a631d3e 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,6 +1,6 @@
  [package]
  name = "change-capsule"
--version = "0.1.0"
-+version = "0.1.1"
+-version = "0.1.1"
++version = "0.1.2"
  edition = "2024"
  rust-version = "1.85"
  description = "Isolated Git worktree attempts for coding agents, sealed into portable verifiable receipts"
 diff --git a/README.md b/README.md
-index d9e0776de29b7621386ff55d49f5ca91f98b3f6c..abdf65f01a3ec2ef7174b6cfd9ae9b6c423ec879 100644
+index abdf65f01a3ec2ef7174b6cfd9ae9b6c423ec879..c6842f57a2f725689750a654076312f62eec6042 100644
 --- a/README.md
 +++ b/README.md
 @@ -173,7 +173,7 @@ A receipt is only useful if something checks it. This repository ships a GitHub
  - uses: actions/checkout@v4
    with:
      fetch-depth: 0          # the pinned base must be present
--- uses: SiliconState/change-capsule@v0.1.0
-+- uses: SiliconState/change-capsule@v0.1.1
+-- uses: SiliconState/change-capsule@v0.1.1
++- uses: SiliconState/change-capsule@v0.1.2
    with:
      bundle: ./receipt       # produced by `capsule export`
      repo: .
@@ -81,34 +63,133 @@ index d9e0776de29b7621386ff55d49f5ca91f98b3f6c..abdf65f01a3ec2ef7174b6cfd9ae9b6c
  4. Make one second commit that adds only `receipts/required/bundle.json`, `result.json`, and `result.patch`. Do not amend, squash, or add unrelated files.
  5. Push both commits. If the branch is rebased or implementation changes, the old receipt is stale: create a new capsule from the new base and repeat.
  
--The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.0` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
-+The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.1` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
+-The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.1` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
++The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.2` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
  
  `capsule evidence` records a command claim and exit code supplied by the caller; it does not execute the command or provide signed attestation. The gate proves receipt integrity and tree binding, while CI should still rerun security-critical tests independently.
  
 diff --git a/action.yml b/action.yml
-index b3ec74e34a5c9ea23c07c73b83da36a6a1f87f7e..d7f06d5679c78aa1a3fd040c113b13e9434275e7 100644
+index d7f06d5679c78aa1a3fd040c113b13e9434275e7..6f2583d02d846f594f0816ef031cd8a0baccc80f 100644
 --- a/action.yml
 +++ b/action.yml
 @@ -36,7 +36,7 @@ inputs:
        Version of the change-capsule crate to install. Pass an empty string to
        install the newest published release (disables the binary cache).
      required: false
--    default: "0.1.0"
-+    default: "0.1.1"
+-    default: "0.1.1"
++    default: "0.1.2"
  
  outputs:
    verified:
 diff --git a/docs/composition.md b/docs/composition.md
-index 46d24fe7d2b6bc8b1273fd76086a17985fa83b17..33918698a0e3f548ec2bc9fbf66bbb484e060c37 100644
+index 33918698a0e3f548ec2bc9fbf66bbb484e060c37..72c5a7de90da2e5678cf45103118758dad643a70 100644
 --- a/docs/composition.md
 +++ b/docs/composition.md
 @@ -24,7 +24,7 @@ A CI job can create one capsule per candidate implementation, test each independ
  
  A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. The gate then knows the diff it merges is the diff that was sealed, that it applies cleanly to the pinned base, and that the claimed verification recorded a passing exit code — without sharing the producer's state. Evidence remains a caller-supplied claim, so CI should independently rerun critical tests.
  
--When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.0`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
-+When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.1`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
+-When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.1`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
++When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.2`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
  
  An evaluation harness can attach dimensions using links:
  
+diff --git a/src/manager.rs b/src/manager.rs
+index 05bbbef71361aba932f0961612af38c0ad17698c..1200a35be8f9741c11ef0c671dfd6d21bb33f414 100644
+--- a/src/manager.rs
++++ b/src/manager.rs
+@@ -339,7 +339,12 @@ impl CapsuleManager {
+         let destination = self.store.external_destination(destination.as_ref())?;
+         let mut exported_bundle = bundle.clone();
+         for descriptor in &mut exported_bundle.artifacts {
+-            descriptor.uri = file_uri(&destination.join(&descriptor.name))?;
++            // Reference artifacts relative to the bundle rather than by absolute
++            // path. A receipt is meant to travel: an exporting machine's
++            // directory layout is meaningless to whoever verifies it later, and
++            // embedding it would publish that layout in any repository or
++            // artifact store the receipt is committed to.
++            descriptor.uri = descriptor.name.clone();
+         }
+         let mut manifest =
+             serde_json::to_vec_pretty(&exported_bundle).map_err(|source| Error::Json {
+diff --git a/src/model.rs b/src/model.rs
+index 4382399d34b9c133b630f28b899921c4846cf11c..be58fda05ccbfc43d1fe35f9dff87c174538b84e 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -425,7 +425,12 @@ pub struct ArtifactDescriptor {
+     pub name: String,
+     /// IANA-style media type of the bytes.
+     pub media_type: String,
+-    /// Percent-encoded `file://` URI of the artifact's current location.
++    /// Where to find the artifact.
++    ///
++    /// For artifacts still held in capsule state this is a percent-encoded
++    /// absolute `file://` URI. In an exported bundle it is instead the
++    /// artifact's name, resolved relative to the bundle directory, so a receipt
++    /// carries no trace of the machine that produced it.
+     pub uri: String,
+     /// Content address, formatted as `sha256:<digest>`.
+     pub content_address: String,
+diff --git a/tests/capsule.rs b/tests/capsule.rs
+index c2e9d816b4dc75bf52f793c88ffef2935213b427..b2c36ec4aaec2ef55a449eebac8bc6100b3f519c 100644
+--- a/tests/capsule.rs
++++ b/tests/capsule.rs
+@@ -1520,6 +1520,58 @@ fn dirty_submodule_content_is_rejected_instead_of_silently_omitted() {
+     ));
+ }
+ 
++#[test]
++fn exported_receipts_carry_no_trace_of_the_exporting_machine() {
++    let fixture = Fixture::new();
++    let manager = fixture.manager();
++    let capsule = fixture.create("portable-receipt");
++    fs::write(capsule.workspace_path.join("shared.txt"), "portable\n").expect("edit capsule");
++    manager
++        .close(&capsule.id, CloseOptions::default())
++        .expect("close capsule");
++    let exported = fixture.temp.path().join("portable-bundle");
++    manager
++        .export_artifacts(&capsule.id, &exported)
++        .expect("export bundle");
++
++    // A receipt is committed to repositories and shipped to third parties, so
++    // it must not disclose the exporting machine's directory layout.
++    let host_markers = [
++        exported.to_str().expect("utf8 export path"),
++        fixture.temp.path().to_str().expect("utf8 temp path"),
++        "file://",
++        "/home/",
++        "/Users/",
++        "C:\\",
++    ];
++    for artifact in ["bundle.json", "result.json", "result.patch"] {
++        let body = fs::read_to_string(exported.join(artifact))
++            .unwrap_or_else(|_| String::from("<binary>"));
++        for marker in host_markers {
++            assert!(
++                !body.contains(marker),
++                "{artifact} leaks host path marker {marker:?}"
++            );
++        }
++    }
++
++    let bundle: serde_json::Value =
++        serde_json::from_slice(&fs::read(exported.join("bundle.json")).expect("read bundle"))
++            .expect("parse bundle");
++    for artifact in bundle["artifacts"].as_array().expect("artifacts") {
++        assert_eq!(
++            artifact["uri"], artifact["name"],
++            "exported artifacts must be referenced relative to the bundle"
++        );
++    }
++
++    // Relocating the bundle must not affect verification.
++    let moved = fixture.temp.path().join("relocated-bundle");
++    fs::rename(&exported, &moved).expect("relocate bundle");
++    let report = verify_bundle(&moved, &VerifyOptions::default()).expect("verify relocated bundle");
++    assert_eq!(report.capsule_id, capsule.id);
++}
++
+ #[test]
+ fn exported_bundles_verify_offline_and_detect_tampering() {
+     let fixture = Fixture::new();

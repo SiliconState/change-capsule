@@ -1,45 +1,41 @@
 {
   "schema_version": 3,
-  "capsule_id": "cap-01kzd1j4n963rh7aan9jaeg2hc",
-  "label": "release 0.1.1",
+  "capsule_id": "cap-01kzd6p1x4d6x46fp9m3977va4",
+  "label": "0.1.2 portable receipts",
   "links": {
-    "task": "release-0-1-1"
+    "task": "security-audit"
   },
   "kind": "patch",
-  "base_commit": "f05abad3724ccdea3d134e01b972f348d2314f4d",
-  "head_commit": "f05abad3724ccdea3d134e01b972f348d2314f4d",
-  "patch_sha256": "00e6b6fad0a0fd8e658992aa20ee2ff271acea94b2ce8ea9c9f129c869988f58",
-  "patch_bytes": 7858,
+  "base_commit": "8b7c0c19acb7f8f3a6e27357fef06ab7862cae0d",
+  "head_commit": "8b7c0c19acb7f8f3a6e27357fef06ab7862cae0d",
+  "patch_sha256": "80ce27c389fc92580b0afb293513d90be1924196f9abf88f226f6e6fbbefb44a",
+  "patch_bytes": 11370,
   "changed_paths": [
-    ".github/workflows/ci.yml",
     "CHANGELOG.md",
     "Cargo.lock",
     "Cargo.toml",
     "README.md",
     "action.yml",
-    "docs/composition.md"
+    "docs/composition.md",
+    "src/manager.rs",
+    "src/model.rs",
+    "tests/capsule.rs"
   ],
   "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "evidence": [
     {
       "command": "cargo test --all-features",
       "exit_code": 0,
-      "summary": "43 integration tests and 3 doctests passed at 0.1.1",
-      "recorded_at_unix": 1786070564
+      "summary": "44 integration tests and 3 doctests passed at 0.1.2",
+      "recorded_at_unix": 1786075903
     },
     {
       "command": "cargo clippy --all-targets --all-features -- -D warnings",
       "exit_code": 0,
       "summary": "no warnings",
-      "recorded_at_unix": 1786070564
-    },
-    {
-      "command": "cargo publish --dry-run",
-      "exit_code": 0,
-      "summary": "packaged 32 files at 0.1.1",
-      "recorded_at_unix": 1786070564
+      "recorded_at_unix": 1786075903
     }
   ],
-  "created_at_unix": 1786070504,
-  "sealed_at_unix": 1786070564
+  "created_at_unix": 1786075875,
+  "sealed_at_unix": 1786075903
 }
