@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "capsule_id": "cap-01kzcy0j68n5d8c1yyjxrfvq91",
+  "artifacts": [
+    {
+      "kind": "result_manifest",
+      "name": "result.json",
+      "media_type": "application/json",
+      "uri": "file:///home/baks/Projects/Learn/change-capsule/receipts/required/result.json",
+      "content_address": "sha256:34dfd0ca8464386921e23cbe7a957496445e9f74030ffdf04da21911edb6908d",
+      "sha256": "34dfd0ca8464386921e23cbe7a957496445e9f74030ffdf04da21911edb6908d",
+      "bytes": 1778
+    },
+    {
+      "kind": "result_patch",
+      "name": "result.patch",
+      "media_type": "application/vnd.git.patch",
+      "uri": "file:///home/baks/Projects/Learn/change-capsule/receipts/required/result.patch",
+      "content_address": "sha256:fbf8459694b668231ba92be188d1b25c51021dfe7c627df648c0cf81871ecca2",
+      "sha256": "fbf8459694b668231ba92be188d1b25c51021dfe7c627df648c0cf81871ecca2",
+      "bytes": 26863
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "schema_version": 3,
+  "capsule_id": "cap-01kzcy0j68n5d8c1yyjxrfvq91",
+  "label": "mandatory receipt gate and stress campaign",
+  "links": {
+    "release": "0.1.0",
+    "task": "dogfood-stress-v1"
+  },
+  "kind": "patch",
+  "base_commit": "b492e9446abaa052a5553163b0acc7831305bf9a",
+  "head_commit": "b492e9446abaa052a5553163b0acc7831305bf9a",
+  "patch_sha256": "fbf8459694b668231ba92be188d1b25c51021dfe7c627df648c0cf81871ecca2",
+  "patch_bytes": 26863,
+  "changed_paths": [
+    ".github/workflows/ci.yml",
+    "Cargo.toml",
+    "README.md",
+    "docs/composition.md",
+    "scripts/prepare-committed-receipt.sh",
+    "scripts/test-committed-receipt.sh",
+    "tests/capsule.rs"
+  ],
+  "ignored_bytes": 750703883,
+  "ignored_content_sha256": "9f717c5e29b9a377b6a06f3a3384ea204e58572d22e5d3c41d4fd8aa77a64870",
+  "ignored_paths": [
+    "target/"
+  ],
+  "evidence": [
+    {
+      "command": "bash scripts/test-committed-receipt.sh && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo check --no-default-features && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features && cargo package --allow-dirty && git diff --check",
+      "exit_code": 0,
+      "summary": "binder attacks, 42 tests, doctests, clippy, format, library-only build, docs, and package passed",
+      "recorded_at_unix": 1786067902
+    },
+    {
+      "command": "repeat 10x: stress_campaign_parallel_candidates_export_verify_select_and_cleanup + concurrent_policy_limit_is_linearizable_under_create_pressure",
+      "exit_code": 0,
+      "summary": "10/10 iterations passed: 120 candidate capsules and 160 quota contenders",
+      "recorded_at_unix": 1786067902
+    }
+  ],
+  "created_at_unix": 1786066782,
+  "sealed_at_unix": 1786067903
+}
