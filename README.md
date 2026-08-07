@@ -197,6 +197,20 @@ The same checks run locally with no Action involved:
 scripts/verify-gate.sh --bundle ./receipt --repo . --require-successful-evidence --verify-head
 ```
 
+### Mandatory committed-receipt protocol
+
+A receipt cannot describe a commit that contains the receipt itself: adding `bundle.json`, `result.json`, and `result.patch` changes the tree. For repositories that commit receipts, use this exact two-commit protocol:
+
+1. Create the capsule from the branch base and do all implementation work in its workspace.
+2. Run verification in that workspace and record the real command and exit code with `capsule evidence`.
+3. Close with `--require-successful-evidence`, export the receipt, and integrate the sealed result. This creates the implementation commit.
+4. Make one second commit that adds only `receipts/required/bundle.json`, `result.json`, and `result.patch`. Do not amend, squash, or add unrelated files.
+5. Push both commits. If the branch is rebased or implementation changes, the old receipt is stale: create a new capsule from the new base and repeat.
+
+The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.0` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
+
+`capsule evidence` records a command claim and exit code supplied by the caller; it does not execute the command or provide signed attestation. The gate proves receipt integrity and tree binding, while CI should still rerun security-critical tests independently.
+
 ## CLI details
 
 `--json` is global. Errors are emitted as one JSON object on stderr in JSON mode. `capsule diff --json` returns metadata rather than embedding arbitrary patch bytes; pass `--output <file>` for patch data. Policy failures use error kind `policy`; unknown artifact requests use `artifact_not_found`.

@@ -37,44 +37,48 @@ jobs:
       - name: Run the parallel-attempts walkthrough
         run: CAPSULE_BIN="$PWD/target/debug/capsule" bash examples/parallel-attempts.sh
 
-  # Dogfoods the published action: seals a real result, then gates on its receipt.
+  # Mandatory dogfood gate. The branch tip must be a receipt-only envelope
+  # commit whose sole parent is the exact implementation tree Capsule sealed.
   receipt-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --all-features
-      - name: Put capsule on PATH
-        run: echo "$PWD/target/release" >> "$GITHUB_PATH"
-      - name: Produce a sealed receipt and apply it
-        run: |
-          set -euo pipefail
-          git config --global user.name "Receipt Gate"
-          git config --global user.email "gate@example.test"
-          mkdir -p /tmp/demo-repo && cd /tmp/demo-repo
-          git init -q -b main
-          printf 'old\n' > app.txt
-          git add . && git commit -qm "base"
-          created=$(capsule --home /tmp/capsule-state create --repo . --label "ci attempt")
-          id=$(head -1 <<< "$created")
-          workspace=$(sed -n 's/^path=//p' <<< "$created")
-          printf 'new\n' > "$workspace/app.txt"
-          capsule --home /tmp/capsule-state evidence "$id" \
-            --command "true" --exit-code 0 --summary "ci verification"
-          capsule --home /tmp/capsule-state close "$id" --require-successful-evidence
-          capsule --home /tmp/capsule-state export "$id" --output /tmp/receipt
-          capsule --home /tmp/capsule-state integrate "$id" --target . -m "apply sealed result"
-      - name: Gate on the receipt
-        id: gate
-        uses: ./
         with:
-          bundle: /tmp/receipt
-          repo: /tmp/demo-repo
+          fetch-depth: 0
+          # Pull requests normally check out a synthetic merge commit. Verify
+          # the contributor's actual two-commit protocol instead.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stress the committed-receipt binder
+        run: bash scripts/test-committed-receipt.sh
+      - name: Bind the receipt to its implementation parent
+        id: receipt
+        run: |
+          bash scripts/prepare-committed-receipt.sh \
+            --bundle receipts/required \
+            --output "$RUNNER_TEMP/capsule-sealed-tree"
+      - name: Gate on the committed receipt with the published action
+        id: gate
+        uses: SiliconState/change-capsule@v0.1.0
+        with:
+          bundle: ./receipts/required
+          repo: ${{ steps.receipt.outputs.repo }}
           require-successful-evidence: "true"
           verify-head: "true"
-      - name: Confirm the gate reported a verified receipt
+          version: "0.1.0"
+      - name: Confirm the gate bound the exact implementation tree
+        env:
+          SEALED_REPO: ${{ steps.receipt.outputs.repo }}
+          RECEIPT_PARENT: ${{ steps.receipt.outputs.receipt-parent }}
+          RECEIPT_BASE: ${{ steps.receipt.outputs.implementation-base }}
+          VERIFIED_BASE: ${{ steps.gate.outputs.base-commit }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha || github.event.before || steps.receipt.outputs.implementation-base }}
+          VERIFIED: ${{ steps.gate.outputs.verified }}
+          CAPSULE_ID: ${{ steps.gate.outputs.capsule-id }}
         run: |
-          test "${{ steps.gate.outputs.verified }}" = "true"
-          test -n "${{ steps.gate.outputs.capsule-id }}"
-          echo "gate verified ${{ steps.gate.outputs.capsule-id }}"
+          test "$VERIFIED" = "true"
+          test -n "$CAPSULE_ID"
+          test "$RECEIPT_PARENT" = "$(git -C "$SEALED_REPO" rev-parse HEAD)"
+          test "$VERIFIED_BASE" = "$RECEIPT_BASE"
+          test "$RECEIPT_BASE" = "$EXPECTED_BASE"
+          echo "gate verified $CAPSULE_ID"

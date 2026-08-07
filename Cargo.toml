@@ -9,6 +9,7 @@ readme = "README.md"
 repository = "https://github.com/SiliconState/change-capsule"
 homepage = "https://github.com/SiliconState/change-capsule"
 documentation = "https://docs.rs/change-capsule"
+exclude = ["receipts/"]
 keywords = ["agents", "git", "worktree", "automation", "provenance"]
 categories = ["command-line-utilities", "development-tools"]
 

@@ -1755,6 +1755,257 @@ fn concurrent_managers_serialize_lifecycle_operations_safely() {
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
+    const CANDIDATES: usize = 12;
+
+    let fixture = Fixture::new();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CANDIDATES));
+    let receipt_root = fixture.temp.path().join("stress-receipts");
+    fs::create_dir(&receipt_root).expect("create receipt root");
+
+    let workers: Vec<_> = (0..CANDIDATES)
+        .map(|index| {
+            let barrier = barrier.clone();
+            let repo = fixture.repo.clone();
+            let state = fixture.state.clone();
+            let receipt = receipt_root.join(format!("candidate-{index}"));
+            std::thread::spawn(move || {
+                let manager = CapsuleManager::open(&state).expect("open stress manager");
+                let mut options = CreateOptions::new(&repo);
+                options.label = Some(format!("stress-candidate-{index}"));
+                options.links = BTreeMap::from([
+                    ("campaign".to_owned(), "parallel-selection".to_owned()),
+                    ("candidate".to_owned(), index.to_string()),
+                ]);
+                let capsule = manager.create(options).expect("create candidate");
+
+                barrier.wait();
+                fs::write(
+                    capsule.workspace_path.join("shared.txt"),
+                    format!("candidate-{index}\n"),
+                )
+                .expect("edit contested path");
+                fs::write(
+                    capsule
+                        .workspace_path
+                        .join(format!("candidate-{index}.txt")),
+                    format!("isolated candidate {index}\n"),
+                )
+                .expect("write candidate path");
+
+                if index % 3 == 0 {
+                    manager
+                        .checkpoint(
+                            &capsule.id,
+                            CheckpointOptions {
+                                message: format!("candidate {index} checkpoint"),
+                                author: test_author(),
+                            },
+                        )
+                        .expect("checkpoint candidate");
+                    fs::write(
+                        capsule
+                            .workspace_path
+                            .join(format!("post-checkpoint-{index}.txt")),
+                        "work continued after checkpoint\n",
+                    )
+                    .expect("continue after checkpoint");
+                }
+
+                manager
+                    .add_evidence(
+                        &capsule.id,
+                        EvidenceInput {
+                            command: format!("verify-candidate-{index}"),
+                            exit_code: 0,
+                            summary: Some("deterministic stress evidence".to_owned()),
+                        },
+                    )
+                    .expect("record evidence");
+                manager
+                    .close(
+                        &capsule.id,
+                        CloseOptions {
+                            require_successful_evidence: true,
+                        },
+                    )
+                    .expect("seal candidate");
+                manager
+                    .export_artifacts(&capsule.id, &receipt)
+                    .expect("export candidate receipt");
+                let report = verify_bundle(
+                    &receipt,
+                    &VerifyOptions {
+                        require_successful_evidence: true,
+                        repository: Some(repo),
+                    },
+                )
+                .expect("verify candidate receipt");
+                assert_eq!(report.capsule_id, capsule.id);
+                (index, capsule.id, receipt)
+            })
+        })
+        .collect();
+
+    let mut candidates: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("stress worker"))
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.0);
+
+    let manager = fixture.manager();
+    let before_selection = manager.metrics().expect("campaign metrics");
+    assert_eq!(before_selection.capsules, CANDIDATES as u64);
+    assert_eq!(before_selection.live_capsules, CANDIDATES as u64);
+    assert_eq!(before_selection.sealed_results, CANDIDATES as u64);
+
+    let selected = &candidates[7];
+    manager
+        .integrate(
+            &selected.1,
+            &IntegrateOptions {
+                target: fixture.repo.clone(),
+                message: Some("select stress candidate 7".to_owned()),
+                author: test_author(),
+            },
+        )
+        .expect("integrate selected candidate");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("shared.txt")).expect("read selected result"),
+        "candidate-7\n"
+    );
+    assert!(fixture.repo.join("candidate-7.txt").is_file());
+    for index in 0..CANDIDATES {
+        if index != 7 {
+            assert!(!fixture.repo.join(format!("candidate-{index}.txt")).exists());
+        }
+    }
+
+    for (_, _, receipt) in &candidates {
+        verify_bundle(
+            receipt,
+            &VerifyOptions {
+                require_successful_evidence: true,
+                repository: Some(fixture.repo.clone()),
+            },
+        )
+        .expect("every candidate remains independently verifiable");
+    }
+
+    let droppers: Vec<_> = candidates
+        .iter()
+        .map(|(_, id, _)| {
+            let state = fixture.state.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                CapsuleManager::open(state)
+                    .expect("open cleanup manager")
+                    .drop_capsule(&id, false)
+                    .expect("drop sealed candidate")
+                    .state
+            })
+        })
+        .collect();
+    for dropper in droppers {
+        assert_eq!(
+            dropper.join().expect("cleanup worker"),
+            CapsuleState::Dropped
+        );
+    }
+
+    let after_cleanup = manager.metrics().expect("post-campaign metrics");
+    assert_eq!(after_cleanup.capsules, CANDIDATES as u64);
+    assert_eq!(after_cleanup.live_capsules, 0);
+    assert_eq!(after_cleanup.sealed_results, CANDIDATES as u64);
+    assert_eq!(
+        after_cleanup.states.get("dropped"),
+        Some(&(CANDIDATES as u64))
+    );
+    assert!(manager.recover().expect("idempotent recovery").is_empty());
+    for (_, _, receipt) in candidates {
+        verify_bundle(&receipt, &VerifyOptions::default())
+            .expect("receipt survives concurrent cleanup");
+    }
+}
+
+#[test]
+fn concurrent_policy_limit_is_linearizable_under_create_pressure() {
+    const CONTENDERS: usize = 16;
+    const LIMIT: usize = 5;
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let mut policy = manager.policy().expect("read policy");
+    policy.max_live_capsules = Some(LIMIT as u64);
+    manager.set_policy(policy).expect("set live limit");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+    let contenders: Vec<_> = (0..CONTENDERS)
+        .map(|index| {
+            let barrier = barrier.clone();
+            let repo = fixture.repo.clone();
+            let state = fixture.state.clone();
+            std::thread::spawn(move || {
+                let manager = CapsuleManager::open(state).expect("open contender manager");
+                barrier.wait();
+                let mut options = CreateOptions::new(repo);
+                options.label = Some(format!("quota-contender-{index}"));
+                manager.create(options)
+            })
+        })
+        .collect();
+
+    let mut admitted = Vec::new();
+    let mut rejected = 0;
+    for contender in contenders {
+        match contender.join().expect("quota contender") {
+            Ok(capsule) => admitted.push(capsule.id),
+            Err(Error::PolicyViolation(message)) if message.contains("live capsules") => {
+                rejected += 1;
+            }
+            Err(error) => panic!("unexpected quota result: {error}"),
+        }
+    }
+    assert_eq!(admitted.len(), LIMIT);
+    assert_eq!(rejected, CONTENDERS - LIMIT);
+    assert_eq!(
+        admitted
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        LIMIT
+    );
+    assert_eq!(manager.list().expect("list admitted capsules").len(), LIMIT);
+    assert_eq!(
+        manager.metrics().expect("quota metrics").live_capsules,
+        LIMIT as u64
+    );
+
+    let cleanup: Vec<_> = admitted
+        .into_iter()
+        .map(|id| {
+            let state = fixture.state.clone();
+            std::thread::spawn(move || {
+                CapsuleManager::open(state)
+                    .expect("open quota cleanup manager")
+                    .drop_capsule(&id, true)
+                    .expect("force-drop admitted contender")
+            })
+        })
+        .collect();
+    for worker in cleanup {
+        assert_eq!(
+            worker.join().expect("quota cleanup").state,
+            CapsuleState::Dropped
+        );
+    }
+    let metrics = manager.metrics().expect("final quota metrics");
+    assert_eq!(metrics.capsules, LIMIT as u64);
+    assert_eq!(metrics.live_capsules, 0);
+}
+
 fn manifest_path(fixture: &Fixture, id: &str) -> PathBuf {
     fixture.state.join("capsules").join(id).join("capsule.json")
 }
