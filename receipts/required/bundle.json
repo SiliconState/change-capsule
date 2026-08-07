@@ -1,24 +1,24 @@
 {
   "schema_version": 1,
-  "capsule_id": "cap-01kzd0wpr7ms6q3j2shb8g1qkv",
+  "capsule_id": "cap-01kzd1j4n963rh7aan9jaeg2hc",
   "artifacts": [
     {
       "kind": "result_manifest",
       "name": "result.json",
       "media_type": "application/json",
-      "uri": "file:///tmp/new-receipt/result.json",
-      "content_address": "sha256:d465bf0e6624684e799c383a35655d33d80227d5180acd37ebd6f12f86fb6f62",
-      "sha256": "d465bf0e6624684e799c383a35655d33d80227d5180acd37ebd6f12f86fb6f62",
-      "bytes": 1079
+      "uri": "file:///tmp/rel-receipt/result.json",
+      "content_address": "sha256:70126a250325c7c52774b3b46978e36da71d934c06bb5480751b150d03e03188",
+      "sha256": "70126a250325c7c52774b3b46978e36da71d934c06bb5480751b150d03e03188",
+      "bytes": 1290
     },
     {
       "kind": "result_patch",
       "name": "result.patch",
       "media_type": "application/vnd.git.patch",
-      "uri": "file:///tmp/new-receipt/result.patch",
-      "content_address": "sha256:2c3e8a0194c20298dd4ac480ac022d42c31891402eef9a5447ff22386b90bbd9",
-      "sha256": "2c3e8a0194c20298dd4ac480ac022d42c31891402eef9a5447ff22386b90bbd9",
-      "bytes": 9221
+      "uri": "file:///tmp/rel-receipt/result.patch",
+      "content_address": "sha256:00e6b6fad0a0fd8e658992aa20ee2ff271acea94b2ce8ea9c9f129c869988f58",
+      "sha256": "00e6b6fad0a0fd8e658992aa20ee2ff271acea94b2ce8ea9c9f129c869988f58",
+      "bytes": 7858
     }
   ]
 }
