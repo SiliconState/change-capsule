@@ -1,590 +1,222 @@
-diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 1827c46c02eeab9f054b5a4d29af4a4aad77c0f4..9e4d92cbea72bf0c2dd4ca8a4fa126003290f8e8 100644
---- a/.github/workflows/ci.yml
-+++ b/.github/workflows/ci.yml
-@@ -37,44 +37,48 @@ jobs:
-       - name: Run the parallel-attempts walkthrough
-         run: CAPSULE_BIN="$PWD/target/debug/capsule" bash examples/parallel-attempts.sh
+diff --git a/src/manager.rs b/src/manager.rs
+index 4df8eee1ebc0386400b9ebbb33fe4d550a1df6c6..05bbbef71361aba932f0961612af38c0ad17698c 100644
+--- a/src/manager.rs
++++ b/src/manager.rs
+@@ -28,6 +28,7 @@ const EVIDENCE_COMMAND_CAP: usize = 16 * 1024;
+ const EVIDENCE_SUMMARY_CAP: usize = 64 * 1024;
+ const EVIDENCE_COUNT_CAP: usize = 64;
+ const EVIDENCE_TOTAL_BYTES_CAP: usize = 256 * 1024;
++const CHECKPOINT_COUNT_CAP: usize = 128;
+ const DEFAULT_AUTHOR_NAME: &str = "Capsule";
+ const DEFAULT_AUTHOR_EMAIL: &str = "capsule@localhost";
  
--  # Dogfoods the published action: seals a real result, then gates on its receipt.
-+  # Mandatory dogfood gate. The branch tip must be a receipt-only envelope
-+  # commit whose sole parent is the exact implementation tree Capsule sealed.
-   receipt-gate:
-     runs-on: ubuntu-latest
-     steps:
-       - uses: actions/checkout@v4
-+        with:
-+          fetch-depth: 0
-+          # Pull requests normally check out a synthetic merge commit. Verify
-+          # the contributor's actual two-commit protocol instead.
-+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-       - uses: dtolnay/rust-toolchain@stable
--      - uses: Swatinem/rust-cache@v2
--      - run: cargo build --release --all-features
--      - name: Put capsule on PATH
--        run: echo "$PWD/target/release" >> "$GITHUB_PATH"
--      - name: Produce a sealed receipt and apply it
-+      - name: Stress the committed-receipt binder
-+        run: bash scripts/test-committed-receipt.sh
-+      - name: Bind the receipt to its implementation parent
-+        id: receipt
-         run: |
--          set -euo pipefail
--          git config --global user.name "Receipt Gate"
--          git config --global user.email "gate@example.test"
--          mkdir -p /tmp/demo-repo && cd /tmp/demo-repo
--          git init -q -b main
--          printf 'old\n' > app.txt
--          git add . && git commit -qm "base"
--          created=$(capsule --home /tmp/capsule-state create --repo . --label "ci attempt")
--          id=$(head -1 <<< "$created")
--          workspace=$(sed -n 's/^path=//p' <<< "$created")
--          printf 'new\n' > "$workspace/app.txt"
--          capsule --home /tmp/capsule-state evidence "$id" \
--            --command "true" --exit-code 0 --summary "ci verification"
--          capsule --home /tmp/capsule-state close "$id" --require-successful-evidence
--          capsule --home /tmp/capsule-state export "$id" --output /tmp/receipt
--          capsule --home /tmp/capsule-state integrate "$id" --target . -m "apply sealed result"
--      - name: Gate on the receipt
-+          bash scripts/prepare-committed-receipt.sh \
-+            --bundle receipts/required \
-+            --output "$RUNNER_TEMP/capsule-sealed-tree"
-+      - name: Gate on the committed receipt with the published action
-         id: gate
--        uses: ./
-+        uses: SiliconState/change-capsule@v0.1.0
-         with:
--          bundle: /tmp/receipt
--          repo: /tmp/demo-repo
-+          bundle: ./receipts/required
-+          repo: ${{ steps.receipt.outputs.repo }}
-           require-successful-evidence: "true"
-           verify-head: "true"
--      - name: Confirm the gate reported a verified receipt
-+          version: "0.1.0"
-+      - name: Confirm the gate bound the exact implementation tree
-+        env:
-+          SEALED_REPO: ${{ steps.receipt.outputs.repo }}
-+          RECEIPT_PARENT: ${{ steps.receipt.outputs.receipt-parent }}
-+          RECEIPT_BASE: ${{ steps.receipt.outputs.implementation-base }}
-+          VERIFIED_BASE: ${{ steps.gate.outputs.base-commit }}
-+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha || github.event.before || steps.receipt.outputs.implementation-base }}
-+          VERIFIED: ${{ steps.gate.outputs.verified }}
-+          CAPSULE_ID: ${{ steps.gate.outputs.capsule-id }}
-         run: |
--          test "${{ steps.gate.outputs.verified }}" = "true"
--          test -n "${{ steps.gate.outputs.capsule-id }}"
--          echo "gate verified ${{ steps.gate.outputs.capsule-id }}"
-+          test "$VERIFIED" = "true"
-+          test -n "$CAPSULE_ID"
-+          test "$RECEIPT_PARENT" = "$(git -C "$SEALED_REPO" rev-parse HEAD)"
-+          test "$VERIFIED_BASE" = "$RECEIPT_BASE"
-+          test "$RECEIPT_BASE" = "$EXPECTED_BASE"
-+          echo "gate verified $CAPSULE_ID"
-diff --git a/Cargo.toml b/Cargo.toml
-index d881b54372c3d51115ecfac2d8b9339d98c82ef0..29d4ddd6fd9655bb06316980561d281e2683fa29 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -9,6 +9,7 @@ readme = "README.md"
- repository = "https://github.com/SiliconState/change-capsule"
- homepage = "https://github.com/SiliconState/change-capsule"
- documentation = "https://docs.rs/change-capsule"
-+exclude = ["receipts/"]
- keywords = ["agents", "git", "worktree", "automation", "provenance"]
- categories = ["command-line-utilities", "development-tools"]
+@@ -577,14 +578,11 @@ impl CapsuleManager {
+             ignored_paths,
+             ignored_bytes,
+         )?;
+-        self.git.create_ref(
+-            &capsule.workspace_path,
+-            &checkpoint_ref(&capsule),
+-            &head_after,
+-        )?;
++        // Prove the manifest can still record this checkpoint before the branch
++        // advances. Failing afterwards would strand the capsule in
++        // `Checkpointing`, and every recovery attempt would fail the same way.
+         let started_at = now()?;
+-        capsule.state = CapsuleState::Checkpointing;
+-        capsule.checkpoint = Some(CheckpointJournal {
++        let journal = CheckpointJournal {
+             head_before: head_before.clone(),
+             head_after: head_after.clone(),
+             patch_sha256: sha256_hex(&checkpoint_snapshot.patch),
+@@ -592,7 +590,15 @@ impl CapsuleManager {
+             author_name: options.author.name,
+             author_email: options.author.email,
+             started_at_unix: started_at,
+-        });
++        };
++        Self::project_checkpoint(&capsule, &journal)?;
++        self.git.create_ref(
++            &capsule.workspace_path,
++            &checkpoint_ref(&capsule),
++            &head_after,
++        )?;
++        capsule.state = CapsuleState::Checkpointing;
++        capsule.checkpoint = Some(journal);
+         capsule.updated_at_unix = started_at;
+         self.store.write_capsule(&capsule)?;
  
-diff --git a/README.md b/README.md
-index 252d8b8a6cc32aaef7d6d7ecb00bc97fc238b4fe..d9e0776de29b7621386ff55d49f5ca91f98b3f6c 100644
---- a/README.md
-+++ b/README.md
-@@ -197,6 +197,20 @@ The same checks run locally with no Action involved:
- scripts/verify-gate.sh --bundle ./receipt --repo . --require-successful-evidence --verify-head
- ```
+@@ -652,6 +658,11 @@ impl CapsuleManager {
+             summary: input.summary,
+             recorded_at_unix: now()?,
+         };
++        // The byte caps above count raw input; JSON escaping can still inflate
++        // it, so confirm the encoded manifest fits before recording anything.
++        let mut projected = capsule.clone();
++        projected.evidence.push(evidence.clone());
++        crate::state::ensure_manifest_capacity(&projected)?;
+         capsule.evidence.push(evidence.clone());
+         capsule.updated_at_unix = now()?;
+         let evidence_index = capsule.evidence.len() - 1;
+@@ -1414,6 +1425,43 @@ impl CapsuleManager {
+         Ok((paths.len(), bytes))
+     }
  
-+### Mandatory committed-receipt protocol
++    /// Confirm both manifests a checkpoint persists still fit.
++    ///
++    /// A checkpoint writes the manifest twice: once carrying the journal before
++    /// the branch moves, and once carrying the finished checkpoint afterwards.
++    /// The journaled form is the larger of the two, so checking only the final
++    /// form would still let the first write fail and strand the capsule.
++    fn project_checkpoint(capsule: &Capsule, journal: &CheckpointJournal) -> Result<()> {
++        if capsule.checkpoints.len() >= CHECKPOINT_COUNT_CAP {
++            return Err(Error::InvalidInput(format!(
++                "a capsule retains at most {CHECKPOINT_COUNT_CAP} checkpoints; close this capsule and start another"
++            )));
++        }
++        let mut journaled = capsule.clone();
++        journaled.state = CapsuleState::Checkpointing;
++        journaled.checkpoint = Some(journal.clone());
++        crate::state::ensure_manifest_capacity(&journaled)?;
 +
-+A receipt cannot describe a commit that contains the receipt itself: adding `bundle.json`, `result.json`, and `result.patch` changes the tree. For repositories that commit receipts, use this exact two-commit protocol:
++        let mut completed = capsule.clone();
++        completed.state = CapsuleState::Active;
++        completed.checkpoint = None;
++        completed.checkpoints.push(Checkpoint {
++            commit: journal.head_after.clone(),
++            message: journal.message.clone(),
++            author_name: journal.author_name.clone(),
++            author_email: journal.author_email.clone(),
++            created_at_unix: journal.started_at_unix,
++        });
++        append_event(
++            &mut completed,
++            AuditEventKind::Checkpointed,
++            Some(CapsuleState::Checkpointing),
++            CapsuleState::Active,
++            BTreeMap::from([("commit".to_owned(), journal.head_after.clone())]),
++        )?;
++        crate::state::ensure_manifest_capacity(&completed)
++    }
 +
-+1. Create the capsule from the branch base and do all implementation work in its workspace.
-+2. Run verification in that workspace and record the real command and exit code with `capsule evidence`.
-+3. Close with `--require-successful-evidence`, export the receipt, and integrate the sealed result. This creates the implementation commit.
-+4. Make one second commit that adds only `receipts/required/bundle.json`, `result.json`, and `result.patch`. Do not amend, squash, or add unrelated files.
-+5. Push both commits. If the branch is rebased or implementation changes, the old receipt is stale: create a new capsule from the new base and repeat.
-+
-+The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.0` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
-+
-+`capsule evidence` records a command claim and exit code supplied by the caller; it does not execute the command or provide signed attestation. The gate proves receipt integrity and tree binding, while CI should still rerun security-critical tests independently.
-+
- ## CLI details
+     fn enforce_result_policy(
+         policy: &Policy,
+         patch_bytes: u64,
+diff --git a/src/model.rs b/src/model.rs
+index 9a3ba9c57e0800a3067c6aae1f4841a4b9bbbd75..4382399d34b9c133b630f28b899921c4846cf11c 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -179,6 +179,7 @@ pub struct CheckpointJournal {
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Cleanup {
+     /// Capsule branch tip observed when cleanup started, if the branch existed.
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub branch_head: Option<String>,
+     /// Whether cleanup must still prove the result seal before removing anything.
+     pub require_sealed: bool,
+diff --git a/src/state.rs b/src/state.rs
+index eddf11d620a5d46159092730ee171b5795972e3b..bbf8af3af31da5101cf04e6efa0d96f415e36f38 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -632,6 +632,27 @@ fn lifecycle_journals_consistent(capsule: &Capsule) -> bool {
+     checkpoint_consistent && integration_consistent && cleanup_consistent
+ }
  
- `--json` is global. Errors are emitted as one JSON object on stderr in JSON mode. `capsule diff --json` returns metadata rather than embedding arbitrary patch bytes; pass `--output <file>` for patch data. Policy failures use error kind `policy`; unknown artifact requests use `artifact_not_found`.
-diff --git a/docs/composition.md b/docs/composition.md
-index 4810a61df3bd39fccbc31481eac9391843ff8b7a..46d24fe7d2b6bc8b1273fd76086a17985fa83b17 100644
---- a/docs/composition.md
-+++ b/docs/composition.md
-@@ -22,7 +22,9 @@ An interactive agent can be launched manually from the path printed by `capsule
- 
- A CI job can create one capsule per candidate implementation, test each independently, record evidence, close all results, and compare their patches without allowing candidates to race on one checkout.
- 
--A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. The gate then knows the diff it merges is the diff that was sealed, that it applies cleanly to the pinned base, and that the claimed verification actually recorded a passing exit code — without trusting the harness's machine or sharing its state.
-+A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. The gate then knows the diff it merges is the diff that was sealed, that it applies cleanly to the pinned base, and that the claimed verification recorded a passing exit code — without sharing the producer's state. Evidence remains a caller-supplied claim, so CI should independently rerun critical tests.
-+
-+When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.0`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
- 
- An evaluation harness can attach dimensions using links:
- 
-diff --git a/scripts/prepare-committed-receipt.sh b/scripts/prepare-committed-receipt.sh
-new file mode 100755
-index 0000000000000000000000000000000000000000..21aa3d43b3093627357b3cbe905ff297508ea69a
---- /dev/null
-+++ b/scripts/prepare-committed-receipt.sh
-@@ -0,0 +1,94 @@
-+#!/usr/bin/env bash
-+# Validate the two-commit committed-receipt protocol and materialize the exact
-+# implementation tree that a receipt claims to describe.
-+set -euo pipefail
-+
-+bundle=""
-+output=""
-+revision="HEAD"
-+repo="."
-+
-+die() { printf '%s\n' "error: $*" >&2; exit 1; }
-+
-+while [[ $# -gt 0 ]]; do
-+  case "$1" in
-+    --bundle) bundle="${2:-}"; shift 2 ;;
-+    --output) output="${2:-}"; shift 2 ;;
-+    --revision) revision="${2:-}"; shift 2 ;;
-+    --repo) repo="${2:-}"; shift 2 ;;
-+    *) die "unknown argument: $1" ;;
-+  esac
-+done
-+
-+[[ -n "$bundle" ]] || die "--bundle is required"
-+[[ -n "$output" ]] || die "--output is required"
-+[[ "$bundle" != /* ]] || die "--bundle must be relative to the repository"
-+bundle="${bundle#./}"
-+bundle="${bundle%/}"
-+[[ -n "$bundle" && "$bundle" != "." ]] || die "--bundle must name a receipt directory"
-+case "/$bundle/" in
-+  *'/../'*|*'/./'*|*'//'*) die "--bundle must be a normalized relative path" ;;
-+esac
-+
-+repo=$(CDPATH='' cd -- "$repo" && pwd -P)
-+git -C "$repo" rev-parse --git-dir > /dev/null 2>&1 || die "not a Git repository: $repo"
-+[[ -z "$(git -C "$repo" status --porcelain)" ]] || die "working tree must be clean"
-+revision=$(git -C "$repo" rev-parse --verify "${revision}^{commit}") || die "invalid revision"
-+
-+read -r -a record <<< "$(git -C "$repo" rev-list --parents -n 1 "$revision")"
-+[[ ${#record[@]} -eq 2 ]] || die "receipt revision must have exactly one parent"
-+parent="${record[1]}"
-+read -r -a implementation_record <<< "$(git -C "$repo" rev-list --parents -n 1 "$parent")"
-+[[ ${#implementation_record[@]} -eq 2 ]] || {
-+  die "implementation revision must have exactly one parent"
-+}
-+implementation_base="${implementation_record[1]}"
-+
-+expected=(
-+  "$bundle/bundle.json"
-+  "$bundle/result.json"
-+  "$bundle/result.patch"
-+)
-+mapfile -d '' changed < <(
-+  git -C "$repo" diff-tree --no-commit-id --name-only -r -z "$revision"
-+)
-+[[ ${#changed[@]} -eq ${#expected[@]} ]] || {
-+  die "receipt commit must change only bundle.json, result.json, and result.patch under $bundle"
++/// Reject a manifest that would not fit the durable storage bound.
++///
++/// Call this with the exact capsule a transition intends to persist, before
++/// that transition takes an irreversible Git side effect. Otherwise a capsule
++/// can be advanced into a state its own manifest cannot record, leaving it
++/// stuck in a journal state that every retry fails to complete.
++pub(crate) fn ensure_manifest_capacity(capsule: &Capsule) -> Result<()> {
++    let mut bytes = serde_json::to_vec_pretty(capsule).map_err(|source| Error::Json {
++        path: PathBuf::from("capsule manifest"),
++        source,
++    })?;
++    bytes.push(b'\n');
++    if bytes.len() as u64 > JSON_CAP {
++        return Err(Error::InvalidInput(format!(
++            "this operation would grow the capsule manifest to {} bytes, past the {JSON_CAP}-byte limit; close this capsule and start another",
++            bytes.len()
++        )));
++    }
++    Ok(())
 +}
 +
-+declare -A allowed=()
-+for path in "${expected[@]}"; do
-+  allowed["$path"]=1
-+  mode=$(git -C "$repo" ls-tree "$revision" -- "$path" | awk '{print $1}')
-+  [[ "$mode" == "100644" || "$mode" == "100755" ]] || {
-+    die "receipt artifact is missing or not a regular file: $path"
-+  }
-+done
-+for path in "${changed[@]}"; do
-+  [[ -n "${allowed[$path]:-}" ]] || {
-+    die "receipt commit contains a non-envelope change: $path"
-+  }
-+done
-+mapfile -d '' bundled < <(
-+  git -C "$repo" ls-tree -r --name-only -z "$revision" -- "$bundle"
-+)
-+[[ ${#bundled[@]} -eq ${#expected[@]} ]] || {
-+  die "receipt directory must contain exactly bundle.json, result.json, and result.patch"
-+}
-+for path in "${bundled[@]}"; do
-+  [[ -n "${allowed[$path]:-}" ]] || {
-+    die "receipt directory contains an unexpected path: $path"
-+  }
-+done
-+
-+[[ ! -e "$output" && ! -L "$output" ]] || die "output path already exists: $output"
-+mkdir -p "$(dirname -- "$output")"
-+git -C "$repo" worktree add --quiet --detach "$output" "$parent"
-+output=$(CDPATH='' cd -- "$output" && pwd -P)
-+
-+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-+  printf 'repo=%s\n' "$output" >> "$GITHUB_OUTPUT"
-+  printf 'receipt-parent=%s\n' "$parent" >> "$GITHUB_OUTPUT"
-+  printf 'implementation-base=%s\n' "$implementation_base" >> "$GITHUB_OUTPUT"
-+fi
-+printf 'Committed receipt envelope verified; sealed tree: %s (%s)\n' "$output" "$parent"
-diff --git a/scripts/test-committed-receipt.sh b/scripts/test-committed-receipt.sh
-new file mode 100755
-index 0000000000000000000000000000000000000000..91ab4a3f5120f13073551ab276e4e271377d5e46
---- /dev/null
-+++ b/scripts/test-committed-receipt.sh
-@@ -0,0 +1,87 @@
-+#!/usr/bin/env bash
-+# Deterministic adversarial tests for prepare-committed-receipt.sh.
-+set -euo pipefail
-+
-+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-+binder="$script_dir/prepare-committed-receipt.sh"
-+root=$(mktemp -d)
-+trap 'rm -rf "$root"' EXIT
-+repo="$root/repo"
-+bundle="receipts/test"
-+
-+mkdir "$repo"
-+git -C "$repo" init -q -b main
-+git -C "$repo" config user.name "Receipt Test"
-+git -C "$repo" config user.email "receipt@example.test"
-+printf 'base\n' > "$repo/app.txt"
-+git -C "$repo" add .
-+git -C "$repo" commit -qm "base"
-+
-+printf 'sealed implementation\n' > "$repo/app.txt"
-+git -C "$repo" add app.txt
-+git -C "$repo" commit -qm "implementation"
-+implementation=$(git -C "$repo" rev-parse HEAD)
-+
-+mkdir -p "$repo/$bundle"
-+printf '{}\n' > "$repo/$bundle/bundle.json"
-+printf '{}\n' > "$repo/$bundle/result.json"
-+printf 'patch\n' > "$repo/$bundle/result.patch"
-+git -C "$repo" add "$bundle"
-+git -C "$repo" commit -qm "receipt envelope"
-+
-+sealed_tree="$root/sealed-tree"
-+"$binder" --repo "$repo" --bundle "$bundle" --output "$sealed_tree" > /dev/null
-+[[ "$(git -C "$sealed_tree" rev-parse HEAD)" == "$implementation" ]]
-+[[ "$(cat "$sealed_tree/app.txt")" == "sealed implementation" ]]
-+[[ ! -e "$sealed_tree/$bundle" ]]
-+git -C "$repo" worktree remove --force "$sealed_tree"
-+
-+# A receipt commit carrying even one unrelated path must not be able to bless it.
-+git -C "$repo" switch -q -C malicious "$implementation"
-+mkdir -p "$repo/$bundle"
-+printf '{}\n' > "$repo/$bundle/bundle.json"
-+printf '{}\n' > "$repo/$bundle/result.json"
-+printf 'patch\n' > "$repo/$bundle/result.patch"
-+printf 'smuggled\n' > "$repo/surprise.txt"
-+git -C "$repo" add .
-+git -C "$repo" commit -qm "receipt plus unsealed payload"
-+if "$binder" --repo "$repo" --bundle "$bundle" --output "$root/rejected" > /dev/null 2>&1; then
-+  echo "binder accepted an unrelated payload" >&2
-+  exit 1
-+fi
-+
-+# A stale extra file under the receipt directory is rejected even when the tip
-+# itself adds exactly the three expected artifacts.
-+git -C "$repo" switch -q -C stale "$implementation"
-+mkdir -p "$repo/$bundle"
-+printf 'stale\n' > "$repo/$bundle/extra.txt"
-+git -C "$repo" add "$bundle/extra.txt"
-+git -C "$repo" commit -qm "stale receipt content"
-+printf '{}\n' > "$repo/$bundle/bundle.json"
-+printf '{}\n' > "$repo/$bundle/result.json"
-+printf 'patch\n' > "$repo/$bundle/result.patch"
-+git -C "$repo" add "$bundle"
-+git -C "$repo" commit -qm "receipt with stale envelope content"
-+if "$binder" --repo "$repo" --bundle "$bundle" --output "$root/stale" > /dev/null 2>&1; then
-+  echo "binder accepted stale receipt content" >&2
-+  exit 1
-+fi
-+
-+# Path traversal, a dirty checkout, and a dangling output symlink are rejected
-+# before any worktree appears.
-+if "$binder" --repo "$repo" --bundle '../escape' --output "$root/escape" > /dev/null 2>&1; then
-+  echo "binder accepted path traversal" >&2
-+  exit 1
-+fi
-+ln -s missing-target "$root/dangling"
-+if "$binder" --repo "$repo" --bundle "$bundle" --output "$root/dangling" > /dev/null 2>&1; then
-+  echo "binder accepted a dangling output symlink" >&2
-+  exit 1
-+fi
-+printf 'dirty\n' >> "$repo/app.txt"
-+if "$binder" --repo "$repo" --bundle "$bundle" --output "$root/dirty" > /dev/null 2>&1; then
-+  echo "binder accepted a dirty checkout" >&2
-+  exit 1
-+fi
-+
-+printf 'committed receipt binder tests passed\n'
+ pub(crate) fn validate_id(id: &str) -> Result<()> {
+     let valid = id.len() >= 8
+         && id.len() <= 64
 diff --git a/tests/capsule.rs b/tests/capsule.rs
-index 0a823ddcdb2e8eb7ff51984c8e96c833d03cfb86..5ba3f0f918a977ed2f5cef412537013dbab2d81c 100644
+index 5ba3f0f918a977ed2f5cef412537013dbab2d81c..c2e9d816b4dc75bf52f793c88ffef2935213b427 100644
 --- a/tests/capsule.rs
 +++ b/tests/capsule.rs
-@@ -1755,6 +1755,257 @@ fn concurrent_managers_serialize_lifecycle_operations_safely() {
-     }
+@@ -1655,6 +1655,69 @@ fn cli_verify_reports_verification_failures_with_their_own_error_kind() {
+     assert_eq!(value["kind"], "verification");
  }
  
 +#[test]
-+#[allow(clippy::too_many_lines)]
-+fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
-+    const CANDIDATES: usize = 12;
-+
++fn checkpoint_growth_is_refused_before_it_can_wedge_the_manifest() {
 +    let fixture = Fixture::new();
-+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CANDIDATES));
-+    let receipt_root = fixture.temp.path().join("stress-receipts");
-+    fs::create_dir(&receipt_root).expect("create receipt root");
-+
-+    let workers: Vec<_> = (0..CANDIDATES)
-+        .map(|index| {
-+            let barrier = barrier.clone();
-+            let repo = fixture.repo.clone();
-+            let state = fixture.state.clone();
-+            let receipt = receipt_root.join(format!("candidate-{index}"));
-+            std::thread::spawn(move || {
-+                let manager = CapsuleManager::open(&state).expect("open stress manager");
-+                let mut options = CreateOptions::new(&repo);
-+                options.label = Some(format!("stress-candidate-{index}"));
-+                options.links = BTreeMap::from([
-+                    ("campaign".to_owned(), "parallel-selection".to_owned()),
-+                    ("candidate".to_owned(), index.to_string()),
-+                ]);
-+                let capsule = manager.create(options).expect("create candidate");
-+
-+                barrier.wait();
-+                fs::write(
-+                    capsule.workspace_path.join("shared.txt"),
-+                    format!("candidate-{index}\n"),
-+                )
-+                .expect("edit contested path");
-+                fs::write(
-+                    capsule
-+                        .workspace_path
-+                        .join(format!("candidate-{index}.txt")),
-+                    format!("isolated candidate {index}\n"),
-+                )
-+                .expect("write candidate path");
-+
-+                if index % 3 == 0 {
-+                    manager
-+                        .checkpoint(
-+                            &capsule.id,
-+                            CheckpointOptions {
-+                                message: format!("candidate {index} checkpoint"),
-+                                author: test_author(),
-+                            },
-+                        )
-+                        .expect("checkpoint candidate");
-+                    fs::write(
-+                        capsule
-+                            .workspace_path
-+                            .join(format!("post-checkpoint-{index}.txt")),
-+                        "work continued after checkpoint\n",
-+                    )
-+                    .expect("continue after checkpoint");
-+                }
-+
-+                manager
-+                    .add_evidence(
-+                        &capsule.id,
-+                        EvidenceInput {
-+                            command: format!("verify-candidate-{index}"),
-+                            exit_code: 0,
-+                            summary: Some("deterministic stress evidence".to_owned()),
-+                        },
-+                    )
-+                    .expect("record evidence");
-+                manager
-+                    .close(
-+                        &capsule.id,
-+                        CloseOptions {
-+                            require_successful_evidence: true,
-+                        },
-+                    )
-+                    .expect("seal candidate");
-+                manager
-+                    .export_artifacts(&capsule.id, &receipt)
-+                    .expect("export candidate receipt");
-+                let report = verify_bundle(
-+                    &receipt,
-+                    &VerifyOptions {
-+                        require_successful_evidence: true,
-+                        repository: Some(repo),
-+                    },
-+                )
-+                .expect("verify candidate receipt");
-+                assert_eq!(report.capsule_id, capsule.id);
-+                (index, capsule.id, receipt)
-+            })
-+        })
-+        .collect();
-+
-+    let mut candidates: Vec<_> = workers
-+        .into_iter()
-+        .map(|worker| worker.join().expect("stress worker"))
-+        .collect();
-+    candidates.sort_by_key(|candidate| candidate.0);
-+
 +    let manager = fixture.manager();
-+    let before_selection = manager.metrics().expect("campaign metrics");
-+    assert_eq!(before_selection.capsules, CANDIDATES as u64);
-+    assert_eq!(before_selection.live_capsules, CANDIDATES as u64);
-+    assert_eq!(before_selection.sealed_results, CANDIDATES as u64);
++    let capsule = fixture.create("checkpoint-bound");
++    let message = "m".repeat(16 * 1024 - 64);
 +
-+    let selected = &candidates[7];
-+    manager
-+        .integrate(
-+            &selected.1,
-+            &IntegrateOptions {
-+                target: fixture.repo.clone(),
-+                message: Some("select stress candidate 7".to_owned()),
++    let mut accepted = 0_usize;
++    let mut refusal = None;
++    for round in 0..400 {
++        fs::write(
++            capsule.workspace_path.join(format!("file-{round}.txt")),
++            format!("change {round}\n"),
++        )
++        .expect("workspace edit");
++        match manager.checkpoint(
++            &capsule.id,
++            CheckpointOptions {
++                message: message.clone(),
 +                author: test_author(),
 +            },
-+        )
-+        .expect("integrate selected candidate");
-+    assert_eq!(
-+        fs::read_to_string(fixture.repo.join("shared.txt")).expect("read selected result"),
-+        "candidate-7\n"
-+    );
-+    assert!(fixture.repo.join("candidate-7.txt").is_file());
-+    for index in 0..CANDIDATES {
-+        if index != 7 {
-+            assert!(!fixture.repo.join(format!("candidate-{index}.txt")).exists());
-+        }
-+    }
-+
-+    for (_, _, receipt) in &candidates {
-+        verify_bundle(
-+            receipt,
-+            &VerifyOptions {
-+                require_successful_evidence: true,
-+                repository: Some(fixture.repo.clone()),
-+            },
-+        )
-+        .expect("every candidate remains independently verifiable");
-+    }
-+
-+    let droppers: Vec<_> = candidates
-+        .iter()
-+        .map(|(_, id, _)| {
-+            let state = fixture.state.clone();
-+            let id = id.clone();
-+            std::thread::spawn(move || {
-+                CapsuleManager::open(state)
-+                    .expect("open cleanup manager")
-+                    .drop_capsule(&id, false)
-+                    .expect("drop sealed candidate")
-+                    .state
-+            })
-+        })
-+        .collect();
-+    for dropper in droppers {
-+        assert_eq!(
-+            dropper.join().expect("cleanup worker"),
-+            CapsuleState::Dropped
-+        );
-+    }
-+
-+    let after_cleanup = manager.metrics().expect("post-campaign metrics");
-+    assert_eq!(after_cleanup.capsules, CANDIDATES as u64);
-+    assert_eq!(after_cleanup.live_capsules, 0);
-+    assert_eq!(after_cleanup.sealed_results, CANDIDATES as u64);
-+    assert_eq!(
-+        after_cleanup.states.get("dropped"),
-+        Some(&(CANDIDATES as u64))
-+    );
-+    assert!(manager.recover().expect("idempotent recovery").is_empty());
-+    for (_, _, receipt) in candidates {
-+        verify_bundle(&receipt, &VerifyOptions::default())
-+            .expect("receipt survives concurrent cleanup");
-+    }
-+}
-+
-+#[test]
-+fn concurrent_policy_limit_is_linearizable_under_create_pressure() {
-+    const CONTENDERS: usize = 16;
-+    const LIMIT: usize = 5;
-+
-+    let fixture = Fixture::new();
-+    let manager = fixture.manager();
-+    let mut policy = manager.policy().expect("read policy");
-+    policy.max_live_capsules = Some(LIMIT as u64);
-+    manager.set_policy(policy).expect("set live limit");
-+
-+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
-+    let contenders: Vec<_> = (0..CONTENDERS)
-+        .map(|index| {
-+            let barrier = barrier.clone();
-+            let repo = fixture.repo.clone();
-+            let state = fixture.state.clone();
-+            std::thread::spawn(move || {
-+                let manager = CapsuleManager::open(state).expect("open contender manager");
-+                barrier.wait();
-+                let mut options = CreateOptions::new(repo);
-+                options.label = Some(format!("quota-contender-{index}"));
-+                manager.create(options)
-+            })
-+        })
-+        .collect();
-+
-+    let mut admitted = Vec::new();
-+    let mut rejected = 0;
-+    for contender in contenders {
-+        match contender.join().expect("quota contender") {
-+            Ok(capsule) => admitted.push(capsule.id),
-+            Err(Error::PolicyViolation(message)) if message.contains("live capsules") => {
-+                rejected += 1;
++        ) {
++            Ok(_) => accepted += 1,
++            Err(error) => {
++                refusal = Some(error);
++                break;
 +            }
-+            Err(error) => panic!("unexpected quota result: {error}"),
 +        }
 +    }
-+    assert_eq!(admitted.len(), LIMIT);
-+    assert_eq!(rejected, CONTENDERS - LIMIT);
-+    assert_eq!(
-+        admitted
-+            .iter()
-+            .collect::<std::collections::BTreeSet<_>>()
-+            .len(),
-+        LIMIT
-+    );
-+    assert_eq!(manager.list().expect("list admitted capsules").len(), LIMIT);
-+    assert_eq!(
-+        manager.metrics().expect("quota metrics").live_capsules,
-+        LIMIT as u64
-+    );
 +
-+    let cleanup: Vec<_> = admitted
-+        .into_iter()
-+        .map(|id| {
-+            let state = fixture.state.clone();
-+            std::thread::spawn(move || {
-+                CapsuleManager::open(state)
-+                    .expect("open quota cleanup manager")
-+                    .drop_capsule(&id, true)
-+                    .expect("force-drop admitted contender")
-+            })
-+        })
-+        .collect();
-+    for worker in cleanup {
-+        assert_eq!(
-+            worker.join().expect("quota cleanup").state,
-+            CapsuleState::Dropped
-+        );
-+    }
-+    let metrics = manager.metrics().expect("final quota metrics");
-+    assert_eq!(metrics.capsules, LIMIT as u64);
-+    assert_eq!(metrics.live_capsules, 0);
++    let refusal = refusal.expect("checkpoint growth must eventually be refused");
++    assert!(
++        matches!(&refusal, Error::InvalidInput(message)
++            if message.contains("manifest") || message.contains("checkpoints")),
++        "unexpected refusal after {accepted} accepted checkpoint(s): {refusal:?}"
++    );
++    assert!(accepted > 0, "no checkpoint was ever accepted");
++
++    // The refusal must leave the capsule exactly as usable as before: still
++    // active, still sealable, with the rejected checkpoint absent from both the
++    // manifest and the branch.
++    let after = manager.show(&capsule.id).expect("capsule survives refusal");
++    assert_eq!(after.state, CapsuleState::Active);
++    assert_eq!(after.checkpoints.len(), accepted);
++    assert!(after.checkpoint.is_none());
++    assert_eq!(
++        manager.status(&capsule.id).expect("status").health,
++        CapsuleHealth::Healthy
++    );
++    assert_eq!(
++        git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]),
++        after
++            .checkpoints
++            .last()
++            .expect("at least one checkpoint")
++            .commit,
++        "the refused checkpoint must not have advanced the branch"
++    );
++    manager
++        .close(&capsule.id, CloseOptions::default())
++        .expect("a capsule that refused a checkpoint must still seal");
 +}
 +
- fn manifest_path(fixture: &Fixture, id: &str) -> PathBuf {
-     fixture.state.join("capsules").join(id).join("capsule.json")
- }
+ #[test]
+ fn evidence_payload_is_bounded_before_it_can_wedge_the_manifest() {
+     let fixture = Fixture::new();
