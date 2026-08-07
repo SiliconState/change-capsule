@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 — 2026-08-06
+
+Bug fixes. Upgrading is recommended for anyone creating checkpoints.
+
+### Fixed
+
+- A capsule could permanently wedge itself. Checkpoints had no growth bound, so
+  a long-running attempt could reach a point where the branch advanced but the
+  manifest recording it exceeded the durable storage cap. The capsule was then
+  stuck in `checkpointing`, and every `capsule recover` retried the same
+  oversized write and failed identically. Checkpointing now proves both
+  manifests it persists still fit before taking any irreversible Git side
+  effect, and refuses cleanly instead, leaving the capsule active and sealable.
+  A capsule also retains at most 128 checkpoints.
+- Recording evidence now verifies the encoded manifest size rather than only the
+  raw input size, so JSON escaping cannot push a manifest past its cap.
+- `Cleanup.branch_head` serialized an explicit `null` instead of being omitted.
+
 ## 0.1.0 — 2026-08-06
 
 First public release: agent-neutral, isolated code-change attempts backed by

@@ -59,7 +59,7 @@ jobs:
             --output "$RUNNER_TEMP/capsule-sealed-tree"
       - name: Gate on the committed receipt with the published action
         id: gate
-        uses: SiliconState/change-capsule@v0.1.0
+        uses: SiliconState/change-capsule@v0
         with:
           bundle: ./receipts/required
           repo: ${{ steps.receipt.outputs.repo }}
