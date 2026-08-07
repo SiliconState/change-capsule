@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.2 — 2026-08-06
+
+### Fixed
+
+- Exported receipts embedded the absolute path of the machine that produced
+  them in `bundle.json`. A receipt is meant to travel, so committing one to a
+  repository or publishing it to an artifact store disclosed the exporting
+  machine's directory layout, and the recorded location was meaningless to
+  whoever verified the receipt elsewhere. Exported artifacts are now referenced
+  by name, relative to the bundle directory. Verification is unaffected: it has
+  always matched artifacts by name, digest, and byte count. Artifacts still held
+  in capsule state keep their absolute local `file://` URIs.
+
 ## 0.1.1 — 2026-08-06
 
 Bug fixes. Upgrading is recommended for anyone creating checkpoints.

@@ -1521,6 +1521,58 @@ fn dirty_submodule_content_is_rejected_instead_of_silently_omitted() {
 }
 
 #[test]
+fn exported_receipts_carry_no_trace_of_the_exporting_machine() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("portable-receipt");
+    fs::write(capsule.workspace_path.join("shared.txt"), "portable\n").expect("edit capsule");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+    let exported = fixture.temp.path().join("portable-bundle");
+    manager
+        .export_artifacts(&capsule.id, &exported)
+        .expect("export bundle");
+
+    // A receipt is committed to repositories and shipped to third parties, so
+    // it must not disclose the exporting machine's directory layout.
+    let host_markers = [
+        exported.to_str().expect("utf8 export path"),
+        fixture.temp.path().to_str().expect("utf8 temp path"),
+        "file://",
+        "/home/",
+        "/Users/",
+        "C:\\",
+    ];
+    for artifact in ["bundle.json", "result.json", "result.patch"] {
+        let body = fs::read_to_string(exported.join(artifact))
+            .unwrap_or_else(|_| String::from("<binary>"));
+        for marker in host_markers {
+            assert!(
+                !body.contains(marker),
+                "{artifact} leaks host path marker {marker:?}"
+            );
+        }
+    }
+
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&fs::read(exported.join("bundle.json")).expect("read bundle"))
+            .expect("parse bundle");
+    for artifact in bundle["artifacts"].as_array().expect("artifacts") {
+        assert_eq!(
+            artifact["uri"], artifact["name"],
+            "exported artifacts must be referenced relative to the bundle"
+        );
+    }
+
+    // Relocating the bundle must not affect verification.
+    let moved = fixture.temp.path().join("relocated-bundle");
+    fs::rename(&exported, &moved).expect("relocate bundle");
+    let report = verify_bundle(&moved, &VerifyOptions::default()).expect("verify relocated bundle");
+    assert_eq!(report.capsule_id, capsule.id);
+}
+
+#[test]
 fn exported_bundles_verify_offline_and_detect_tampering() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

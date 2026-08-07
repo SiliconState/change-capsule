@@ -425,7 +425,12 @@ pub struct ArtifactDescriptor {
     pub name: String,
     /// IANA-style media type of the bytes.
     pub media_type: String,
-    /// Percent-encoded `file://` URI of the artifact's current location.
+    /// Where to find the artifact.
+    ///
+    /// For artifacts still held in capsule state this is a percent-encoded
+    /// absolute `file://` URI. In an exported bundle it is instead the
+    /// artifact's name, resolved relative to the bundle directory, so a receipt
+    /// carries no trace of the machine that produced it.
     pub uri: String,
     /// Content address, formatted as `sha256:<digest>`.
     pub content_address: String,

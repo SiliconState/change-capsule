@@ -339,7 +339,12 @@ impl CapsuleManager {
         let destination = self.store.external_destination(destination.as_ref())?;
         let mut exported_bundle = bundle.clone();
         for descriptor in &mut exported_bundle.artifacts {
-            descriptor.uri = file_uri(&destination.join(&descriptor.name))?;
+            // Reference artifacts relative to the bundle rather than by absolute
+            // path. A receipt is meant to travel: an exporting machine's
+            // directory layout is meaningless to whoever verifies it later, and
+            // embedding it would publish that layout in any repository or
+            // artifact store the receipt is committed to.
+            descriptor.uri = descriptor.name.clone();
         }
         let mut manifest =
             serde_json::to_vec_pretty(&exported_bundle).map_err(|source| Error::Json {
