@@ -2,6 +2,19 @@
 
 Capsule protects local attempt identity, result integrity, and cleanup boundaries. It is not a sandbox for untrusted code.
 
+## Contents
+
+- [Trust assumptions](#trust-assumptions)
+- [State protections](#state-protections)
+- [Artifact protections](#artifact-protections) — [receipt signing](#receipt-signing)
+- [Policy protections and limits](#policy-protections-and-limits)
+- [Git process protections](#git-process-protections)
+- [Cleanup protections](#cleanup-protections)
+- [Integration protections](#integration-protections)
+- [Result integrity](#result-integrity)
+- [Capability and idempotency limits](#capability-and-idempotency-limits)
+- [Known limits](#known-limits)
+
 ## Trust assumptions
 
 - The user trusts the installed `capsule` binary and system Git executable.
@@ -33,7 +46,14 @@ Artifact discovery first revalidates the sealed result. Descriptors report perce
 
 Export and backup never overwrite an existing destination and refuse destinations inside managed state. Export copies only a validated sealed result and emits descriptors for the exported paths. Backup copies recognized state files and policy, but intentionally excludes live workspaces, Git object databases, and lock files. A destination lacking its final `bundle.json` or `backup.json` marker is an interrupted, incomplete publication.
 
-Bundle verification (`capsule verify`) is bounded and fail-closed. Optional authenticity uses a detached raw 64-byte Ed25519 signature over a fixed-domain SHA-256 commitment of the exact `bundle.json` bytes. Authenticated verification reads `bundle.json` once and applies signature and ordinary receipt checks to that same byte snapshot; only a caller-supplied out-of-band public key is trusted. `capsule keygen` obtains a raw 32-byte private seed from the OS CSPRNG and derives the matching raw 32-byte public key; it atomically creates new files without overwrite, publishes the harmless public key first, and gives the private file mode `0600` on Unix. If private publication fails, the public file remains and the reported paths permit explicit cleanup. Key reads use one no-follow/reparse-aware opened handle, add a nonblocking open on Unix, and require a post-open regular file with exact length plus EOF. Library callers can use `generate_keypair` or `derive_public_key`. Private seed buffers are zeroized after generation, derivation, or signing, and keys are never stored in Capsule state. Successful CLI JSON reports whether signature authentication and receipt verification both passed.
+### Receipt signing
+
+Bundle verification (`capsule verify`) is bounded and fail-closed. Optional authenticity uses a detached raw 64-byte Ed25519 signature over a fixed-domain SHA-256 commitment of the exact `bundle.json` bytes.
+
+- **Verification** reads `bundle.json` once and applies signature and ordinary receipt checks to that same byte snapshot; only a caller-supplied out-of-band public key is trusted. Successful CLI JSON reports whether signature authentication and receipt verification both passed.
+- **Key generation** (`capsule keygen`) obtains a raw 32-byte private seed from the OS CSPRNG and derives the matching raw 32-byte public key. It atomically creates new files without overwrite, publishes the harmless public key first, and gives the private file mode `0600` on Unix. If private publication fails, the public file remains and the reported paths permit explicit cleanup.
+- **Key reads** use one no-follow/reparse-aware opened handle, add a nonblocking open on Unix, and require a post-open regular file with exact length plus EOF.
+- **Key handling.** Private seed buffers are zeroized after generation, derivation, or signing, and keys are never stored in Capsule state. Library callers can use `generate_keypair` or `derive_public_key`.
 
 ## Policy protections and limits
 
@@ -116,7 +136,7 @@ Idempotent creation guarantees at most one capsule identity and worktree per key
 - Audit records retain the newest 128 events and report how many older events rolled off; they are validated but neither signed nor append-only against a same-user attacker who can rewrite state.
 - Aggregate metrics are instantaneous observations, not monotonic accounting or durable telemetry.
 - Policy quotas are checked at lifecycle boundaries rather than continuously enforced.
-- Same-user replacement between individual checks remains possible on hostile filesystems; close requires matching complete ignored-content inventories around its tracked snapshot transaction, revalidates a second complete tracked snapshot and `HEAD`, and then writes artifacts. Cleanup and integration revalidate Git identities immediately before destructive or target-mutating operations. A hostile same-user mutation after close's final checks remains outside the security boundary: close is not atomic against such an actor, and the design is not a kernel-enforced capability system.
+- Same-user replacement between individual checks remains possible on hostile filesystems. Close requires matching complete ignored-content inventories around its tracked snapshot transaction, revalidates a second complete tracked snapshot and `HEAD`, and then writes artifacts; cleanup and integration revalidate Git identities immediately before destructive or target-mutating operations. **A hostile same-user mutation after close's final checks remains outside the security boundary:** close is not atomic against such an actor, and the design is not a kernel-enforced capability system.
 - On Unix, non-UTF-8 Git inventory paths use an unambiguous raw-byte hex JSON representation; ordinary UTF-8 paths remain strings.
 - File locks are advisory.
 - Evidence is caller-asserted.

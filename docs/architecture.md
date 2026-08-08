@@ -1,5 +1,23 @@
 # Architecture
 
+How Capsule is put together: what it owns, where its state lives, and how a result is built.
+
+## Contents
+
+- [Product boundary](#product-boundary)
+- [Why a capsule is not just a worktree](#why-a-capsule-is-not-just-a-worktree)
+- [Components](#components)
+- [State layout](#state-layout)
+- [Protocol surfaces](#protocol-surfaces)
+- [Lifecycle](#lifecycle)
+- [Result construction](#result-construction)
+- [Artifact interface](#artifact-interface)
+- [Policy and quotas](#policy-and-quotas)
+- [State administration](#state-administration)
+- [Integration](#integration)
+- [Library and CLI packaging](#library-and-cli-packaging)
+- [Future-compatible seams](#future-compatible-seams)
+
 ## Product boundary
 
 Capsule represents one code-change attempt as a durable state machine around an ordinary Git worktree.
@@ -135,7 +153,14 @@ To include committed, staged, unstaged, non-ignored untracked, deleted, renamed,
 5. emits a NUL-delimited changed-path inventory;
 6. hashes the patch with SHA-256.
 
-The real worktree index is not modified by status, diff, close, or drift checks. Capsule disables sparse checkout while creating its linked workspace, so a sparse source still yields a complete checkout; enabling sparse checkout inside the managed workspace is rejected. Because snapshots rebuild an independent index from the base and filesystem, `skip-worktree` and `assume-unchanged` flags in the workspace index do not hide changes. Git-ignored untracked files are intentionally outside the patch unless the repository's ignore rules are changed to include them. Close computes a complete ignored-content inventory before and after the tracked snapshot transaction and requires exact agreement on path identities, total bytes, and structural content SHA-256 before publishing. The stable final inventory is used for policy and recorded in the sealed result as provenance. The hash uses a versioned domain and explicit native-path encoding: Unix pathname bytes (including non-UTF-8 names and symlink targets), Windows UTF-16LE code units, or fail-closed UTF-8 on other platforms. Dirty nested submodules and unregistered embedded repositories remain rejected.
+The real worktree index is not modified by status, diff, close, or drift checks. Consequences of building the snapshot this way:
+
+- Capsule disables sparse checkout while creating its linked workspace, so a sparse source still yields a complete checkout; enabling sparse checkout inside the managed workspace is rejected.
+- Because snapshots rebuild an independent index from the base and filesystem, `skip-worktree` and `assume-unchanged` flags in the workspace index do not hide changes.
+- Git-ignored untracked files are intentionally outside the patch unless the repository's ignore rules are changed to include them.
+- Dirty nested submodules and unregistered embedded repositories remain rejected.
+
+**Ignored-content provenance.** Close computes a complete ignored-content inventory before and after the tracked snapshot transaction and requires exact agreement on path identities, total bytes, and structural content SHA-256 before publishing. The stable final inventory is used for policy and recorded in the sealed result as provenance. The hash uses a versioned domain and explicit native-path encoding: Unix pathname bytes (including non-UTF-8 names and symlink targets), Windows UTF-16LE code units, or fail-closed UTF-8 on other platforms.
 
 A closed result is:
 
@@ -162,13 +187,28 @@ An exported bundle is a portable receipt. `verify_bundle` (CLI: `capsule verify`
 
 ## Policy and quotas
 
-`policy.json` has an independent schema version. An absent file means permissive defaults under the fixed 64 MiB patch safety bound. Policy may allowlist canonical repository roots and limit total/live records, age, observed state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes. Patch and changed-path limits always measure the complete base-to-current result, including at a checkpoint boundary rather than only that checkpoint's delta. Lifecycle mutations check applicable policy while holding the global and project locks. When a count limit is configured, capsule-record and live-capsule counts also include reservations whose manifest does not exist yet, so a burst of interrupted idempotent creations cannot slip past a configured cap. Usage that no configured policy limit references is not measured; permissive defaults avoid policy-only state/workspace directory accounting. Close is the deliberate exception: it always reads two complete ignored-content inventories to establish stable sealed provenance. Ignored-byte policy checks outside close use file metadata rather than reading content. `policy_report` evaluates active and sealed results without mutating them and records uninspectable usage as a violation.
+`policy.json` has an independent schema version. An absent file means permissive defaults under the fixed 64 MiB patch safety bound. Policy may allowlist canonical repository roots and limit total/live records, age, observed state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes.
+
+How limits are measured:
+
+- Patch and changed-path limits always measure the complete base-to-current result, including at a checkpoint boundary rather than only that checkpoint's delta.
+- Lifecycle mutations check applicable policy while holding the global and project locks.
+- When a count limit is configured, capsule-record and live-capsule counts also include reservations whose manifest does not exist yet, so a burst of interrupted idempotent creations cannot slip past a configured cap.
+- Usage that no configured policy limit references is not measured; permissive defaults avoid policy-only state/workspace directory accounting.
+- Close is the deliberate exception: it always reads two complete ignored-content inventories to establish stable sealed provenance.
+- Ignored-byte policy checks outside close use file metadata rather than reading content.
+- `policy_report` evaluates active and sealed results without mutating them and records uninspectable usage as a violation.
 
 Byte/count quotas are cooperative checkpoints, not kernel reservations: workers can grow workspaces between capsule operations, and another same-user process can consume disk independently. Every relevant core mutation rechecks observed usage; callers that need continuous hard enforcement must add filesystem or OS quotas.
 
 ## State administration
 
-`inspect_state` reports record schema/state summaries without deserializing records as the current schema, and reports the idempotency index's record count plus per-entry validation findings keyed by indexed digest. `backup_state` copies recognized durable manifests, results, patches, policy, and the idempotency index in its indexed layout under all known project locks; workspaces and Git repositories are deliberately excluded. State-byte accounting includes the index. Migration does not reinterpret the index's independent schema. Schema-v3 state migrates only through explicit dry-run/apply operations. Apply requires and completes an external backup first, then uses a local rollback journal; migrated v3 evidence remains unbound. Exported v3 receipts continue to verify. A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
+- **`inspect_state`** reports record schema/state summaries without deserializing records as the current schema, and reports the idempotency index's record count plus per-entry validation findings keyed by indexed digest.
+- **`backup_state`** copies recognized durable manifests, results, patches, policy, and the idempotency index in its indexed layout under all known project locks; workspaces and Git repositories are deliberately excluded.
+- **State-byte accounting** includes the index, and migration does not reinterpret the index's independent schema.
+- **Migration** of schema-v3 state happens only through explicit dry-run/apply operations. Apply requires and completes an external backup first, then uses a local rollback journal; migrated v3 evidence remains unbound. Exported v3 receipts continue to verify.
+
+A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
 
 ## Integration
 

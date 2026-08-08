@@ -2,6 +2,18 @@
 
 Capsule is universal infrastructure at the attempt boundary. It is designed to sit below many different tools without knowing their concepts.
 
+## Contents
+
+- [Negotiating and retrying](#negotiating-and-retrying)
+- [Coding agents](#coding-agents)
+- [CI and evaluation harnesses](#ci-and-evaluation-harnesses)
+- [Task trackers](#task-trackers)
+- [Workflow and multi-agent systems](#workflow-and-multi-agent-systems)
+- [Editors and humans](#editors-and-humans)
+- [Rust embedding](#rust-embedding)
+- [Shell composition](#shell-composition)
+- [Non-goals for adapters](#non-goals-for-adapters)
+
 ## Negotiating and retrying
 
 Two surfaces exist specifically for the systems in this document — coordinators, CI and evaluation harnesses, task runners, and multi-agent systems — rather than for a single attempt.
