@@ -2759,7 +2759,17 @@ fn keygen_reports_partial_publication_and_sign_never_overwrites() {
     assert!(!output.status.success());
     assert!(public.is_file(), "harmless public key remains published");
     assert_eq!(fs::read(&private).expect("private untouched"), [1_u8; 32]);
-    assert!(String::from_utf8_lossy(&output.stderr).contains(public.to_string_lossy().as_ref()));
+    // JSON mode escapes backslashes, so a raw-byte match would miss a Windows
+    // path. Decode the envelope and assert against the real message.
+    let reported: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("keygen error JSON");
+    assert!(
+        reported["error"]
+            .as_str()
+            .expect("keygen error message")
+            .contains(public.to_string_lossy().as_ref()),
+        "{reported}"
+    );
 
     let manager = fixture.manager();
     let capsule = fixture.create("signature-no-overwrite");
