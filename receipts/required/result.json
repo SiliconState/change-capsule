@@ -1,57 +1,65 @@
 {
-  "schema_version": 3,
-  "capsule_id": "cap-01kzh0r34f0nreq541pgxqq80a",
-  "label": "dependency refresh",
+  "schema_version": 4,
+  "capsule_id": "cap-01kzh1d6b4bmbp46cx9cc01j44",
+  "label": "0.2.0 pin migration and ulid 3.0",
   "links": {
-    "task": "dependabot-consolidation"
+    "task": "release-finalization"
   },
   "kind": "patch",
-  "base_commit": "1e85cd09dcc7a9e3d8293a88b7f78ef645d626a0",
-  "head_commit": "1e85cd09dcc7a9e3d8293a88b7f78ef645d626a0",
-  "patch_sha256": "ac78f371df27d85cc5ffc052881c56cd205bb3eef4db806882bb4306e6abd1d6",
-  "patch_bytes": 30560,
+  "base_commit": "3ff9821ae1f9c6108e3a89246923d998e8add70a",
+  "head_commit": "3ff9821ae1f9c6108e3a89246923d998e8add70a",
+  "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+  "patch_bytes": 16710,
   "changed_paths": [
     ".github/workflows/ci.yml",
-    ".github/workflows/release.yml",
     "CHANGELOG.md",
     "Cargo.lock",
     "Cargo.toml",
+    "README.md",
     "action.yml",
-    "fuzz/Cargo.lock"
+    "docs/composition.md",
+    "docs/releasing.md",
+    "fuzz/Cargo.lock",
+    "src/manager/mod.rs"
   ],
-  "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "ignored_content_sha256": "329a338068cf8b9de6c40b9ff919e470f401ee0a7770b24ea2362003d6156303",
   "evidence": [
     {
       "command": "cargo fmt --all -- --check",
       "exit_code": 0,
       "summary": "formatting clean",
-      "recorded_at_unix": 1786203925
+      "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+      "recorded_at_unix": 1786204614
     },
     {
       "command": "cargo clippy --all-targets --all-features --locked -- -D warnings",
       "exit_code": 0,
       "summary": "no warnings on linux, windows-msvc, and apple-darwin targets",
-      "recorded_at_unix": 1786203925
+      "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+      "recorded_at_unix": 1786204614
     },
     {
       "command": "cargo test --all-features --locked",
       "exit_code": 0,
-      "summary": "all six suites passed with the updated dependency tree",
-      "recorded_at_unix": 1786203925
+      "summary": "all six suites passed with ulid 3.0 and the 0.2.0 pins",
+      "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+      "recorded_at_unix": 1786204614
     },
     {
       "command": "cargo +1.85 check --all-features --all-targets --locked",
       "exit_code": 0,
-      "summary": "declared MSRV verified against the new majors",
-      "recorded_at_unix": 1786203925
+      "summary": "declared MSRV verified",
+      "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+      "recorded_at_unix": 1786204614
     },
     {
-      "command": "cargo audit --deny warnings && cargo deny check advisories bans licenses sources",
+      "command": "bash scripts/check-release-pins.sh",
       "exit_code": 0,
-      "summary": "advisories, bans, licenses, sources all clean",
-      "recorded_at_unix": 1786203925
+      "summary": "published-pin and receipt schema consistent",
+      "patch_sha256": "33a5ff00e017a5a319d88737917bb44b9ea190ec9b1c267de87119dd00e46b40",
+      "recorded_at_unix": 1786204614
     }
   ],
-  "created_at_unix": 1786203868,
-  "sealed_at_unix": 1786203925
+  "created_at_unix": 1786204559,
+  "sealed_at_unix": 1786204614
 }
