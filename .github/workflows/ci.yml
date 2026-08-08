@@ -115,7 +115,7 @@ jobs:
           repo: ${{ steps.receipt.outputs.repo }}
           require-successful-evidence: "true"
           verify-head: "true"
-          version: "0.1.2"
+          version: "0.2.0"
       - name: Gate on the committed receipt with the current source binary
         env:
           SEALED_REPO: ${{ steps.receipt.outputs.repo }}

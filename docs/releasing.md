@@ -27,9 +27,11 @@ it shipped with:
 | `0.1.x` | 3 |
 | `0.2.x` | 3 and 4 |
 
-So while the pin is `0.1.2`, the committed receipt **must stay schema v3**, which
-means sealing it with the `0.1.2` binary rather than a source build. Bumping the
-crate version alone does not change this; only publishing does.
+So the committed receipt must never declare a schema newer than the pinned
+published binary decodes. During the 0.1.2 era that meant sealing receipts with
+the `0.1.2` binary (schema v3); with the pin at `0.2.x`, current source builds
+(schema v4) are fine. Bumping the crate version alone changes nothing; only
+publishing and then moving the pin does.
 
 ## Releasing 0.2.0
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `ulid` 3.0 (ID generation now calls `Ulid::generate()`; identifiers are unchanged).
+- The published-action pin and committed receipt moved to the released 0.2.0: the receipt gate now installs `change-capsule 0.2.0` and the committed receipt is sealed at durable schema v4.
+
 ## 0.2.0 — 2026-08-08
 
 ### Added

@@ -46,7 +46,7 @@ A CI job can create one capsule per candidate implementation, test each independ
 
 A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-current-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. This proves the claimed passing evidence was attached to that exact patch, but evidence remains caller-supplied, so CI should independently rerun critical tests.
 
-When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.1.2`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
+When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.2.0`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
 
 An evaluation harness can attach dimensions using links:
 

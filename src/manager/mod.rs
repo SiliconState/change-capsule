@@ -375,7 +375,7 @@ fn append_event(
     }
     capsule.audit_events.push(AuditEvent {
         schema_version: AUDIT_SCHEMA_VERSION,
-        event_id: format!("evt-{}", Ulid::new().to_string().to_ascii_lowercase()),
+        event_id: format!("evt-{}", Ulid::generate().to_string().to_ascii_lowercase()),
         occurred_at_unix,
         kind,
         capsule_id: Some(capsule.id.clone()),
@@ -795,7 +795,7 @@ fn is_unchecked_worktree_shape(path: &Path) -> Result<bool> {
 }
 
 fn new_capsule_id() -> String {
-    format!("cap-{}", Ulid::new().to_string().to_ascii_lowercase())
+    format!("cap-{}", Ulid::generate().to_string().to_ascii_lowercase())
 }
 
 fn path_entry_exists_no_follow(path: &Path) -> Result<bool> {

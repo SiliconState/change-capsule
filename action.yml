@@ -36,7 +36,7 @@ inputs:
       Version of the change-capsule crate to install. Pass an empty string to
       install the newest published release (disables the binary cache).
     required: false
-    default: "0.1.2"
+    default: "0.2.0"
 
 outputs:
   verified:

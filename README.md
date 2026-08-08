@@ -352,7 +352,7 @@ A receipt is only useful if something checks it. This repository ships a GitHub 
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0          # the pinned base must be present
-- uses: SiliconState/change-capsule@v0.1.2
+- uses: SiliconState/change-capsule@v0.2.0
   with:
     bundle: ./receipt       # produced by `capsule export`
     repo: .
@@ -386,7 +386,7 @@ A receipt cannot describe a commit that contains the receipt itself: adding `bun
 4. Make one second commit that adds only `receipts/required/bundle.json`, `result.json`, and `result.patch`. Do not amend, squash, or add unrelated files.
 5. Push both commits. If the branch is rebased or implementation changes, the old receipt is stale: create a new capsule from the new base and repeat.
 
-The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.1.2` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
+The required `receipt-gate` job in this repository enforces the protocol. `scripts/prepare-committed-receipt.sh` rejects a dirty checkout, merge commit, malformed receipt path, missing artifact, or any non-envelope change in the tip commit. It checks out the tip's sole parent and identifies that implementation commit's base. `SiliconState/change-capsule@v0.2.0` then verifies the committed bundle, successful evidence, exact pinned base, and implementation tree byte-for-byte; pull requests additionally require that pinned base to equal GitHub's current base SHA. Configure this job as a required branch check and use rebase or fast-forward merges that preserve the two commits; a squash merge deliberately destroys this binding.
 
 `capsule evidence` records a command claim and exit code supplied by the caller; it does not execute the command or provide signed attestation. The gate proves receipt integrity and tree binding, while CI should still rerun security-critical tests independently.
 
