@@ -21,6 +21,12 @@ pub enum Error {
     /// Caller input was missing, malformed, or out of bounds.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// An existing key is permanently bound to a materially different creation request.
+    #[error("idempotency key is already bound to a different creation request")]
+    IdempotencyConflict,
+    /// No reservation exists for the requested state-root-scoped idempotency key.
+    #[error("idempotency reservation not found")]
+    IdempotencyNotFound,
     /// The operation is not allowed from the capsule's current state.
     #[error("capsule {id} is {state}; expected {expected}")]
     InvalidState {

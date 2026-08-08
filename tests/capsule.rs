@@ -7,13 +7,20 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
 
 use change_capsule::{
     ArtifactDescriptor, ArtifactKind, ArtifactSink, AuditEventKind, Author, CapsuleHealth,
     CapsuleManager, CapsuleState, CheckpointOptions, CloseOptions, CreateOptions, Error,
-    EvidenceInput, IntegrateOptions, Policy, ResultKind, VerifyOptions, verify_bundle,
+    EvidenceInput, GitPath, IntegrateOptions, Policy, ResultKind, VerifyOptions, sign_bundle,
+    sign_bundle_bytes, verify_authenticated_bundle, verify_bundle, verify_bundle_signature_bytes,
 };
+use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -128,6 +135,7 @@ fn parallel_capsules_isolate_changes_and_integrate_one_explicit_result() {
             &first.id,
             CloseOptions {
                 require_successful_evidence: true,
+                require_current_successful_evidence: false,
             },
         )
         .expect("close first");
@@ -300,6 +308,42 @@ fn cleanup_refuses_a_replaced_foreign_directory_even_with_force() {
 }
 
 #[test]
+fn targeted_recovery_ignores_unrelated_malformed_records_and_is_idempotent() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let recoverable = fixture.create("targeted-recovery");
+    let unrelated = fixture.create("malformed-unrelated");
+
+    let manifest = manifest_path(&fixture, &recoverable.id);
+    let mut value = read_json(&manifest);
+    value["state"] = serde_json::Value::String("creating".to_owned());
+    value["workspace_git_dir"] = serde_json::Value::Null;
+    write_json(&manifest, &value);
+    fs::write(manifest_path(&fixture, &unrelated.id), b"not json").expect("malform unrelated");
+
+    let action = manager
+        .recover_capsule(&recoverable.id)
+        .expect("targeted recovery")
+        .expect("recovery action");
+    assert_eq!(action.capsule_id, recoverable.id);
+    assert_eq!(action.state, CapsuleState::Active);
+    assert!(
+        manager
+            .recover_capsule(&recoverable.id)
+            .expect("idempotent targeted recovery")
+            .is_none()
+    );
+    assert!(
+        manager.recover().is_err(),
+        "global recovery must fail closed"
+    );
+    assert_eq!(
+        fs::read(manifest_path(&fixture, &unrelated.id)).expect("unrelated remains"),
+        b"not json"
+    );
+}
+
+#[test]
 fn recover_finishes_a_journaled_creation_after_process_restart() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -453,6 +497,40 @@ fn dropped_result_diff_json_uses_the_sealed_inventory() {
         serde_json::from_slice(&output.stdout).expect("parse diff metadata");
     assert_eq!(value["changed_paths"], serde_json::json!(["shared.txt"]));
     assert!(value["bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+    let patch = manager.diff(&capsule.id).expect("sealed patch");
+    assert_eq!(value["patch_sha256"], hex::encode(Sha256::digest(&patch)));
+    assert!(value["patch_sha256"].as_str().is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }));
+}
+
+#[test]
+fn json_diff_output_digest_covers_exact_written_patch() {
+    let fixture = Fixture::new();
+    let capsule = fixture.create("output-diff");
+    fs::write(capsule.workspace_path.join("shared.txt"), "live\n").expect("edit capsule");
+    let output_path = fixture.temp.path().join("live.patch");
+    let output = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args([
+            "--home",
+            fixture.state.to_str().expect("utf8 state path"),
+            "--json",
+            "diff",
+            &capsule.id,
+            "--output",
+            output_path.to_str().expect("utf8 output path"),
+        ])
+        .output()
+        .expect("run capsule CLI");
+    assert_success(&output);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse diff metadata");
+    let written = fs::read(output_path).expect("read written patch");
+    assert_eq!(value["bytes"], written.len());
+    assert_eq!(value["patch_sha256"], hex::encode(Sha256::digest(&written)));
 }
 
 #[test]
@@ -1023,7 +1101,7 @@ fn unsupported_schema_versions_fail_closed_but_remain_inspectable_and_backupable
         manager.show(&capsule.id),
         Err(Error::SchemaVersion {
             found: 2,
-            supported: 3
+            supported: 4
         })
     ));
     let inspection = manager.inspect_state().expect("inspect old state");
@@ -1239,7 +1317,7 @@ fn option_like_base_revision_is_rejected_before_git_invocation() {
 }
 
 #[test]
-fn sparse_checkout_is_rejected_instead_of_treating_absent_files_as_deletions() {
+fn capsule_created_from_sparse_source_has_a_complete_independent_checkout() {
     let fixture = Fixture::new();
     fs::write(fixture.repo.join("other.txt"), "other\n").expect("seed second tracked file");
     git_success(&fixture.repo, ["add", "other.txt"]);
@@ -1255,25 +1333,28 @@ fn sparse_checkout_is_rejected_instead_of_treating_absent_files_as_deletions() {
             "add second file",
         ],
     );
-    let manager = fixture.manager();
-    let capsule = fixture.create("sparse");
     git_success(
-        &capsule.workspace_path,
+        &fixture.repo,
         ["sparse-checkout", "set", "--skip-checks", "shared.txt"],
     );
+    assert_eq!(
+        git_text(
+            &fixture.repo,
+            ["config", "--type=bool", "core.sparseCheckout"]
+        ),
+        "true"
+    );
 
-    assert!(matches!(
-        manager.status(&capsule.id),
-        Err(Error::InvalidInput(message)) if message.contains("sparse-checkout")
-    ));
-    assert!(matches!(
-        manager.close(&capsule.id, CloseOptions::default()),
-        Err(Error::InvalidInput(message)) if message.contains("sparse-checkout")
-    ));
+    let capsule = fixture.create("sparse-source");
+    assert_eq!(
+        fs::read_to_string(capsule.workspace_path.join("other.txt")).expect("complete checkout"),
+        "other\n"
+    );
+    assert!(fixture.manager().status(&capsule.id).is_ok());
 }
 
 #[test]
-fn skip_worktree_index_entries_are_rejected_as_incomplete_snapshots() {
+fn skip_worktree_entries_do_not_hide_changes_from_the_temporary_index_snapshot() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
     let capsule = fixture.create("skip-worktree");
@@ -1281,15 +1362,23 @@ fn skip_worktree_index_entries_are_rejected_as_incomplete_snapshots() {
         &capsule.workspace_path,
         ["update-index", "--skip-worktree", "shared.txt"],
     );
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "changed despite skip\n",
+    )
+    .expect("edit hidden path");
 
-    assert!(matches!(
-        manager.status(&capsule.id),
-        Err(Error::InvalidInput(message)) if message.contains("skip-worktree")
-    ));
+    assert_eq!(
+        manager
+            .status(&capsule.id)
+            .expect("complete snapshot")
+            .changed_paths,
+        vec!["shared.txt"]
+    );
 }
 
 #[test]
-fn assume_unchanged_index_entries_are_rejected_as_incomplete_snapshots() {
+fn assume_unchanged_entries_do_not_hide_changes_from_the_temporary_index_snapshot() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
     let capsule = fixture.create("assume-unchanged");
@@ -1297,11 +1386,19 @@ fn assume_unchanged_index_entries_are_rejected_as_incomplete_snapshots() {
         &capsule.workspace_path,
         ["update-index", "--assume-unchanged", "shared.txt"],
     );
+    fs::write(
+        capsule.workspace_path.join("shared.txt"),
+        "changed despite assume\n",
+    )
+    .expect("edit hidden path");
 
-    assert!(matches!(
-        manager.status(&capsule.id),
-        Err(Error::InvalidInput(message)) if message.contains("assume-unchanged")
-    ));
+    assert_eq!(
+        manager
+            .status(&capsule.id)
+            .expect("complete snapshot")
+            .changed_paths,
+        vec!["shared.txt"]
+    );
 }
 
 #[test]
@@ -1600,6 +1697,7 @@ fn exported_bundles_verify_offline_and_detect_tampering() {
         &exported,
         &VerifyOptions {
             require_successful_evidence: true,
+            require_current_successful_evidence: false,
             repository: Some(fixture.repo.clone()),
         },
     )
@@ -1663,6 +1761,7 @@ fn verification_confirms_the_patch_reproduces_exactly_against_the_base() {
             &exported,
             &VerifyOptions {
                 require_successful_evidence: false,
+                require_current_successful_evidence: false,
                 repository: Some(fixture.repo.clone()),
             },
         ),
@@ -1944,6 +2043,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
                         &capsule.id,
                         CloseOptions {
                             require_successful_evidence: true,
+                            require_current_successful_evidence: false,
                         },
                     )
                     .expect("seal candidate");
@@ -1954,6 +2054,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
                     &receipt,
                     &VerifyOptions {
                         require_successful_evidence: true,
+                        require_current_successful_evidence: false,
                         repository: Some(repo),
                     },
                 )
@@ -2003,6 +2104,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
             receipt,
             &VerifyOptions {
                 require_successful_evidence: true,
+                require_current_successful_evidence: false,
                 repository: Some(fixture.repo.clone()),
             },
         )
@@ -2043,6 +2145,790 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
         verify_bundle(&receipt, &VerifyOptions::default())
             .expect("receipt survives concurrent cleanup");
     }
+}
+
+#[test]
+fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("current-evidence");
+    fs::write(capsule.workspace_path.join("shared.txt"), "tested\n").expect("edit");
+    let evidence = manager
+        .add_evidence(
+            &capsule.id,
+            EvidenceInput {
+                command: "caller-ran-tests".to_owned(),
+                exit_code: 0,
+                summary: None,
+            },
+        )
+        .expect("record bound claim");
+    assert!(evidence.patch_sha256.is_some());
+    fs::write(capsule.workspace_path.join("shared.txt"), "changed later\n").expect("stale edit");
+    assert!(matches!(
+        manager.close(
+            &capsule.id,
+            CloseOptions {
+                require_successful_evidence: false,
+                require_current_successful_evidence: true,
+            },
+        ),
+        Err(Error::InvalidInput(message)) if message.contains("current successful evidence")
+    ));
+    let current = manager
+        .add_evidence(
+            &capsule.id,
+            EvidenceInput {
+                command: "caller-ran-tests-again".to_owned(),
+                exit_code: 0,
+                summary: None,
+            },
+        )
+        .expect("record current claim");
+    let result = manager
+        .close(
+            &capsule.id,
+            CloseOptions {
+                require_successful_evidence: false,
+                require_current_successful_evidence: true,
+            },
+        )
+        .expect("seal current claim");
+    assert_eq!(
+        current.patch_sha256.as_deref(),
+        Some(result.patch_sha256.as_str())
+    );
+
+    let receipt = fixture.temp.path().join("current-evidence-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    verify_bundle(
+        &receipt,
+        &VerifyOptions {
+            require_successful_evidence: false,
+            require_current_successful_evidence: true,
+            repository: Some(fixture.repo.clone()),
+        },
+    )
+    .expect("verify current evidence against seal");
+}
+
+#[test]
+fn state_v3_migration_is_dry_run_then_backup_first_and_marks_evidence_unbound() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration");
+    manager
+        .add_evidence(
+            &capsule.id,
+            EvidenceInput {
+                command: "legacy claim".to_owned(),
+                exit_code: 0,
+                summary: None,
+            },
+        )
+        .expect("evidence");
+    fs::write(capsule.workspace_path.join("shared.txt"), "legacy\n").expect("edit");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    for path in [
+        manifest_path(&fixture, &capsule.id),
+        result_path(&fixture, &capsule.id),
+    ] {
+        let mut value = read_json(&path);
+        value["schema_version"] = serde_json::json!(3);
+        for evidence in value["evidence"].as_array_mut().expect("evidence array") {
+            evidence
+                .as_object_mut()
+                .expect("evidence object")
+                .remove("patch_sha256");
+        }
+        write_json(&path, &value);
+    }
+
+    let before = fs::read(manifest_path(&fixture, &capsule.id)).expect("before dry run");
+    let dry = manager
+        .migrate_state_v3(None::<&Path>, false)
+        .expect("dry-run migration");
+    assert!(!dry.applied);
+    assert!(dry.backup_directory.is_none());
+    assert_eq!(dry.capsules, 1);
+    assert_eq!(dry.results, 1);
+    assert_eq!(dry.unbound_evidence, 2);
+    assert_eq!(
+        fs::read(manifest_path(&fixture, &capsule.id)).expect("after dry run"),
+        before
+    );
+    assert!(manager.migrate_state_v3(None::<&Path>, true).is_err());
+
+    let backup = fixture.temp.path().join("migration-backup");
+    let report = manager
+        .migrate_state_v3(Some(&backup), true)
+        .expect("apply migration");
+    assert!(report.applied);
+    assert!(backup.join("backup.json").is_file());
+    assert_eq!(
+        read_json(
+            &backup
+                .join("capsules")
+                .join(&capsule.id)
+                .join("capsule.json")
+        )["schema_version"],
+        3
+    );
+    let migrated = manager.show(&capsule.id).expect("read migrated state");
+    assert_eq!(migrated.schema_version, 4);
+    assert_eq!(migrated.evidence[0].patch_sha256, None);
+    assert_eq!(report.unbound_evidence, 2);
+    assert_eq!(
+        manager
+            .result(&capsule.id)
+            .expect("migrated seal")
+            .schema_version,
+        4
+    );
+}
+
+#[test]
+fn migration_dry_run_rejects_backup_at_library_and_cli_boundaries() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let backup = fixture.temp.path().join("dry-backup");
+    assert!(matches!(
+        manager.migrate_state_v3(Some(&backup), false),
+        Err(Error::InvalidInput(message)) if message.contains("apply=true")
+    ));
+    assert!(!backup.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args([
+            "--home",
+            fixture.state.to_str().expect("utf8 state path"),
+            "--json",
+            "state",
+            "migrate",
+            "--dry-run",
+            "--backup",
+            backup.to_str().expect("utf8 backup path"),
+        ])
+        .output()
+        .expect("run capsule CLI");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("parse CLI error JSON");
+    assert_eq!(error["kind"], "invalid_input");
+    assert!(!backup.exists());
+}
+
+#[test]
+fn migration_rejects_adversarial_pair_mismatches_before_backup_or_write() {
+    for (target, field, value) in [
+        ("result", "label", serde_json::json!("different")),
+        ("manifest-result", "changed_paths", serde_json::json!(999)),
+        ("manifest-result", "sealed_at_unix", serde_json::json!(0)),
+    ] {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let capsule = fixture.create(&format!("mismatch-{field}"));
+        fs::write(capsule.workspace_path.join("shared.txt"), "changed\n").expect("edit");
+        manager
+            .close(&capsule.id, CloseOptions::default())
+            .expect("close");
+        for path in [
+            manifest_path(&fixture, &capsule.id),
+            result_path(&fixture, &capsule.id),
+        ] {
+            let mut json = read_json(&path);
+            json["schema_version"] = serde_json::json!(3);
+            write_json(&path, &json);
+        }
+        let changed_path = if target == "result" {
+            result_path(&fixture, &capsule.id)
+        } else {
+            manifest_path(&fixture, &capsule.id)
+        };
+        let mut changed = read_json(&changed_path);
+        if target == "result" {
+            changed[field] = value;
+        } else {
+            changed["result"][field] = value;
+        }
+        write_json(&changed_path, &changed);
+        let before_manifest = fs::read(manifest_path(&fixture, &capsule.id)).expect("manifest");
+        let before_result = fs::read(result_path(&fixture, &capsule.id)).expect("result");
+        let backup = fixture.temp.path().join("must-not-exist");
+        assert!(manager.migrate_state_v3(Some(&backup), true).is_err());
+        assert!(!backup.exists());
+        assert_eq!(
+            fs::read(manifest_path(&fixture, &capsule.id)).expect("manifest unchanged"),
+            before_manifest
+        );
+        assert_eq!(
+            fs::read(result_path(&fixture, &capsule.id)).expect("result unchanged"),
+            before_result
+        );
+    }
+}
+
+#[test]
+fn migration_rejects_mixed_current_and_legacy_pairs() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("mixed-schema");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let result = result_path(&fixture, &capsule.id);
+    let mut legacy = read_json(&result);
+    legacy["schema_version"] = serde_json::json!(3);
+    write_json(&result, &legacy);
+    let backup = fixture.temp.path().join("must-not-exist");
+    assert!(matches!(
+        manager.migrate_state_v3(Some(&backup), true),
+        Err(Error::UnsafeState(message)) if message.contains("mixed-schema")
+    ));
+    assert!(!backup.exists());
+}
+
+#[test]
+fn opening_store_does_not_recover_a_live_migration_before_global_lock() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    drop(manager);
+    let lock_path = fixture.state.join("locks/global.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open global lock");
+    lock.lock_exclusive().expect("hold global lock");
+    let journal = fixture.state.join(".migration-v3-v4");
+    fs::create_dir(&journal).expect("create live staging journal");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args([
+            "--home",
+            fixture.state.to_str().expect("utf8 state path"),
+            "--json",
+            "list",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start concurrent opener");
+    thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll opener").is_none());
+    assert!(
+        journal.is_dir(),
+        "live journal must remain while lock is held"
+    );
+
+    lock.unlock().expect("release global lock");
+    let output = child.wait_with_output().expect("finish opener");
+    assert_success(&output);
+    assert!(
+        !journal.exists(),
+        "opener recovers only after taking the lock"
+    );
+}
+
+#[test]
+fn migration_recovery_distinguishes_active_rollback_from_committed_cleanup() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration-recovery");
+    let manifest = manifest_path(&fixture, &capsule.id);
+    let original = fs::read(&manifest).expect("original manifest");
+    drop(manager);
+
+    let active = fixture.state.join(".migration-v3-v4");
+    fs::create_dir(&active).expect("active journal");
+    fs::write(active.join("0.json"), &original).expect("journal original");
+    write_json(
+        &active.join("targets.json"),
+        &serde_json::json!([format!("capsules/{}/capsule.json", capsule.id)]),
+    );
+    fs::write(&manifest, b"partially migrated").expect("partial target write");
+    drop(fixture.manager());
+    assert_eq!(fs::read(&manifest).expect("rolled back manifest"), original);
+    assert!(!active.exists());
+
+    let committed = fixture.state.join(".migration-v3-v4-committed-cleanup");
+    fs::create_dir(&committed).expect("committed cleanup");
+    fs::write(committed.join("0.json"), b"partially deleted journal").expect("partial cleanup");
+    drop(fixture.manager());
+    assert!(!committed.exists());
+    assert_eq!(
+        fs::read(&manifest).expect("committed target retained"),
+        original
+    );
+
+    drop(fixture.manager());
+    assert_eq!(fs::read(&manifest).expect("idempotent reopen"), original);
+}
+
+#[test]
+fn migration_recovery_fails_closed_when_both_namespaces_exist() {
+    let fixture = Fixture::new();
+    drop(fixture.manager());
+    let active = fixture.state.join(".migration-v3-v4");
+    let committed = fixture.state.join(".migration-v3-v4-committed-cleanup");
+    fs::create_dir(&active).expect("active journal");
+    fs::create_dir(&committed).expect("committed journal");
+    assert!(matches!(
+        CapsuleManager::open(&fixture.state),
+        Err(Error::UnsafeState(message)) if message.contains("both active and committed")
+    ));
+    assert!(active.is_dir());
+    assert!(committed.is_dir());
+}
+
+#[test]
+fn migration_rejects_result_patch_corruption_without_writing_or_backup() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("migration-corrupt");
+    fs::write(capsule.workspace_path.join("shared.txt"), "changed\n").expect("edit");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    for path in [
+        manifest_path(&fixture, &capsule.id),
+        result_path(&fixture, &capsule.id),
+    ] {
+        let mut value = read_json(&path);
+        value["schema_version"] = serde_json::json!(3);
+        write_json(&path, &value);
+    }
+    fs::write(
+        fixture
+            .state
+            .join("capsules")
+            .join(&capsule.id)
+            .join("result.patch"),
+        b"corrupt",
+    )
+    .expect("corrupt patch");
+    let before = fs::read(result_path(&fixture, &capsule.id)).expect("legacy result");
+    let backup = fixture.temp.path().join("must-not-exist");
+    assert!(manager.migrate_state_v3(Some(&backup), true).is_err());
+    assert!(!backup.exists());
+    assert_eq!(
+        fs::read(result_path(&fixture, &capsule.id)).expect("unchanged result"),
+        before
+    );
+}
+
+#[test]
+fn authenticated_verification_cannot_combine_different_bundle_snapshots() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let first = fixture.create("signed-first");
+    let second = fixture.create("signed-second");
+    manager
+        .close(&first.id, CloseOptions::default())
+        .expect("close first");
+    manager
+        .close(&second.id, CloseOptions::default())
+        .expect("close second");
+    let first_receipt = fixture.temp.path().join("first-receipt");
+    let second_receipt = fixture.temp.path().join("second-receipt");
+    manager
+        .export_artifacts(&first.id, &first_receipt)
+        .expect("export first");
+    manager
+        .export_artifacts(&second.id, &second_receipt)
+        .expect("export second");
+
+    let seed = [7_u8; 32];
+    let first_bytes = fs::read(first_receipt.join("bundle.json")).expect("first snapshot");
+    let signature = sign_bundle_bytes(&first_bytes, &seed);
+    let trusted = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let report = verify_authenticated_bundle(
+        &first_receipt,
+        &signature,
+        &trusted,
+        &VerifyOptions::default(),
+    )
+    .expect("authenticate exact first snapshot");
+    assert!(report.signature_authenticated);
+    assert!(
+        verify_authenticated_bundle(
+            &second_receipt,
+            &signature,
+            &trusted,
+            &VerifyOptions::default(),
+        )
+        .is_err(),
+        "signature from one valid snapshot must not authenticate another valid snapshot"
+    );
+}
+
+#[test]
+fn current_result_requires_ignored_digest_and_canonical_lowercase_hashes() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("result-canonicality");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close capsule");
+    let receipt = fixture.temp.path().join("canonicality-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export receipt");
+
+    let result_path = receipt.join("result.json");
+    let bundle_path = receipt.join("bundle.json");
+    for mutation in ["missing_ignored_digest", "uppercase_ignored_digest"] {
+        let original_result = fs::read(&result_path).expect("original result");
+        let original_bundle = fs::read(&bundle_path).expect("original bundle");
+        let mut result: serde_json::Value =
+            serde_json::from_slice(&original_result).expect("decode result");
+        if mutation == "missing_ignored_digest" {
+            assert!(
+                result
+                    .as_object_mut()
+                    .expect("result object")
+                    .remove("ignored_content_sha256")
+                    .is_some(),
+                "sealed result had no ignored-content digest"
+            );
+        } else {
+            let digest = result["ignored_content_sha256"]
+                .as_str()
+                .expect("ignored-content digest");
+            result["ignored_content_sha256"] = serde_json::json!(format!("A{}", &digest[1..]));
+        }
+        let mut changed = serde_json::to_vec_pretty(&result).expect("encode changed result");
+        changed.push(b'\n');
+        fs::write(&result_path, &changed).expect("write changed result");
+        let mut bundle: serde_json::Value =
+            serde_json::from_slice(&original_bundle).expect("decode bundle");
+        let descriptor = bundle["artifacts"]
+            .as_array_mut()
+            .expect("artifact descriptors")
+            .iter_mut()
+            .find(|descriptor| descriptor["name"] == "result.json")
+            .expect("result descriptor");
+        let digest = hex::encode(Sha256::digest(&changed));
+        descriptor["bytes"] = serde_json::json!(changed.len());
+        descriptor["sha256"] = serde_json::json!(&digest);
+        descriptor["content_address"] = serde_json::json!(format!("sha256:{digest}"));
+        fs::write(
+            &bundle_path,
+            serde_json::to_vec_pretty(&bundle).expect("encode bundle"),
+        )
+        .expect("write bundle");
+
+        let verification = verify_bundle(&receipt, &VerifyOptions::default());
+        assert!(
+            verification.is_err(),
+            "verification accepted {mutation}: {verification:?}; changed result: {}",
+            String::from_utf8_lossy(&changed)
+        );
+        fs::write(&result_path, &original_result).expect("restore result");
+        fs::write(&bundle_path, &original_bundle).expect("restore bundle");
+    }
+}
+
+#[test]
+fn detached_signature_covers_exact_bundle_bytes_and_requires_trusted_key() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("signature");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let receipt = fixture.temp.path().join("signed-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    let bundle = fs::read(receipt.join("bundle.json")).expect("bundle bytes");
+    let seed = [7_u8; 32];
+    let signature = sign_bundle_bytes(&bundle, &seed);
+    let trusted = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    verify_bundle_signature_bytes(&bundle, &signature, &trusted).expect("valid signature");
+    let mut changed = bundle.clone();
+    changed.push(b' ');
+    assert!(verify_bundle_signature_bytes(&changed, &signature, &trusted).is_err());
+    let other = SigningKey::from_bytes(&[9_u8; 32])
+        .verifying_key()
+        .to_bytes();
+    assert!(verify_bundle_signature_bytes(&bundle, &signature, &other).is_err());
+}
+
+#[test]
+fn cli_keygen_sign_and_verify_report_authentication() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("cli-keygen");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let receipt = fixture.temp.path().join("keygen-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    let private = fixture.temp.path().join("private.seed");
+    let public = fixture.temp.path().join("public.key");
+    let signature = fixture.temp.path().join("bundle.sig");
+    assert_success(&capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("keygen"),
+            std::ffi::OsStr::new("--private-key"),
+            private.as_os_str(),
+            std::ffi::OsStr::new("--public-key"),
+            public.as_os_str(),
+        ],
+    ));
+    assert_eq!(fs::metadata(&private).expect("private metadata").len(), 32);
+    assert_eq!(fs::metadata(&public).expect("public metadata").len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&private)
+                .expect("private metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert!(
+        !capsule_cli(
+            &fixture,
+            [
+                std::ffi::OsStr::new("keygen"),
+                std::ffi::OsStr::new("--private-key"),
+                private.as_os_str(),
+                std::ffi::OsStr::new("--public-key"),
+                public.as_os_str(),
+            ],
+        )
+        .status
+        .success()
+    );
+    assert_success(&capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("sign"),
+            receipt.as_os_str(),
+            std::ffi::OsStr::new("--private-key"),
+            private.as_os_str(),
+            std::ffi::OsStr::new("--output"),
+            signature.as_os_str(),
+        ],
+    ));
+    let output = capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("verify"),
+            receipt.as_os_str(),
+            std::ffi::OsStr::new("--signature"),
+            signature.as_os_str(),
+            std::ffi::OsStr::new("--trusted-public-key"),
+            public.as_os_str(),
+        ],
+    );
+    assert_success(&output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("verify JSON");
+    assert_eq!(report["signature_authenticated"], true);
+}
+
+#[test]
+fn keygen_reports_partial_publication_and_sign_never_overwrites() {
+    let fixture = Fixture::new();
+    let private = fixture.temp.path().join("existing.seed");
+    let public = fixture.temp.path().join("published.key");
+    fs::write(&private, [1_u8; 32]).expect("existing private path");
+    let output = capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("keygen"),
+            std::ffi::OsStr::new("--private-key"),
+            private.as_os_str(),
+            std::ffi::OsStr::new("--public-key"),
+            public.as_os_str(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(public.is_file(), "harmless public key remains published");
+    assert_eq!(fs::read(&private).expect("private untouched"), [1_u8; 32]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(public.to_string_lossy().as_ref()));
+
+    let manager = fixture.manager();
+    let capsule = fixture.create("signature-no-overwrite");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let receipt = fixture.temp.path().join("signature-no-overwrite-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    let signature = fixture.temp.path().join("existing.sig");
+    fs::write(&signature, b"keep me").expect("existing signature");
+    assert!(sign_bundle(&receipt, &[2_u8; 32], &signature).is_err());
+    assert_eq!(
+        fs::read(&signature).expect("signature untouched"),
+        b"keep me"
+    );
+}
+
+#[test]
+fn key_inputs_require_exact_length_without_trailing_bytes() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("key-length");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let receipt = fixture.temp.path().join("key-length-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    let private = fixture.temp.path().join("long.seed");
+    fs::write(&private, [3_u8; 33]).expect("trailing private byte");
+    let output = capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("sign"),
+            receipt.as_os_str(),
+            std::ffi::OsStr::new("--private-key"),
+            private.as_os_str(),
+            std::ffi::OsStr::new("--output"),
+            fixture.temp.path().join("unused.sig").as_os_str(),
+        ],
+    );
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn key_inputs_reject_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("key-symlink");
+    manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    let receipt = fixture.temp.path().join("key-symlink-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    let target = fixture.temp.path().join("target.seed");
+    let link = fixture.temp.path().join("linked.seed");
+    fs::write(&target, [4_u8; 32]).expect("key target");
+    symlink(&target, &link).expect("key symlink");
+    let output = capsule_cli(
+        &fixture,
+        [
+            std::ffi::OsStr::new("sign"),
+            receipt.as_os_str(),
+            std::ffi::OsStr::new("--private-key"),
+            link.as_os_str(),
+            std::ffi::OsStr::new("--output"),
+            fixture.temp.path().join("linked.sig").as_os_str(),
+        ],
+    );
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_ignored_names_and_symlink_targets_hash_losslessly() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("non-utf8-ignored");
+    fs::write(capsule.workspace_path.join(".gitignore"), b"ignored-*\n").expect("ignore rule");
+    let raw_name = b"ignored-\xff".to_vec();
+    let ignored = capsule
+        .workspace_path
+        .join(std::ffi::OsString::from_vec(raw_name.clone()));
+    fs::write(&ignored, b"ignored bytes").expect("write ignored non-UTF-8 file");
+    let link = capsule.workspace_path.join("ignored-link");
+    symlink(std::ffi::OsString::from_vec(b"target-\xfe".to_vec()), &link)
+        .expect("write non-UTF-8 symlink target");
+
+    let result = manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("hash ignored native names");
+    assert!(result.ignored_paths.contains(&GitPath::UnixBytes {
+        unix_bytes_hex: hex::encode(raw_name),
+    }));
+    assert!(result.ignored_content_sha256.is_some());
+}
+
+#[test]
+fn git_path_raw_encoding_is_strictly_canonical() {
+    let valid: GitPath = serde_json::from_str(r#"{"unix_bytes_hex":"ff"}"#).expect("raw path");
+    assert!(valid.is_valid_encoding());
+    for invalid in [
+        r#"{"unix_bytes_hex":"FF"}"#,
+        r#"{"unix_bytes_hex":"666f6f"}"#,
+        r#"{"unix_bytes_hex":"f"}"#,
+        r#"{"unix_bytes_hex":"00"}"#,
+        r#"{"unix_bytes_hex":"ff","extra":true}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<GitPath>(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_git_inventory_paths_round_trip_losslessly() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let capsule = fixture.create("non-utf8");
+    let raw = b"bad-\xff.txt".to_vec();
+    fs::write(
+        capsule
+            .workspace_path
+            .join(std::ffi::OsString::from_vec(raw.clone())),
+        b"bytes\n",
+    )
+    .expect("write non-UTF-8 path");
+    let expected = GitPath::UnixBytes {
+        unix_bytes_hex: hex::encode(&raw),
+    };
+    assert_eq!(
+        manager.status(&capsule.id).expect("status").changed_paths,
+        vec![expected.clone()]
+    );
+    let result = manager
+        .close(&capsule.id, CloseOptions::default())
+        .expect("close");
+    assert_eq!(result.changed_paths, vec![expected.clone()]);
+    let encoded = serde_json::to_vec(&result).expect("encode result");
+    let decoded: change_capsule::CapsuleResult =
+        serde_json::from_slice(&encoded).expect("decode result");
+    assert_eq!(decoded.changed_paths, vec![expected]);
+    let receipt = fixture.temp.path().join("non-utf8-receipt");
+    manager
+        .export_artifacts(&capsule.id, &receipt)
+        .expect("export");
+    verify_bundle(
+        receipt,
+        &VerifyOptions {
+            repository: Some(fixture.repo.clone()),
+            ..VerifyOptions::default()
+        },
+    )
+    .expect("verify non-UTF-8 inventory");
 }
 
 #[test]

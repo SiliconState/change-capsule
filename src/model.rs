@@ -11,11 +11,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::idempotency::IdempotencyRecordInspection;
+
 /// Schema version of the durable capsule manifest and sealed result.
 ///
 /// State written by a different version fails closed rather than being
 /// interpreted under current assumptions.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+
+/// Previous durable/result schema accepted only for receipt verification and
+/// explicit state migration.
+pub const LEGACY_SCHEMA_VERSION: u32 = 3;
 
 /// Schema version of the exported artifact bundle (`bundle.json`).
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -85,6 +91,11 @@ pub struct Evidence {
     /// Optional bounded human- or machine-generated summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// SHA-256 of the complete patch as it existed when this claim was attached.
+    ///
+    /// Absent only on evidence migrated from schema v3, where no binding existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_sha256: Option<String>,
     /// When the record was attached to the capsule.
     pub recorded_at_unix: u64,
 }
@@ -285,7 +296,7 @@ pub struct CapsuleResult {
     /// Size of the sealed patch in bytes.
     pub patch_bytes: u64,
     /// Complete inventory of paths the result changes.
-    pub changed_paths: Vec<String>,
+    pub changed_paths: Vec<GitPath>,
     /// Total bytes of Git-ignored content present at seal time.
     ///
     /// Recorded as provenance about what the patch deliberately excludes.
@@ -293,11 +304,14 @@ pub struct CapsuleResult {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ignored_bytes: u64,
     /// Structural digest of ignored content observed at seal time.
+    ///
+    /// Present on every schema-v4 result. Optional only so exported schema-v3
+    /// receipts, which predate this field, remain decodable and verifiable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_content_sha256: Option<String>,
     /// Ignored paths excluded from the patch, as reported by Git.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignored_paths: Vec<String>,
+    pub ignored_paths: Vec<GitPath>,
     /// Checkpoints made during the attempt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
@@ -350,10 +364,10 @@ pub struct CapsuleStatus {
     pub dirty: Option<bool>,
     /// Non-ignored paths changed from the pinned base.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub changed_paths: Vec<String>,
+    pub changed_paths: Vec<GitPath>,
     /// Ignored untracked paths excluded from any result patch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignored_paths: Vec<String>,
+    pub ignored_paths: Vec<GitPath>,
     /// Commits reachable from `HEAD` but not from the base.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commits_ahead: Option<u64>,
@@ -404,6 +418,118 @@ pub struct RecoveryAction {
     pub state: CapsuleState,
     /// Human-readable description of what recovery did.
     pub action: String,
+}
+
+/// A lossless Git inventory path.
+///
+/// UTF-8 paths retain the historical JSON string shape. On Unix, paths with
+/// non-UTF-8 bytes use `{ "unix_bytes_hex": "..." }`, which is unambiguous
+/// and round-trippable without unsafe code.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(untagged)]
+pub enum GitPath {
+    /// Ordinary UTF-8 Git path.
+    Utf8(String),
+    /// Raw Unix pathname bytes, lowercase hex encoded.
+    UnixBytes {
+        /// Lowercase hexadecimal pathname bytes.
+        unix_bytes_hex: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for GitPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, untagged)]
+        enum Repr {
+            Utf8(String),
+            UnixBytes { unix_bytes_hex: String },
+        }
+
+        let path = match Repr::deserialize(deserializer)? {
+            Repr::Utf8(value) => Self::Utf8(value),
+            Repr::UnixBytes { unix_bytes_hex } => Self::UnixBytes { unix_bytes_hex },
+        };
+        if path.is_valid_encoding() {
+            Ok(path)
+        } else {
+            Err(serde::de::Error::custom(
+                "Git path encoding must be non-empty, NUL-free, canonical lowercase hex, and raw-byte form must not encode valid UTF-8",
+            ))
+        }
+    }
+}
+
+impl GitPath {
+    /// Return the UTF-8 path when it has the ordinary representation.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Utf8(value) => Some(value),
+            Self::UnixBytes { .. } => None,
+        }
+    }
+
+    /// Return whether this value is an unambiguous, non-empty Git path encoding.
+    pub fn is_valid_encoding(&self) -> bool {
+        match self {
+            Self::Utf8(value) => !value.is_empty() && !value.contains('\0'),
+            Self::UnixBytes { unix_bytes_hex } => {
+                !unix_bytes_hex.is_empty()
+                    && unix_bytes_hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    && hex::decode(unix_bytes_hex).is_ok_and(|bytes| {
+                        !bytes.is_empty()
+                            && !bytes.contains(&0)
+                            && std::str::from_utf8(&bytes).is_err()
+                    })
+            }
+        }
+    }
+
+    /// Decode this inventory value to a native relative path when supported.
+    pub fn to_path_buf(&self) -> Option<PathBuf> {
+        match self {
+            Self::Utf8(value) => Some(PathBuf::from(value)),
+            Self::UnixBytes { unix_bytes_hex } => {
+                let bytes = hex::decode(unix_bytes_hex).ok()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+                    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = bytes;
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq<str> for GitPath {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for GitPath {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl std::fmt::Display for GitPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Utf8(value) => formatter.write_str(value),
+            Self::UnixBytes { unix_bytes_hex } => write!(formatter, "unix-bytes:{unix_bytes_hex}"),
+        }
+    }
 }
 
 /// Which sealed artifact a descriptor refers to.
@@ -555,6 +681,11 @@ pub struct StateInspection {
     pub state_bytes: u64,
     /// One entry per stored record, ordered by identifier.
     pub records: Vec<StateRecordInspection>,
+    /// Number of entries in the direct idempotency index.
+    pub idempotency_record_count: u64,
+    /// Validation findings for idempotency index entries, ordered by filename.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub idempotency_records: Vec<IdempotencyRecordInspection>,
 }
 
 /// Instantaneous aggregate counters across all capsules.
@@ -597,6 +728,27 @@ pub struct BackupReport {
     pub bytes: u64,
 }
 
+/// Outcome of an explicit durable-state migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationReport {
+    /// State root inspected or migrated.
+    pub state_root: PathBuf,
+    /// Backup destination required before apply; absent for dry-run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_directory: Option<PathBuf>,
+    /// Whether changes were atomically applied.
+    pub applied: bool,
+    /// Number of capsule manifests migrated.
+    pub capsules: u64,
+    /// Number of sealed result manifests migrated.
+    pub results: u64,
+    /// Number of legacy evidence records marked unbound.
+    ///
+    /// Includes both capsule manifests and sealed result manifests, because each
+    /// persisted copy is independently migrated.
+    pub unbound_evidence: u64,
+}
+
 /// Outcome of verifying an exported receipt.
 ///
 /// Produced by [`verify_bundle`](crate::verify_bundle). Its presence means every
@@ -626,4 +778,9 @@ pub struct VerificationReport {
     pub evidence_failed: usize,
     /// Whether the patch was additionally checked against a repository.
     pub repository_checked: bool,
+    /// Whether a detached signature was authenticated with a caller-supplied trusted key.
+    ///
+    /// [`verify_bundle`](crate::verify_bundle) leaves this false because receipt
+    /// integrity verification does not accept or trust keys embedded in a bundle.
+    pub signature_authenticated: bool,
 }

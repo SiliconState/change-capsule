@@ -6,6 +6,58 @@ This document is the framework-neutral contract for using Capsule from an agent 
 
 Treat `workspace_path` as the attempt's only writable project directory. Do not switch its branch, move its `.git` marker, or repurpose the path.
 
+## Capability negotiation
+
+```sh
+capsule --json capabilities
+```
+
+Run this first when you need to know what a given build supports. It is a static compatibility probe: it executes before `CapsuleManager` or state initialization, never creates, inspects, locks, canonicalizes, or mutates `CAPSULE_HOME`, never invokes Git, and succeeds even if `--home` names a missing, unwritable, malformed, or incompatible state root. Its output is one bounded deterministic JSON object with no timestamps, host paths, environment-derived values, or nondeterministic ordering. Without `--json` the same document is printed in human-readable form. `Capabilities::current()` is the Rust representation.
+
+```json
+{
+  "capability_schema_version": 1,
+  "product": "change-capsule",
+  "product_version": "0.2.0",
+  "protocol_versions": [1],
+  "features": [
+    "cli.structured-errors.v1",
+    "create.v1",
+    "create.idempotent.v1",
+    "idempotency.lookup.v1",
+    "recover.targeted.v1",
+    "diff.sha256.v1",
+    "receipt.export.v1",
+    "receipt.verify.v1",
+    "state.inspect.v1"
+  ],
+  "schemas": {
+    "durable_read_write": [4],
+    "durable_migrate_from": [3],
+    "receipt_verify": [3, 4],
+    "bundle": [1],
+    "idempotency_record": [1]
+  },
+  "limits": {
+    "label_bytes": 256,
+    "links": 32,
+    "link_key_bytes": 64,
+    "link_value_bytes": 4096,
+    "idempotency_key_bytes": 256
+  }
+}
+```
+
+Protocol rules:
+
+- `capability_schema_version` is independent of the durable capsule schema, receipt schema, bundle schema, and package semver.
+- Require a protocol version and the subset of feature identifiers you use. Do not infer behavior from `product_version`.
+- Feature identifiers are stable versioned strings. Unknown future identifiers and additive fields are safe to ignore.
+- Removing an identifier or changing its meaning requires a new protocol or capability schema version.
+- Numeric limits are UTF-8 byte counts unless documented otherwise; `links` is a count.
+
+This document negotiates protocol features. It does not establish trust in the binary, its host, or the state root.
+
 ## Recommended flow
 
 ### 1. Create
@@ -26,6 +78,60 @@ Persist at least:
 - `base_commit`.
 
 The `base` input is resolved to an immutable commit before the attempt starts.
+
+#### Idempotent creation
+
+Any coordinator that can time out, crash, or be restarted should pass a key:
+
+```sh
+capsule --json create \
+  --repo /path/to/repository \
+  --label "implement request" \
+  --link task=external-task-id \
+  --idempotency-key "run:8f21/attempt:1"
+```
+
+An idempotency key is:
+
+- scoped to one canonical Capsule state root — different roots may use the same key independently;
+- opaque and compared by exact UTF-8 bytes;
+- non-whitespace, control-free, and at most 256 bytes;
+- **not a credential**: do not put secrets in it. Prefer high-entropy or namespaced values. Capsule assigns no meaning to key contents;
+- durably bound to one logical creation request and one capsule ID for the lifetime of that record, and never reusable after close, integration, orphaning, or drop.
+
+For one state root:
+
+- the same key plus the same creation request always resolves to the same capsule ID;
+- concurrent identical calls create at most one capsule identity and worktree;
+- retries after a timeout or process crash return or resume that same identity, and a timeout while the original call is still running serializes through the existing locks rather than racing into a second identity;
+- the same key with a materially different repository, base request, label, or links fails with `idempotency_conflict` before any second capsule or worktree side effect;
+- an unrecoverable or orphaned first attempt stays bound to the key; Capsule marks that same capsule orphaned rather than silently creating a replacement.
+
+The reservation stores both the caller's original base selector and the resolved immutable commit. Repeating the same selector — including `HEAD` — replays the original reservation even after the source branch has moved; a different selector is accepted only when its meaning is provably equivalent to the reserved commit, and otherwise conflicts. A key is never silently retargeted to a newer `HEAD`.
+
+The response is the ordinary capsule JSON shape, so no consumer is forced into a conditional response schema. Consumers that need reservation status call lookup.
+
+#### Direct keyed lookup
+
+```sh
+capsule --json lookup --idempotency-key "run:8f21/attempt:1"
+```
+
+```json
+{
+  "schema_version": 1,
+  "idempotency_key_sha256": "...",
+  "capsule_id": "cap-01...",
+  "status": "reserved",
+  "capsule": null
+}
+```
+
+Once the manifest exists, `status` is `materialized` and `capsule` carries the validated current manifest. Lookup is non-mutating and direct: it accesses only the hashed reservation path and its referenced capsule, never `list` or unrelated manifest scans. It fails closed if the reservation and capsule immutable identities disagree, remains usable when unrelated capsule or reservation records are malformed or exceed normal list limits, and returns `idempotency_not_found` without echoing the raw key.
+
+This is the bounded correctness path for crash recovery. Do not use `list` as a recovery primitive on a large multi-agent state root.
+
+At-most-one identity is not at-most-once execution: it proves Capsule created one attempt, not that the external agent process ran exactly once. A replay may return a capsule that is already closed, integrated, orphaned, or dropped, so callers still need `status`, targeted `recover <id>`, and `state inspect`. Idempotency is local orchestration state: it never appears in a portable receipt, and receipts prove result consistency, not agent authorship.
 
 ### 2. Launch any worker
 
@@ -50,12 +156,16 @@ capsule --json diff <id> --output /tmp/current.patch
 
 Status fields relevant to automation:
 
+The diff JSON metadata includes `patch_sha256`, a canonical lowercase SHA-256 of the exact live or sealed patch returned; with `--output`, it covers the exact bytes written. Use it rather than a capsule ID alone when deduplicating evidence.
+
 - `health`: stop on anything other than `healthy` while active;
 - `dirty`: whether the real worktree has uncommitted changes;
 - `changed_paths`: complete non-ignored paths changed from the pinned base;
 - `ignored_paths`: ignored untracked files/directories deliberately excluded from the patch; their inventory is recorded in the sealed result at close as provenance;
 - `commits_ahead`: commits reachable from `HEAD` and not from the base;
 - `sealed`: after close, whether the worktree's tracked content still matches the result.
+
+Closing computes a complete ignored-content inventory both before and after its tracked snapshot transaction. The inventories must agree exactly on lossless path identities, byte total, and structural content digest; patch bytes, changed paths, `HEAD`, and the clean/dirty classification used for `result.kind` must also remain identical before any result artifacts are written. Policy and the sealed result use the stable final ignored inventory, and current-evidence policy is evaluated against the exact final patch. This narrows ordinary close races but is not an atomic security boundary against hostile same-user mutation after the final checks.
 
 ### 4. Optional checkpoint
 
@@ -79,15 +189,15 @@ capsule --json evidence <id> \
   --summary "5 integration tests passed"
 ```
 
-The caller is responsible for command execution, timeout, sandboxing, output retention, and honesty. Evidence is provenance, not a cryptographic attestation. A capsule retains at most 64 evidence records totaling at most 256 KiB of command and summary text, so the durable manifest can never grow past its own storage bound.
+The caller is responsible for command execution, timeout, sandboxing, output retention, and honesty. Evidence is explicit caller-claimed provenance, not a cryptographic attestation that the command ran. Schema-v4 records bind the claim to the SHA-256 of the complete patch observed when evidence is added. A later edit makes that evidence non-current. A capsule retains at most 64 evidence records totaling at most 256 KiB.
 
 ### 6. Close
 
 ```sh
-capsule --json close <id> --require-successful-evidence
+capsule --json close <id> --require-current-successful-evidence
 ```
 
-After close, treat the worktree's tracked content as read-only. Any subsequent tracked-content mutation causes `status.health=drifted_after_close`, blocks ordinary cleanup, and blocks integration. Ignored content (build output, caches, logs) may keep changing after close; it is reported and its close-time inventory stays sealed as provenance, but its churn does not invalidate the result.
+`--require-successful-evidence` is the legacy policy (evidence exists and every exit code is zero). `--require-current-successful-evidence` requires at least one successful claim whose patch digest equals the complete patch being sealed.
 
 The sealed result is available through:
 
@@ -114,11 +224,18 @@ Reviewers do not need access to the original worker session. They can consume:
 An exported bundle is verifiable anywhere, with no capsule state:
 
 ```sh
-capsule --json verify /tmp/capsule-result --require-successful-evidence
+capsule --json verify /tmp/capsule-result --require-current-successful-evidence
 capsule --json verify /tmp/capsule-result --repo /path/to/repository
 ```
 
-Offline verification re-checks descriptor digests, sizes, schema versions, and internal result consistency. With `--repo`, it additionally proves the pinned base exists and that applying the sealed patch to it reproduces exactly the sealed bytes and changed paths. A CI merge gate can therefore require: the bundle verifies, evidence is successful, and the PR diff equals `result.patch`.
+Offline verification accepts exported result schemas v3 and v4. Current-evidence policy can only be satisfied by a successful schema-v4 evidence record bound to the sealed patch. Generate matching raw 32-byte Ed25519 files, then optionally verify a raw 64-byte detached signature with the trusted public key supplied out of band:
+
+```sh
+capsule keygen --private-key signing.seed --public-key trusted.pub
+capsule --json verify /tmp/capsule-result --signature receipt.sig --trusted-public-key trusted.pub
+```
+
+The signature covers a fixed-domain SHA-256 commitment of the exact `bundle.json` bytes; descriptors bind the other two artifacts. Authenticated verification opens `bundle.json` once and applies both checks to that byte snapshot, using only the public key supplied out of band. JSON success sets `signature_authenticated` only after both checks pass. Key and signature inputs must be regular non-link files of exact raw length; Unix reads open them nonblocking as well as no-follow before post-open validation, so special files cannot wait for a peer. Windows retains reparse-aware opens and checks. Signature output is atomically published without overwrite. Key generation publishes the harmless public key first, so a private-publication failure can leave only that public file for explicit cleanup.
 
 Several capsules may share one task link. A coordinator can compare their changed paths, patches, evidence, and review outcomes before selecting one.
 
@@ -157,6 +274,8 @@ Current error kinds are:
 - `not_found`
 - `invalid_input`
 - `invalid_state`
+- `idempotency_conflict`
+- `idempotency_not_found`
 - `policy`
 - `artifact_not_found`
 - `verification`
@@ -168,7 +287,7 @@ Current error kinds are:
 - `schema_version`
 - `internal`
 
-Consumers should branch on `kind` and retain the message for diagnosis. `cli` covers argument-parser failures; JSON help and version requests instead succeed with `kind=cli_help` and an `output` field. All other listed error kinds come from library operations. The on-disk manifest and result format is schema version 3. Incompatible schemas fail closed; additive JSON output fields may appear within the same major package line.
+Consumers should branch on `kind` and retain the message for diagnosis. The on-disk manifest and result format is schema version 4. Schema-v3 state requires explicit migration; exported schema-v3 receipts remain verifiable.
 
 ## Audit and metrics
 
@@ -184,7 +303,7 @@ Policy is checked at core lifecycle boundaries. It is not a continuous filesyste
 
 ## State administration
 
-`capsule state inspect` reports record versions and states even when normal schema deserialization would fail. `capsule state backup --output <new-directory>` copies recognized durable state and policy, excluding workspaces and Git repositories, and publishes `backup.json` last as the completion marker. There is no schema migration before a first stable release; incompatible state fails closed but remains inspectable and backupable. `bundle.json` similarly marks a complete artifact export; a reserved destination lacking its marker is incomplete and is not reused implicitly.
+`capsule state inspect` reports record versions and states even when normal schema deserialization would fail. It also reports the idempotency index separately: its record count and any malformed entries, identified by indexed digest rather than raw key, without requiring capsule schema compatibility. Backup includes the index in its indexed layout. Migration does not reinterpret the index's independent schema. A malformed reservation makes keyed operations for that key fail closed while leaving direct lookups for other keys working; there is no garbage collector or key-reuse API, because one reservation per capsule is already bounded by capsule creation and policy limits. `capsule state migrate --dry-run` validates schema-v3 candidates without writes or a backup report and rejects any backup argument. `capsule state migrate --apply --backup <new-directory>` requires and completes a backup first, then applies through a rollback journal. Migration rejects mixed current/legacy capsule/result pairs and validates every sealed-result invariant before backup or mutation. V3 evidence migrates unbound and cannot satisfy current-evidence policy. Other incompatible schemas fail closed.
 
 ## Links
 
@@ -202,6 +321,8 @@ No key has privileged semantics in core.
 
 ## Concurrency
 
+Idempotent creation runs entirely under the existing global-then-project lock order: it canonicalizes the requested repository without mutation, resolves or reconciles an existing key reservation, resolves the base and enforces policy for a new key, generates exactly one capsule ID, durably publishes the reservation before any capsule-directory, branch, worktree, or manifest side effect, creates the manifest and worktree using exactly the reserved ID and immutable request, and finally publishes the active manifest as the authoritative completed creation.
+
 Operations that mutate one repository's capsules take a project-scoped file lock. Policy-sensitive mutations also take the global lock so global counters cannot race. Backup, policy replacement/checking, metrics, inspection, and the administrative audit stream take the global lock plus every known project lock in deterministic order. Multiple active capsules remain independent Git worktrees.
 
 The caller should still avoid issuing two mutating commands against the same capsule simultaneously. Locks serialize them, but a stale caller may receive a state error after the first operation completes.
@@ -212,8 +333,11 @@ Run at process startup or after an interrupted lifecycle operation:
 
 ```sh
 capsule --json recover
+capsule --json recover <known-id>
 ```
 
-Recovery is conservative. It completes provable journal transitions for create, checkpoint, integration, and cleanup and otherwise leaves state for explicit inspection. Prepared commits are protected by namespaced Git refs until their transition becomes durable. Recovery does not delete work, reset unrelated target changes, or invent a result.
+Global recovery scans all records and fails closed on malformed state. Targeted recovery uses the same transition logic and lock order but reads only the known capsule, so an unrelated malformed record does not block it.
+
+Recovery is conservative. It completes provable journal transitions for create, checkpoint, integration, and cleanup and otherwise leaves state for explicit inspection. Every creation crash window is handled conservatively: before reservation publication a retry may make a new reservation; after the reservation but before the capsule directory or manifest a retry resumes the reserved ID; an empty reserved capsule directory is resumed only when its exact expected private shape can be proven; a `creating` manifest is completed only when the absence of conflicting branch and worktree state is proven; partial or contradictory Git side effects preserve the reservation and mark that same capsule orphaned rather than creating a replacement; and once a capsule is active or later, replay simply returns it. Prepared commits are protected by namespaced Git refs until their transition becomes durable. Recovery does not delete work, reset unrelated target changes, or invent a result.
 
 Dirty nested submodule worktrees are rejected because a top-level patch cannot contain their internal files. Commit the nested repository first when the desired result is a top-level gitlink change. `status.ignored_paths` reports ignored untracked content that is deliberately excluded from the result.

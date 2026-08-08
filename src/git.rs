@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use crate::error::{Error, Result, io};
+use crate::model::GitPath;
 
 const SMALL_OUTPUT_CAP: usize = 1024 * 1024;
 const STDERR_CAP: usize = 64 * 1024;
@@ -28,7 +29,7 @@ pub(crate) struct WorktreeRecord {
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     pub(crate) patch: Vec<u8>,
-    pub(crate) changed_paths: Vec<String>,
+    pub(crate) changed_paths: Vec<GitPath>,
 }
 
 pub(crate) struct CommitPatch<'a> {
@@ -117,6 +118,11 @@ impl Git {
                 OsString::from(base),
             ],
         )?;
+        self.finish_worktree_creation(path, base)
+    }
+
+    pub(crate) fn finish_worktree_creation(&self, path: &Path, base: &str) -> Result<()> {
+        self.success(path, ["sparse-checkout", "disable"])?;
         self.success(path, ["reset", "--hard", base])
     }
 
@@ -280,7 +286,7 @@ impl Git {
         self.output(worktree, arguments, None)
     }
 
-    pub(crate) fn ignored_paths(&self, worktree: &Path) -> Result<Vec<String>> {
+    pub(crate) fn ignored_paths(&self, worktree: &Path) -> Result<Vec<GitPath>> {
         let output = self.output_with_env(
             worktree,
             [
@@ -295,7 +301,7 @@ impl Git {
             SMALL_OUTPUT_CAP,
             None,
         )?;
-        parse_nul_strings(&output)
+        parse_nul_paths(&output)
     }
 
     pub(crate) fn commits_ahead(&self, worktree: &Path, base: &str) -> Result<u64> {
@@ -345,14 +351,21 @@ impl Git {
         for path in parse_changed_gitlinks(&raw)? {
             self.output_with_env(
                 worktree,
-                ["submodule", "status", "--cached", "--", &path],
+                [
+                    OsString::from("submodule"),
+                    OsString::from("status"),
+                    OsString::from("--cached"),
+                    OsString::from("--"),
+                    path.clone(),
+                ],
                 &env,
                 SMALL_OUTPUT_CAP,
                 None,
             )
             .map_err(|_| {
                 Error::InvalidInput(format!(
-                    "unregistered embedded Git repository cannot be represented safely: {path}"
+                    "unregistered embedded Git repository cannot be represented safely: {}",
+                    path.to_string_lossy()
                 ))
             })?;
         }
@@ -389,7 +402,7 @@ impl Git {
             SMALL_OUTPUT_CAP,
             None,
         )?;
-        let changed_paths = parse_nul_strings(&paths)?;
+        let changed_paths = parse_nul_paths(&paths)?;
         Ok(Snapshot {
             patch,
             changed_paths,
@@ -437,7 +450,7 @@ impl Git {
         )?;
         Ok(Snapshot {
             patch,
-            changed_paths: parse_nul_strings(&paths)?,
+            changed_paths: parse_nul_paths(&paths)?,
         })
     }
 
@@ -521,7 +534,7 @@ impl Git {
         )?;
         Ok(Snapshot {
             patch: reproduced,
-            changed_paths: parse_nul_strings(&paths)?,
+            changed_paths: parse_nul_paths(&paths)?,
         })
     }
 
@@ -543,10 +556,6 @@ impl Git {
 
     pub(crate) fn reset_index(&self, worktree: &Path, commit: &str) -> Result<()> {
         self.success(worktree, ["reset", "--mixed", commit])
-    }
-
-    pub(crate) fn reset_hard(&self, worktree: &Path, commit: &str) -> Result<()> {
-        self.success(worktree, ["reset", "--hard", commit])
     }
 
     pub(crate) fn prune(&self, repo: &Path) -> Result<()> {
@@ -790,7 +799,7 @@ fn render_command(executable: &Path, arguments: &[OsString]) -> String {
     rendered
 }
 
-fn parse_changed_gitlinks(bytes: &[u8]) -> Result<Vec<String>> {
+fn parse_changed_gitlinks(bytes: &[u8]) -> Result<Vec<OsString>> {
     let mut fields = bytes
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty());
@@ -814,13 +823,52 @@ fn parse_changed_gitlinks(bytes: &[u8]) -> Result<Vec<String>> {
             ));
         }
         if new_mode == "160000" {
-            paths.push(
-                String::from_utf8(path.to_vec())
-                    .map_err(|_| Error::InvalidInput("Git path is not valid UTF-8".to_owned()))?,
-            );
+            paths.push(os_string_from_git_bytes(path)?);
         }
     }
     Ok(paths)
+}
+
+fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<GitPath>> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+        .map(git_path_from_bytes)
+        .collect()
+}
+
+#[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
+fn git_path_from_bytes(bytes: &[u8]) -> Result<GitPath> {
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return Ok(GitPath::Utf8(value.to_owned()));
+    }
+    #[cfg(unix)]
+    {
+        Ok(GitPath::UnixBytes {
+            unix_bytes_hex: hex::encode(bytes),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(Error::InvalidInput(
+            "Git returned a path that cannot be represented on this platform".to_owned(),
+        ))
+    }
+}
+
+#[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
+fn os_string_from_git_bytes(bytes: &[u8]) -> Result<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec())
+            .map(OsString::from)
+            .map_err(|_| Error::InvalidInput("Git path is not valid UTF-8".to_owned()))
+    }
 }
 
 fn parse_nul_strings(bytes: &[u8]) -> Result<Vec<String>> {

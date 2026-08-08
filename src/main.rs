@@ -5,18 +5,20 @@
 //! to stderr carrying a stable `kind` field for programmatic branching.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use change_capsule::{
     Author, CapsuleManager, CheckpointOptions, CloseOptions, CreateOptions, EvidenceInput,
-    IntegrateOptions, Policy, VerifyOptions, verify_bundle,
+    IntegrateOptions, Policy, VerifyOptions, verify_authenticated_bundle, verify_bundle,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,8 +41,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Show static machine-readable protocol capabilities without touching state or Git.
+    Capabilities,
     /// Create an isolated capsule from a pinned Git commit.
     Create(CreateArgs),
+    /// Directly resolve one state-root-scoped idempotency key.
+    Lookup(LookupArgs),
     /// List durable capsule records.
     List,
     /// Show one capsule manifest.
@@ -57,6 +63,10 @@ enum Command {
     Artifacts(IdArgs),
     /// Export a self-describing sealed artifact directory.
     Export(ExportArgs),
+    /// Generate a raw Ed25519 private seed and matching public key.
+    Keygen(KeygenArgs),
+    /// Sign exact bundle.json bytes with a raw 32-byte Ed25519 private seed.
+    Sign(SignArgs),
     /// Verify an exported bundle offline, without capsule state or a workspace.
     Verify(VerifyArgs),
     /// Show structured lifecycle audit events for one capsule or all capsules.
@@ -77,8 +87,8 @@ enum Command {
     Integrate(IntegrateArgs),
     /// Remove the owned worktree while retaining its durable record and result.
     Drop(DropArgs),
-    /// Reconcile interrupted create and integrate journal states.
-    Recover,
+    /// Reconcile interrupted lifecycle transitions globally or for one capsule.
+    Recover(RecoverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -98,11 +108,28 @@ struct CreateArgs {
     /// Opaque linkage metadata, such as issue=bd-42 or run=abc. Repeatable.
     #[arg(long, value_parser = parse_link)]
     link: Vec<(String, String)>,
+
+    /// Opaque state-root-scoped idempotency key. Do not put secrets here.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LookupArgs {
+    /// Opaque state-root-scoped idempotency key. Do not put secrets here.
+    #[arg(long)]
+    idempotency_key: String,
 }
 
 #[derive(Debug, Args)]
 struct IdArgs {
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct RecoverArgs {
+    /// Capsule ID. Omit to recover all records.
+    id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +157,31 @@ struct ExportArgs {
 }
 
 #[derive(Debug, Args)]
+struct KeygenArgs {
+    /// New raw 32-byte Ed25519 private seed file.
+    #[arg(long)]
+    private_key: PathBuf,
+
+    /// New raw 32-byte Ed25519 public key file.
+    #[arg(long)]
+    public_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SignArgs {
+    /// Directory containing bundle.json.
+    bundle: PathBuf,
+
+    /// Raw 32-byte Ed25519 private seed. Never copied into Capsule state.
+    #[arg(long)]
+    private_key: PathBuf,
+
+    /// New raw 64-byte detached signature file.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct VerifyArgs {
     /// Directory containing bundle.json, result.json, and result.patch.
     bundle: PathBuf,
@@ -141,6 +193,18 @@ struct VerifyArgs {
     /// Reject bundles without evidence or with any non-zero evidence exit code.
     #[arg(long)]
     require_successful_evidence: bool,
+
+    /// Reject bundles without successful evidence bound to the sealed patch.
+    #[arg(long)]
+    require_current_successful_evidence: bool,
+
+    /// Raw 64-byte detached Ed25519 signature file.
+    #[arg(long, requires = "trusted_public_key")]
+    signature: Option<PathBuf>,
+
+    /// Raw 32-byte trusted Ed25519 public key supplied out of band.
+    #[arg(long, requires = "signature")]
+    trusted_public_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -176,6 +240,18 @@ enum StateCommand {
     Backup {
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Validate or apply the explicit schema-v3 to schema-v4 migration.
+    Migrate {
+        /// Apply only after creating the required backup.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Validate and report without mutation (the default).
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// New external backup directory; required with --apply and invalid for dry-run.
+        #[arg(long, required_if_eq("apply", "true"), requires = "apply")]
+        backup: Option<PathBuf>,
     },
 }
 
@@ -214,6 +290,10 @@ struct CloseArgs {
     /// Refuse to seal unless evidence exists and every recorded exit code is zero.
     #[arg(long)]
     require_successful_evidence: bool,
+
+    /// Refuse to seal unless successful evidence binds to the current complete patch.
+    #[arg(long)]
+    require_current_successful_evidence: bool,
 }
 
 #[derive(Debug, Args)]
@@ -329,14 +409,75 @@ fn main() -> ExitCode {
 // library operation, keeping automation behavior auditable in one place.
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> change_capsule::Result<()> {
+    if matches!(cli.command, Command::Capabilities) {
+        return print_value(&change_capsule::Capabilities::current(), cli.json);
+    }
+    if let Command::Lookup(arguments) = &cli.command {
+        let state_root = match &cli.home {
+            Some(home) => home.clone(),
+            None => change_capsule::default_state_root()?,
+        };
+        return print_value(
+            &CapsuleManager::lookup_idempotency_key_at(&state_root, &arguments.idempotency_key)?,
+            cli.json,
+        );
+    }
+    if let Command::Keygen(arguments) = &cli.command {
+        let keys = change_capsule::generate_keypair()?;
+        write_new_key_file(&arguments.public_key, &keys.public_key(), false).map_err(|error| {
+            change_capsule::Error::InvalidInput(format!(
+                "public key publication failed at {}; no private key was published: {error}; remove the public key before retrying if it exists",
+                arguments.public_key.display()
+            ))
+        })?;
+        write_new_key_file(&arguments.private_key, keys.private_seed(), true).map_err(|error| {
+            change_capsule::Error::InvalidInput(format!(
+                "public key was published at {}; private key publication failed at {}: {error}; remove the public key before retrying if desired",
+                arguments.public_key.display(),
+                arguments.private_key.display()
+            ))
+        })?;
+        return print_value(
+            &json!({ "private_key": arguments.private_key, "public_key": arguments.public_key }),
+            cli.json,
+        );
+    }
+    if let Command::Sign(arguments) = &cli.command {
+        let key = read_private_seed(&arguments.private_key)?;
+        change_capsule::sign_bundle(&arguments.bundle, &key, &arguments.output)?;
+        return print_value(
+            &json!({ "bundle": arguments.bundle, "signature": arguments.output }),
+            cli.json,
+        );
+    }
     if let Command::Verify(arguments) = &cli.command {
-        let report = verify_bundle(
-            &arguments.bundle,
-            &VerifyOptions {
-                require_successful_evidence: arguments.require_successful_evidence,
-                repository: arguments.repo.clone(),
-            },
-        )?;
+        let report = if let (Some(signature), Some(public_key)) =
+            (&arguments.signature, &arguments.trusted_public_key)
+        {
+            let signature = read_exact_file::<64>(signature, "Ed25519 signature")?;
+            let key = read_exact_file::<32>(public_key, "trusted Ed25519 public key")?;
+            verify_authenticated_bundle(
+                &arguments.bundle,
+                &signature,
+                &key,
+                &VerifyOptions {
+                    require_successful_evidence: arguments.require_successful_evidence,
+                    require_current_successful_evidence: arguments
+                        .require_current_successful_evidence,
+                    repository: arguments.repo.clone(),
+                },
+            )?
+        } else {
+            verify_bundle(
+                &arguments.bundle,
+                &VerifyOptions {
+                    require_successful_evidence: arguments.require_successful_evidence,
+                    require_current_successful_evidence: arguments
+                        .require_current_successful_evidence,
+                    repository: arguments.repo.clone(),
+                },
+            )?
+        };
         return print_value(&report, cli.json);
     }
 
@@ -346,6 +487,9 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
     };
 
     match cli.command {
+        Command::Capabilities => {
+            unreachable!("capabilities is handled before state initialization")
+        }
         Command::Create(arguments) => {
             let mut options = CreateOptions::new(arguments.repo);
             options.base = arguments.base;
@@ -359,7 +503,10 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 }
             }
             options.links = links;
-            let capsule = manager.create(options)?;
+            let capsule = match arguments.idempotency_key {
+                Some(key) => manager.create_idempotent(options, &key)?,
+                None => manager.create(options)?,
+            };
             if cli.json {
                 print_json(&capsule)?;
             } else {
@@ -367,6 +514,9 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 println!("path={}", capsule.workspace_path.display());
                 println!("base={}", capsule.base_commit);
             }
+        }
+        Command::Lookup(_) => {
+            unreachable!("lookup is handled before state initialization")
         }
         Command::List => {
             let capsules = manager.list()?;
@@ -405,6 +555,7 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                         "id": arguments.id,
                         "output": output,
                         "bytes": patch.len(),
+                        "patch_sha256": hex::encode(Sha256::digest(&patch)),
                     }))?;
                 } else {
                     println!("{}", output.display());
@@ -420,6 +571,7 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 print_json(&json!({
                     "id": arguments.id,
                     "bytes": patch.len(),
+                    "patch_sha256": hex::encode(Sha256::digest(&patch)),
                     "changed_paths": changed_paths,
                     "hint": "pass --output <path> to write patch bytes",
                 }))?;
@@ -458,7 +610,9 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 cli.json,
             )?;
         }
-        Command::Verify(_) => unreachable!("verify is handled before state initialization"),
+        Command::Keygen(_) | Command::Sign(_) | Command::Verify(_) => {
+            unreachable!("keygen, sign, and verify are handled before state initialization")
+        }
         Command::Audit(arguments) => {
             let events = match arguments.id {
                 Some(id) => manager.audit_events(&id)?,
@@ -480,6 +634,14 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             StateCommand::Backup { output } => {
                 print_value(&manager.backup_state(output)?, cli.json)?;
             }
+            StateCommand::Migrate {
+                apply,
+                dry_run: _,
+                backup,
+            } => print_value(
+                &manager.migrate_state_v3(backup.as_deref(), apply)?,
+                cli.json,
+            )?,
         },
         Command::Checkpoint(arguments) => {
             let checkpoint = manager.checkpoint(
@@ -507,6 +669,8 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 &arguments.id,
                 CloseOptions {
                     require_successful_evidence: arguments.require_successful_evidence,
+                    require_current_successful_evidence: arguments
+                        .require_current_successful_evidence,
                 },
             )?;
             print_value(&result, cli.json)?;
@@ -526,8 +690,11 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             let capsule = manager.drop_capsule(&arguments.id, arguments.force)?;
             print_value(&capsule, cli.json)?;
         }
-        Command::Recover => {
-            let actions = manager.recover()?;
+        Command::Recover(arguments) => {
+            let actions: Vec<_> = match arguments.id {
+                Some(id) => manager.recover_capsule(&id)?.into_iter().collect(),
+                None => manager.recover()?,
+            };
             if cli.json {
                 print_json(&actions)?;
             } else if actions.is_empty() {
@@ -549,24 +716,200 @@ fn parse_link(value: &str) -> Result<(String, String), String> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn write_new_key_file(path: &Path, bytes: &[u8], private: bool) -> change_capsule::Result<()> {
+    let parent = parent_directory(path);
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| change_capsule::Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| change_capsule::Error::Io {
+                path: temporary.path().to_path_buf(),
+                source,
+            })?;
+    }
+    let _ = private;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| change_capsule::Error::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        if error.error.kind() == io::ErrorKind::AlreadyExists {
+            change_capsule::Error::InvalidInput(format!(
+                "refusing to overwrite key file: {}",
+                path.display()
+            ))
+        } else {
+            change_capsule::Error::Io {
+                path: path.to_path_buf(),
+                source: error.error,
+            }
+        }
+    })?;
+    sync_parent_directory(parent)
+}
+
+fn read_private_seed(path: &Path) -> change_capsule::Result<Zeroizing<[u8; 32]>> {
+    Ok(Zeroizing::new(read_exact_file::<32>(
+        path,
+        "Ed25519 private seed",
+    )?))
+}
+
+fn open_readonly_input(path: &Path) -> change_capsule::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        options.custom_flags(
+            i32::try_from(flags.bits())
+                .expect("O_NOFOLLOW | O_NONBLOCK fits platform custom_flags"),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+        .open(path)
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn read_exact_file<const N: usize>(
+    path: &Path,
+    description: &str,
+) -> change_capsule::Result<[u8; N]> {
+    let mut file = open_readonly_input(path)?;
+    validate_opened_exact_file(&file, path, description, N)?;
+    let mut bytes = [0_u8; N];
+    file.read_exact(&mut bytes)
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        != 0
+    {
+        return Err(invalid_exact_file(path, description, N));
+    }
+    validate_opened_exact_file(&file, path, description, N)?;
+    Ok(bytes)
+}
+
+fn validate_opened_exact_file(
+    file: &fs::File,
+    path: &Path,
+    description: &str,
+    size: usize,
+) -> change_capsule::Result<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata_is_reparse_point(&metadata) || !metadata.is_file() || metadata.len() != size as u64
+    {
+        return Err(invalid_exact_file(path, description, size));
+    }
+    Ok(())
+}
+
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn invalid_exact_file(path: &Path, description: &str, size: usize) -> change_capsule::Error {
+    change_capsule::Error::InvalidInput(format!(
+        "{description} must be a regular non-link file containing exactly {size} raw bytes: {}",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> change_capsule::Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> change_capsule::Result<()> {
+    Ok(())
+}
+
 fn read_json_file<T: serde::de::DeserializeOwned>(
     path: &Path,
     cap: u64,
 ) -> change_capsule::Result<T> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| change_capsule::Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > cap {
+    let mut file = open_readonly_input(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata_is_reparse_point(&metadata) || !metadata.is_file() || metadata.len() > cap {
         return Err(change_capsule::Error::InvalidInput(format!(
-            "JSON input must be a regular non-symlink file no larger than {cap} bytes: {}",
+            "JSON input must be a regular non-link file no larger than {cap} bytes: {}",
             path.display()
         )));
     }
-    let bytes = fs::read(path).map_err(|source| change_capsule::Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > cap {
+        return Err(change_capsule::Error::InvalidInput(format!(
+            "JSON input exceeds {cap} bytes: {}",
+            path.display()
+        )));
+    }
     serde_json::from_slice(&bytes).map_err(|source| {
         change_capsule::Error::InvalidInput(format!(
             "invalid JSON input at {}: {source}",
@@ -598,7 +941,7 @@ fn print_json<T: Serialize>(value: &T) -> change_capsule::Result<()> {
 }
 
 fn write_output_file(path: &Path, bytes: &[u8]) -> change_capsule::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     fs::create_dir_all(parent).map_err(|source| change_capsule::Error::Io {
         path: parent.to_path_buf(),
         source,
@@ -644,6 +987,8 @@ fn error_kind(error: &change_capsule::Error) -> &'static str {
         change_capsule::Error::InvalidId(_) | change_capsule::Error::InvalidInput(_) => {
             "invalid_input"
         }
+        change_capsule::Error::IdempotencyConflict => "idempotency_conflict",
+        change_capsule::Error::IdempotencyNotFound => "idempotency_not_found",
         change_capsule::Error::InvalidState { .. } => "invalid_state",
         change_capsule::Error::PolicyViolation(_) => "policy",
         change_capsule::Error::ArtifactNotFound(_) => "artifact_not_found",

@@ -65,7 +65,18 @@ jobs:
           repo: ${{ steps.receipt.outputs.repo }}
           require-successful-evidence: "true"
           verify-head: "true"
-          version: "0.1.0"
+          version: "0.1.2"
+      - name: Gate on the committed receipt with the current source binary
+        env:
+          SEALED_REPO: ${{ steps.receipt.outputs.repo }}
+        run: |
+          cargo build --all-features
+          CAPSULE_BIN="$PWD/target/debug/capsule" \
+            bash scripts/verify-gate.sh \
+              --bundle receipts/required \
+              --repo "$SEALED_REPO" \
+              --require-successful-evidence \
+              --verify-head
       - name: Confirm the gate bound the exact implementation tree
         env:
           SEALED_REPO: ${{ steps.receipt.outputs.repo }}
@@ -82,3 +93,12 @@ jobs:
           test "$VERIFIED_BASE" = "$RECEIPT_BASE"
           test "$RECEIPT_BASE" = "$EXPECTED_BASE"
           echo "gate verified $CAPSULE_ID"
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,8 +8,15 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::artifact::{ArtifactReader, ArtifactSink, PublishedArtifact};
+use crate::capabilities::{
+    IDEMPOTENCY_RECORD_SCHEMA_VERSION, LABEL_BYTES_LIMIT, LINK_KEY_BYTES_LIMIT,
+    LINK_VALUE_BYTES_LIMIT, LINKS_LIMIT,
+};
 use crate::error::{Error, Result, io};
 use crate::git::{CommitPatch, Git, Repository};
+use crate::idempotency::{
+    IdempotencyLookup, IdempotencyRecord, IdempotencyStatus, canonical_request_sha256, key_sha256,
+};
 use crate::model::{
     AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind,
     AuditEvent, AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth,
@@ -18,11 +25,11 @@ use crate::model::{
     ResultRef, SCHEMA_VERSION, StateInspection,
 };
 use crate::policy::{Policy, PolicyReport};
-use crate::state::{StateStore, default_state_root};
+use crate::state::{StateStore, default_state_root, project_key};
 
-const LABEL_CAP: usize = 256;
-const LINK_KEY_CAP: usize = 64;
-const LINK_VALUE_CAP: usize = 4096;
+const LABEL_CAP: usize = LABEL_BYTES_LIMIT;
+const LINK_KEY_CAP: usize = LINK_KEY_BYTES_LIMIT;
+const LINK_VALUE_CAP: usize = LINK_VALUE_BYTES_LIMIT;
 const MESSAGE_CAP: usize = 16 * 1024;
 const EVIDENCE_COMMAND_CAP: usize = 16 * 1024;
 const EVIDENCE_SUMMARY_CAP: usize = 64 * 1024;
@@ -103,6 +110,8 @@ pub struct EvidenceInput {
 pub struct CloseOptions {
     /// Refuse to seal unless evidence exists and every exit code is zero.
     pub require_successful_evidence: bool,
+    /// Refuse to seal unless successful evidence is bound to the patch being sealed.
+    pub require_current_successful_evidence: bool,
 }
 
 /// Inputs for applying a sealed result to a target worktree.
@@ -214,6 +223,18 @@ impl CapsuleManager {
     /// `backup.json` is written last as the completion marker.
     pub fn backup_state(&self, destination: impl AsRef<Path>) -> Result<BackupReport> {
         self.store.backup(destination.as_ref())
+    }
+
+    /// Explicitly migrate schema-v3 durable manifests/results to schema v4.
+    ///
+    /// Dry-run validates every candidate without mutation. Apply requires a new
+    /// external backup destination and writes the complete backup before state.
+    pub fn migrate_state_v3(
+        &self,
+        backup: Option<&Path>,
+        apply: bool,
+    ) -> Result<crate::model::MigrationReport> {
+        self.store.migrate_v3(backup, apply)
     }
 
     /// Retained lifecycle events for one capsule, oldest first.
@@ -370,12 +391,6 @@ impl CapsuleManager {
     pub fn create(&self, options: CreateOptions) -> Result<Capsule> {
         validate_create_options(&options)?;
         let repository = self.git.repository(&options.repository)?;
-        if self.git.sparse_checkout(&repository.worktree)? {
-            return Err(Error::InvalidInput(
-                "cannot create a capsule from a sparse-checkout worktree; disable sparse checkout first"
-                    .to_owned(),
-            ));
-        }
         let base_commit = self
             .git
             .resolve_commit(&repository.worktree, &options.base)?;
@@ -384,13 +399,210 @@ impl CapsuleManager {
         let _lock = self.store.lock_project(&project_key)?;
         let policy = self.store.read_policy()?;
         let capsules = self.store.list_capsules()?;
-        self.enforce_create_policy(&policy, &capsules, &repository)?;
-        let id = format!("cap-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let pending_reservations =
+            if policy.max_capsules.is_some() || policy.max_live_capsules.is_some() {
+                self.store.unmaterialized_idempotency_count()?
+            } else {
+                0
+            };
+        self.enforce_create_policy(&policy, &capsules, &repository, pending_reservations)?;
+        let id = new_capsule_id();
+        let capsule =
+            self.initial_capsule(id, options, &repository, project_key, base_commit, now()?)?;
+        self.materialize_new_capsule(capsule, false)
+    }
+
+    /// Create or replay one state-root-scoped logical capsule creation.
+    ///
+    /// The key is opaque local orchestration state, not a credential. A durable
+    /// reservation is published before any capsule identity or worktree side
+    /// effect, and remains bound to the same capsule for its lifetime.
+    pub fn create_idempotent(&self, options: CreateOptions, key: &str) -> Result<Capsule> {
+        validate_create_options(&options)?;
+        let key_digest = key_sha256(key)?;
+        let repository = self.git.repository(&options.repository)?;
+        let requested_project_key = project_key(&repository.common_dir)?;
+        let _global_lock = self.store.lock_global()?;
+        let _project_lock = self.store.lock_project(&requested_project_key)?;
+
+        if let Some(record) = self.store.read_idempotency_record(&key_digest)? {
+            self.validate_replayed_request(&options, &repository, &record)?;
+            return self.materialize_idempotency_record(&record);
+        }
+
+        let base_commit = self
+            .git
+            .resolve_commit(&repository.worktree, &options.base)?;
+        let policy = self.store.read_policy()?;
+        let (capsules, pending_reservations) =
+            if policy.max_capsules.is_some() || policy.max_live_capsules.is_some() {
+                (
+                    self.store.list_capsules()?,
+                    self.store.unmaterialized_idempotency_count()?,
+                )
+            } else {
+                (Vec::new(), 0)
+            };
+        self.enforce_create_policy(&policy, &capsules, &repository, pending_reservations)?;
+        let record = IdempotencyRecord {
+            schema_version: IDEMPOTENCY_RECORD_SCHEMA_VERSION,
+            idempotency_key_sha256: key_digest,
+            request_sha256: String::new(),
+            record_sha256: String::new(),
+            capsule_id: new_capsule_id(),
+            source_worktree: repository.worktree.clone(),
+            repository_common_dir: repository.common_dir.clone(),
+            project_key: requested_project_key,
+            base_selector: options.base,
+            base_commit,
+            label: options.label,
+            links: options.links,
+            reserved_at_unix: now()?,
+        }
+        .sealed()?;
+        // Never publish a reservation this build could not read back. The reader
+        // is deliberately strict, and a record that fails it would wedge the key
+        // forever, so prove the round trip before taking the first side effect.
+        record.validate(&record.idempotency_key_sha256)?;
+        self.store.write_idempotency_record_new(&record)?;
+        #[cfg(test)]
+        run_idempotent_create_test_hook(IdempotentCreateTestStage::AfterReservation)?;
+        self.materialize_idempotency_record(&record)
+    }
+
+    /// Directly resolve one state-root-scoped idempotency key without scans.
+    pub fn lookup_idempotency_key(&self, key: &str) -> Result<IdempotencyLookup> {
+        Self::lookup_idempotency_key_in_store(&self.store, key)
+    }
+
+    /// Open an existing state root and directly resolve one idempotency key.
+    ///
+    /// This lookup does not create state, acquire locks, enumerate capsules, or
+    /// discover/invoke Git.
+    pub fn lookup_idempotency_key_at(
+        state_root: impl AsRef<Path>,
+        key: &str,
+    ) -> Result<IdempotencyLookup> {
+        let store = StateStore::open_existing(state_root.as_ref())?;
+        Self::lookup_idempotency_key_in_store(&store, key)
+    }
+
+    fn lookup_idempotency_key_in_store(store: &StateStore, key: &str) -> Result<IdempotencyLookup> {
+        let key_digest = key_sha256(key)?;
+        let record = store
+            .read_idempotency_record(&key_digest)?
+            .ok_or(Error::IdempotencyNotFound)?;
+        let capsule = if store.capsule_manifest_exists(&record.capsule_id)? {
+            let capsule = store.read_capsule(&record.capsule_id)?;
+            validate_reservation_capsule(&record, &capsule)?;
+            Some(capsule)
+        } else {
+            store.validate_unmaterialized_capsule(&record.capsule_id)?;
+            None
+        };
+        Ok(IdempotencyLookup {
+            schema_version: IDEMPOTENCY_RECORD_SCHEMA_VERSION,
+            idempotency_key_sha256: key_digest,
+            capsule_id: record.capsule_id,
+            status: if capsule.is_some() {
+                IdempotencyStatus::Materialized
+            } else {
+                IdempotencyStatus::Reserved
+            },
+            capsule,
+        })
+    }
+
+    fn validate_replayed_request(
+        &self,
+        options: &CreateOptions,
+        repository: &Repository,
+        record: &IdempotencyRecord,
+    ) -> Result<()> {
+        if repository.worktree != record.source_worktree
+            || repository.common_dir != record.repository_common_dir
+            || project_key(&repository.common_dir)? != record.project_key
+        {
+            return Err(Error::IdempotencyConflict);
+        }
+        let base_commit = if options.base == record.base_selector {
+            record.base_commit.clone()
+        } else {
+            match self.git.resolve_commit(&repository.worktree, &options.base) {
+                Ok(commit) => commit,
+                Err(_) => return Err(Error::IdempotencyConflict),
+            }
+        };
+        if base_commit != record.base_commit {
+            return Err(Error::IdempotencyConflict);
+        }
+        let equivalent = canonical_request_sha256(
+            &repository.worktree,
+            &repository.common_dir,
+            &record.project_key,
+            &record.base_selector,
+            &base_commit,
+            options.label.as_deref(),
+            &options.links,
+        )?;
+        if equivalent != record.request_sha256 {
+            return Err(Error::IdempotencyConflict);
+        }
+        Ok(())
+    }
+
+    fn materialize_idempotency_record(&self, record: &IdempotencyRecord) -> Result<Capsule> {
+        if self.store.capsule_manifest_exists(&record.capsule_id)? {
+            let mut capsule = self.store.read_capsule(&record.capsule_id)?;
+            validate_reservation_capsule(record, &capsule)?;
+            if capsule.state == CapsuleState::Creating {
+                self.complete_creating(&mut capsule, true)?;
+            }
+            return Ok(capsule);
+        }
+        self.store
+            .validate_unmaterialized_capsule(&record.capsule_id)?;
+        let options = CreateOptions {
+            repository: record.source_worktree.clone(),
+            base: record.base_selector.clone(),
+            label: record.label.clone(),
+            links: record.links.clone(),
+        };
+        // Resolve the source repository as it exists now and require it to still
+        // be the one the reservation was made against. Adopting the reserved
+        // identity against a replaced repository would bind a capsule to a base
+        // commit that never came from it.
+        let repository = self.git.repository(&record.source_worktree)?;
+        if repository.worktree != record.source_worktree
+            || repository.common_dir != record.repository_common_dir
+        {
+            return Err(Error::UnsafeState(
+                "reserved source repository identity changed before creation".to_owned(),
+            ));
+        }
+        let capsule = self.initial_capsule(
+            record.capsule_id.clone(),
+            options,
+            &repository,
+            record.project_key.clone(),
+            record.base_commit.clone(),
+            record.reserved_at_unix,
+        )?;
+        self.materialize_new_capsule(capsule, true)
+    }
+
+    fn initial_capsule(
+        &self,
+        id: String,
+        options: CreateOptions,
+        repository: &Repository,
+        project_key: String,
+        base_commit: String,
+        created_at: u64,
+    ) -> Result<Capsule> {
         let branch = format!("capsule/{}", &id[4..]);
         let workspace_path = self.store.workspace_path(&project_key, &id)?;
-        self.store.prepare_capsule(&id, &project_key)?;
-        let created_at = now()?;
-        let mut capsule = Capsule {
+        Ok(Capsule {
             schema_version: SCHEMA_VERSION,
             id,
             label: options.label,
@@ -415,28 +627,147 @@ impl CapsuleManager {
             cleanup: None,
             closed_at_unix: None,
             dropped_at_unix: None,
-        };
+        })
+    }
+
+    /// Publish the manifest and finish the Git side of a `creating` capsule.
+    ///
+    /// `reserved` marks an identity bound to an idempotency reservation. Such an
+    /// identity can never be replaced, so an unprovable Git state orphans that
+    /// same capsule. A plain create owns a brand-new identity nothing refers to
+    /// yet, so it keeps its original contract and fails instead.
+    fn materialize_new_capsule(&self, mut capsule: Capsule, reserved: bool) -> Result<Capsule> {
+        if reserved {
+            self.store
+                .prepare_reserved_capsule(&capsule.id, &capsule.project_key)?;
+        } else {
+            self.store
+                .prepare_capsule(&capsule.id, &capsule.project_key)?;
+        }
         self.store.write_capsule(&capsule)?;
+        #[cfg(test)]
+        if reserved {
+            run_idempotent_create_test_hook(IdempotentCreateTestStage::AfterManifest)?;
+        }
+        self.complete_creating(&mut capsule, reserved)?;
+        Ok(capsule)
+    }
+
+    /// Drive a `creating` capsule to `active`, or refuse to guess.
+    ///
+    /// With `allow_orphan`, an unprovable Git state marks this same capsule
+    /// orphaned and succeeds, because the caller's identity is already durably
+    /// bound and must never be silently replaced. Without it, the same condition
+    /// is an error.
+    fn complete_creating(&self, capsule: &mut Capsule, allow_orphan: bool) -> Result<String> {
+        let Ok(source) = self.git.repository(&capsule.source_worktree) else {
+            return self.abandon_creation(
+                capsule,
+                "reserved source repository is no longer available",
+                allow_orphan,
+            );
+        };
+        if source.common_dir != capsule.repository_common_dir {
+            return self.abandon_creation(
+                capsule,
+                "reserved source repository identity no longer agrees",
+                allow_orphan,
+            );
+        }
+        if path_entry_exists_no_follow(&capsule.workspace_path)? {
+            if capsule.workspace_git_dir.is_none() {
+                capsule.workspace_git_dir = self
+                    .git
+                    .repository(&capsule.workspace_path)
+                    .ok()
+                    .map(|repository| repository.git_dir);
+            }
+            if self.validate_owned_worktree(capsule).is_ok() {
+                let head = self.git.head(&capsule.workspace_path)?;
+                let branch_head = self.git.branch_head(&source.worktree, &capsule.branch)?;
+                if head != capsule.base_commit
+                    || branch_head.as_deref() != Some(capsule.base_commit.as_str())
+                    || (!self.git.clean(&capsule.workspace_path)?
+                        && !is_unchecked_worktree_shape(&capsule.workspace_path)?)
+                {
+                    return self.abandon_creation(
+                        capsule,
+                        "existing worktree does not exactly match the reserved base",
+                        allow_orphan,
+                    );
+                }
+                self.git
+                    .finish_worktree_creation(&capsule.workspace_path, &capsule.base_commit)?;
+                return self.activate_created_capsule(capsule);
+            }
+            return self.abandon_creation(capsule, "workspace path is contradictory", allow_orphan);
+        }
+        let branch_head = self.git.branch_head(&source.worktree, &capsule.branch)?;
+        let records = self.git.registered_worktrees(&source.worktree)?;
+        if branch_head.is_some()
+            || records.iter().any(|record| {
+                record.branch.as_deref() == Some(capsule.branch.as_str())
+                    || same_path_existing_or_clean(&record.path, &capsule.workspace_path)
+            })
+        {
+            return self.abandon_creation(
+                capsule,
+                "partial Git creation state is contradictory",
+                allow_orphan,
+            );
+        }
         self.git.add_worktree(
-            &repository.worktree,
+            &source.worktree,
             &capsule.workspace_path,
             &capsule.branch,
             &capsule.base_commit,
         )?;
         capsule.workspace_git_dir = Some(self.git.repository(&capsule.workspace_path)?.git_dir);
-        self.validate_owned_worktree(&capsule)?;
+        self.validate_owned_worktree(capsule)?;
+        self.activate_created_capsule(capsule)
+    }
+
+    fn activate_created_capsule(&self, capsule: &mut Capsule) -> Result<String> {
         capsule.state = CapsuleState::Active;
         capsule.updated_at_unix = now()?;
         let base_commit = capsule.base_commit.clone();
         append_event(
-            &mut capsule,
+            capsule,
             AuditEventKind::Created,
             Some(CapsuleState::Creating),
             CapsuleState::Active,
             BTreeMap::from([("base_commit".to_owned(), base_commit)]),
         )?;
-        self.store.write_capsule(&capsule)?;
-        Ok(capsule)
+        self.store.write_capsule(capsule)?;
+        Ok("completed an interrupted workspace creation".to_owned())
+    }
+
+    fn abandon_creation(
+        &self,
+        capsule: &mut Capsule,
+        reason: &str,
+        allow_orphan: bool,
+    ) -> Result<String> {
+        if !allow_orphan {
+            return Err(Error::UnsafeState(format!(
+                "cannot create capsule {}: {reason}",
+                capsule.id
+            )));
+        }
+        let previous = capsule.state;
+        capsule.state = CapsuleState::Orphaned;
+        capsule.updated_at_unix = now()?;
+        append_event(
+            capsule,
+            AuditEventKind::Recovered,
+            Some(previous),
+            CapsuleState::Orphaned,
+            BTreeMap::from([("reason".to_owned(), reason.to_owned())]),
+        )?;
+        self.store.write_capsule(capsule)?;
+        Ok(format!(
+            "marked an incomplete creation orphaned: {reason}; explicit inspection is required"
+        ))
     }
 
     /// Summarize every durable capsule record, ordered by identifier.
@@ -641,6 +972,7 @@ impl CapsuleManager {
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
         self.enforce_capsule_policy(&capsule)?;
+        self.validate_owned_worktree(&capsule)?;
         if capsule.evidence.len() >= EVIDENCE_COUNT_CAP {
             return Err(Error::InvalidInput(format!(
                 "a capsule retains at most {EVIDENCE_COUNT_CAP} evidence records"
@@ -657,10 +989,12 @@ impl CapsuleManager {
                 "total evidence payload would exceed the {EVIDENCE_TOTAL_BYTES_CAP}-byte capsule bound"
             )));
         }
+        let snapshot = self.snapshot(&capsule)?;
         let evidence = Evidence {
             command: input.command,
             exit_code: input.exit_code,
             summary: input.summary,
+            patch_sha256: Some(sha256_hex(&snapshot.patch)),
             recorded_at_unix: now()?,
         };
         // The byte caps above count raw input; JSON escaping can still inflate
@@ -710,10 +1044,28 @@ impl CapsuleManager {
                     .to_owned(),
             ));
         }
-        let snapshot = self.snapshot(&capsule)?;
-        let ignored_paths = self.git.ignored_paths(&capsule.workspace_path)?;
-        let (ignored_bytes, ignored_content_sha256) =
-            ignored_content_inventory(&capsule.workspace_path, &ignored_paths)?;
+        let CloseSnapshotTransaction {
+            clean,
+            snapshot,
+            head,
+            ignored:
+                IgnoredContentInventory {
+                    paths: ignored_paths,
+                    bytes: ignored_bytes,
+                    content_sha256: ignored_content_sha256,
+                },
+        } = self.close_snapshot_transaction(&capsule)?;
+        let digest = sha256_hex(&snapshot.patch);
+        if options.require_current_successful_evidence
+            && !capsule.evidence.iter().any(|item| {
+                item.exit_code == 0 && item.patch_sha256.as_deref() == Some(digest.as_str())
+            })
+        {
+            return Err(Error::InvalidInput(
+                "current successful evidence is required, but no successful caller claim is bound to the exact final patch being sealed"
+                    .to_owned(),
+            ));
+        }
         Self::enforce_result_policy(
             &policy,
             snapshot.patch.len() as u64,
@@ -721,8 +1073,6 @@ impl CapsuleManager {
             ignored_paths.len(),
             ignored_bytes,
         )?;
-        let head = self.git.head(&capsule.workspace_path)?;
-        let clean = self.git.clean(&capsule.workspace_path)?;
         let kind = if snapshot.patch.is_empty() {
             ResultKind::NoChange
         } else if clean {
@@ -731,7 +1081,6 @@ impl CapsuleManager {
             ResultKind::Patch
         };
         let sealed_at = now()?;
-        let digest = sha256_hex(&snapshot.patch);
         let result = CapsuleResult {
             schema_version: SCHEMA_VERSION,
             capsule_id: capsule.id.clone(),
@@ -1057,39 +1406,59 @@ impl CapsuleManager {
         let mut actions = Vec::new();
         for listed in capsules {
             let _project_lock = self.store.lock_project(&listed.project_key)?;
-            let mut capsule = self.store.read_capsule(&listed.id)?;
-            let previous = capsule.state;
-            let action = match capsule.state {
-                CapsuleState::Creating => Some(self.recover_creating(&mut capsule)?),
-                CapsuleState::Checkpointing => self.recover_checkpointing(&mut capsule)?,
-                CapsuleState::Active => self.recover_active(&mut capsule)?,
-                CapsuleState::Integrating => self.recover_integrating(&mut capsule)?,
-                CapsuleState::Dropping => Some(self.finish_cleanup(&mut capsule)?),
-                CapsuleState::Closed
-                | CapsuleState::Integrated
-                | CapsuleState::Orphaned
-                | CapsuleState::Dropped => None,
-            };
-            if let Some(action) = action {
-                capsule.updated_at_unix = now()?;
-                let recovered_state = capsule.state;
-                append_event(
-                    &mut capsule,
-                    AuditEventKind::Recovered,
-                    Some(previous),
-                    recovered_state,
-                    BTreeMap::from([("action".to_owned(), action.clone())]),
-                )?;
-                self.store.write_capsule(&capsule)?;
-                actions.push(RecoveryAction {
-                    capsule_id: capsule.id.clone(),
-                    previous_state: previous,
-                    state: capsule.state,
-                    action,
-                });
+            if let Some(action) = self.recover_capsule_locked(&listed.id)? {
+                actions.push(action);
             }
         }
         Ok(actions)
+    }
+
+    /// Reconcile one known capsule without scanning unrelated state records.
+    ///
+    /// Uses the same global-then-project lock order and transition logic as
+    /// [`Self::recover`], and rereads the capsule after both locks are held.
+    pub fn recover_capsule(&self, id: &str) -> Result<Option<RecoveryAction>> {
+        crate::state::validate_id(id)?;
+        let _global_lock = self.store.lock_global()?;
+        let listed = self.store.read_capsule(id)?;
+        let _project_lock = self.store.lock_project(&listed.project_key)?;
+        self.recover_capsule_locked(id)
+    }
+
+    fn recover_capsule_locked(&self, id: &str) -> Result<Option<RecoveryAction>> {
+        let mut capsule = self.store.read_capsule(id)?;
+        let previous = capsule.state;
+        let action = match capsule.state {
+            CapsuleState::Creating => Some(self.recover_creating(&mut capsule)?),
+            CapsuleState::Checkpointing => self.recover_checkpointing(&mut capsule)?,
+            CapsuleState::Active => self.recover_active(&mut capsule)?,
+            CapsuleState::Integrating => self.recover_integrating(&mut capsule)?,
+            CapsuleState::Dropping => Some(self.finish_cleanup(&mut capsule)?),
+            CapsuleState::Closed
+            | CapsuleState::Integrated
+            | CapsuleState::Orphaned
+            | CapsuleState::Dropped => None,
+        };
+        if let Some(action) = action {
+            capsule.updated_at_unix = now()?;
+            let recovered_state = capsule.state;
+            append_event(
+                &mut capsule,
+                AuditEventKind::Recovered,
+                Some(previous),
+                recovered_state,
+                BTreeMap::from([("action".to_owned(), action.clone())]),
+            )?;
+            self.store.write_capsule(&capsule)?;
+            Ok(Some(RecoveryAction {
+                capsule_id: capsule.id.clone(),
+                previous_state: previous,
+                state: capsule.state,
+                action,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn policy_violations(&self, policy: &Policy, capsules: &[Capsule]) -> Result<Vec<String>> {
@@ -1344,6 +1713,7 @@ impl CapsuleManager {
         policy: &Policy,
         capsules: &[Capsule],
         repository: &Repository,
+        unmaterialized_reservations: u64,
     ) -> Result<()> {
         policy.validate()?;
         if !repository_allowed(policy, &repository.worktree) {
@@ -1352,19 +1722,17 @@ impl CapsuleManager {
                 repository.worktree.display()
             )));
         }
-        enforce_next_limit(
-            "capsule records",
-            capsules.len() as u64,
-            policy.max_capsules,
-        )?;
-        enforce_next_limit(
-            "live capsules",
-            capsules
-                .iter()
-                .filter(|capsule| capsule.state != CapsuleState::Dropped)
-                .count() as u64,
-            policy.max_live_capsules,
-        )?;
+        let capsule_records = (capsules.len() as u64)
+            .checked_add(unmaterialized_reservations)
+            .ok_or_else(|| Error::PolicyViolation("capsule record count overflowed".to_owned()))?;
+        enforce_next_limit("capsule records", capsule_records, policy.max_capsules)?;
+        let live_capsules = (capsules
+            .iter()
+            .filter(|capsule| capsule.state != CapsuleState::Dropped)
+            .count() as u64)
+            .checked_add(unmaterialized_reservations)
+            .ok_or_else(|| Error::PolicyViolation("live capsule count overflowed".to_owned()))?;
+        enforce_next_limit("live capsules", live_capsules, policy.max_live_capsules)?;
         if policy.max_state_bytes.is_some() {
             enforce_limit(
                 "state bytes",
@@ -1771,16 +2139,48 @@ impl CapsuleManager {
         Ok((matches, result, result_bytes, stored_patch))
     }
 
+    fn close_snapshot_transaction(&self, capsule: &Capsule) -> Result<CloseSnapshotTransaction> {
+        let initial_ignored = ignored_content_inventory(
+            &capsule.workspace_path,
+            self.git.ignored_paths(&capsule.workspace_path)?,
+        )?;
+        #[cfg(test)]
+        run_close_ignored_inventory_test_hook(&capsule.id);
+        let initial_snapshot = self.snapshot(capsule)?;
+        let initial_head = self.git.head(&capsule.workspace_path)?;
+        let initial_clean = self.git.clean(&capsule.workspace_path)?;
+        let snapshot = self.snapshot(capsule)?;
+        let head = self.git.head(&capsule.workspace_path)?;
+        let clean = self.git.clean(&capsule.workspace_path)?;
+        let ignored = ignored_content_inventory(
+            &capsule.workspace_path,
+            self.git.ignored_paths(&capsule.workspace_path)?,
+        )?;
+        require_stable_close_snapshot(
+            &initial_snapshot,
+            &initial_head,
+            initial_clean,
+            &snapshot,
+            &head,
+            clean,
+        )?;
+        require_stable_ignored_content(&initial_ignored, &ignored)?;
+        Ok(CloseSnapshotTransaction {
+            clean,
+            snapshot,
+            head,
+            ignored,
+        })
+    }
+
     fn snapshot(&self, capsule: &Capsule) -> Result<crate::git::Snapshot> {
         self.snapshot_against(capsule, &capsule.base_commit)
     }
 
     fn snapshot_against(&self, capsule: &Capsule, base: &str) -> Result<crate::git::Snapshot> {
-        if self.git.sparse_checkout(&capsule.workspace_path)?
-            || self.git.hidden_index_entries(&capsule.workspace_path)?
-        {
+        if self.git.sparse_checkout(&capsule.workspace_path)? {
             return Err(Error::InvalidInput(
-                "sparse-checkout, skip-worktree, or assume-unchanged index entries cannot produce a complete capsule snapshot; restore a full checkout first"
+                "a capsule workspace with sparse checkout enabled cannot produce a complete snapshot; disable sparse checkout first"
                     .to_owned(),
             ));
         }
@@ -1916,26 +2316,9 @@ impl CapsuleManager {
     }
 
     fn recover_creating(&self, capsule: &mut Capsule) -> Result<String> {
-        if capsule.workspace_path.exists() {
-            if capsule.workspace_git_dir.is_none() {
-                capsule.workspace_git_dir = self
-                    .git
-                    .repository(&capsule.workspace_path)
-                    .ok()
-                    .map(|repository| repository.git_dir);
-            }
-            if self.validate_owned_worktree(capsule).is_ok() {
-                self.git
-                    .reset_hard(&capsule.workspace_path, &capsule.base_commit)?;
-                capsule.state = CapsuleState::Active;
-                return Ok("completed an interrupted workspace creation".to_owned());
-            }
-        }
-        capsule.state = CapsuleState::Orphaned;
-        Ok(
-            "marked an incomplete creation orphaned for explicit inspection or forced cleanup"
-                .to_owned(),
-        )
+        // Recovery reconciles an identity that already exists on disk, so an
+        // unprovable Git state must orphan it rather than fail the whole sweep.
+        self.complete_creating(capsule, true)
     }
 
     fn recover_checkpointing(&self, capsule: &mut Capsule) -> Result<Option<String>> {
@@ -2360,8 +2743,12 @@ fn check_capsule_limit(
     }
 }
 
-fn safe_ignored_relative(ignored: &str) -> Result<&Path> {
-    let relative = Path::new(ignored.trim_end_matches('/'));
+fn safe_ignored_relative(ignored: &crate::model::GitPath) -> Result<PathBuf> {
+    let relative = ignored.to_path_buf().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "ignored path cannot be represented here: {ignored}"
+        ))
+    })?;
     if relative.components().any(|component| {
         matches!(
             component,
@@ -2369,29 +2756,52 @@ fn safe_ignored_relative(ignored: &str) -> Result<&Path> {
         )
     }) {
         return Err(Error::UnsafeState(format!(
-            "Git returned an unsafe ignored path: {ignored:?}"
+            "Git returned an unsafe ignored path: {ignored}"
         )));
     }
     Ok(relative)
 }
 
-fn ignored_content_inventory(workspace: &Path, ignored_paths: &[String]) -> Result<(u64, String)> {
-    let mut digest = Sha256::new();
-    let mut total = 0_u64;
-    let mut seen = BTreeSet::new();
-    for ignored in ignored_paths {
-        let relative = safe_ignored_relative(ignored)?;
-        inventory_path(workspace, relative, &mut seen, &mut total, &mut digest)?;
-    }
-    Ok((total, hex::encode(digest.finalize())))
+#[derive(Debug)]
+struct CloseSnapshotTransaction {
+    clean: bool,
+    snapshot: crate::git::Snapshot,
+    head: String,
+    ignored: IgnoredContentInventory,
 }
 
-fn ignored_usage(workspace: &Path, ignored_paths: &[String]) -> Result<u64> {
+#[derive(Debug, PartialEq, Eq)]
+struct IgnoredContentInventory {
+    paths: Vec<crate::model::GitPath>,
+    bytes: u64,
+    content_sha256: String,
+}
+
+fn ignored_content_inventory(
+    workspace: &Path,
+    ignored_paths: Vec<crate::model::GitPath>,
+) -> Result<IgnoredContentInventory> {
+    let mut digest = Sha256::new();
+    digest.update(b"change-capsule ignored-content inventory v2\0");
+    let mut total = 0_u64;
+    let mut seen = BTreeSet::new();
+    for ignored in &ignored_paths {
+        let relative = safe_ignored_relative(ignored)?;
+        inventory_path(workspace, &relative, &mut seen, &mut total, &mut digest)?;
+    }
+    Ok(IgnoredContentInventory {
+        paths: ignored_paths,
+        bytes: total,
+        content_sha256: hex::encode(digest.finalize()),
+    })
+}
+
+fn ignored_usage(workspace: &Path, ignored_paths: &[crate::model::GitPath]) -> Result<u64> {
     let mut total = 0_u64;
     let mut seen = BTreeSet::new();
     for ignored in ignored_paths {
         let relative = safe_ignored_relative(ignored)?;
-        usage_path(workspace, relative, &mut seen, &mut total)?;
+        usage_path(workspace, &relative, &mut seen, &mut total)?;
     }
     Ok(total)
 }
@@ -2436,30 +2846,20 @@ fn inventory_path(
     }
     let path = workspace.join(relative);
     let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
-    let relative_bytes = relative
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(relative.to_path_buf()))?
-        .as_bytes();
-    digest.update((relative_bytes.len() as u64).to_be_bytes());
-    digest.update(relative_bytes);
+    update_native_path(digest, b"relative", relative)?;
     if metadata.file_type().is_symlink() {
         digest.update(b"link");
         let target = fs::read_link(&path).map_err(|error| io(&path, error))?;
-        let target = target
-            .to_str()
-            .ok_or_else(|| Error::NonUtf8Path(target.clone()))?
-            .as_bytes();
-        digest.update((target.len() as u64).to_be_bytes());
-        digest.update(target);
+        update_native_path(digest, b"target", &target)?;
         *total = total
             .checked_add(metadata.len())
             .ok_or_else(|| Error::UnsafeState("ignored byte count overflowed".to_owned()))?;
         return Ok(());
     }
     if metadata.is_file() {
-        let mut file = File::open(&path).map_err(|error| io(&path, error))?;
+        let mut file = open_ignored_inventory_file(&path)?;
         let opened = file.metadata().map_err(|error| io(&path, error))?;
-        if !opened.is_file() || opened.len() != metadata.len() {
+        if !opened_regular_file(&opened) || opened.len() != metadata.len() {
             return Err(Error::UnsafeState(format!(
                 "ignored file changed while it was inspected: {}",
                 path.display()
@@ -2515,8 +2915,83 @@ fn inventory_path(
                 digest,
             )?;
         }
+        return Ok(());
     }
-    Ok(())
+    Err(Error::UnsafeState(format!(
+        "ignored path has an unsupported special-file type: {}",
+        path.display()
+    )))
+}
+
+fn opened_regular_file(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.is_file()
+            && metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_file()
+    }
+}
+
+fn open_ignored_inventory_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        options.custom_flags(
+            i32::try_from(flags.bits())
+                .expect("O_NOFOLLOW | O_NONBLOCK fits platform custom_flags"),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|error| io(path, error))
+}
+
+#[cfg_attr(any(unix, windows), allow(clippy::unnecessary_wraps))]
+fn update_native_path(digest: &mut Sha256, field: &[u8], path: &Path) -> Result<()> {
+    digest.update((field.len() as u64).to_be_bytes());
+    digest.update(field);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        digest.update(b"unix-bytes");
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        digest.update(b"windows-utf16le");
+        digest.update((units.len() as u64).to_be_bytes());
+        for unit in units {
+            digest.update(unit.to_le_bytes());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let value = path
+            .to_str()
+            .ok_or_else(|| Error::NonUtf8Path(path.to_path_buf()))?;
+        digest.update(b"portable-utf8");
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+        Ok(())
+    }
 }
 
 fn artifact_error(id: &str, error: Error) -> Error {
@@ -2554,14 +3029,96 @@ fn integration_ref(capsule: &Capsule) -> String {
     format!("refs/change-capsule/{}/integration", capsule.id)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdempotentCreateTestStage {
+    AfterReservation,
+    AfterManifest,
+}
+
+#[cfg(test)]
+static IDEMPOTENT_CREATE_TEST_HOOK: std::sync::Mutex<Option<IdempotentCreateTestStage>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_idempotent_create_test_hook(stage: IdempotentCreateTestStage) -> Result<()> {
+    let mut hook = IDEMPOTENT_CREATE_TEST_HOOK
+        .lock()
+        .expect("idempotent-create test hook lock");
+    if hook.as_ref() == Some(&stage) {
+        *hook = None;
+        return Err(Error::UnsafeState(
+            "injected idempotent creation interruption".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_unchecked_worktree_shape(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(path).map_err(|error| io(path, error))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|error| io(path, error))?
+    else {
+        return Ok(false);
+    };
+    if entry.file_name() != std::ffi::OsStr::new(".git")
+        || entries
+            .next()
+            .transpose()
+            .map_err(|error| io(path, error))?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let git_metadata =
+        fs::symlink_metadata(entry.path()).map_err(|error| io(entry.path(), error))?;
+    Ok(!git_metadata.file_type().is_symlink() && git_metadata.is_file())
+}
+
+fn new_capsule_id() -> String {
+    format!("cap-{}", Ulid::new().to_string().to_ascii_lowercase())
+}
+
+fn path_entry_exists_no_follow(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io(path, error)),
+    }
+}
+
+fn validate_reservation_capsule(record: &IdempotencyRecord, capsule: &Capsule) -> Result<()> {
+    if capsule.id != record.capsule_id
+        || capsule.source_worktree != record.source_worktree
+        || capsule.repository_common_dir != record.repository_common_dir
+        || capsule.project_key != record.project_key
+        || capsule.base_commit != record.base_commit
+        || capsule.label != record.label
+        || capsule.links != record.links
+        || capsule.created_at_unix != record.reserved_at_unix
+    {
+        return Err(Error::UnsafeState(format!(
+            "idempotency reservation does not agree with capsule {}",
+            record.capsule_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_create_options(options: &CreateOptions) -> Result<()> {
     if let Some(label) = &options.label {
         validate_bounded_text(label, LABEL_CAP, "label", false)?;
     }
-    if options.links.len() > 32 {
-        return Err(Error::InvalidInput(
-            "at most 32 links are allowed".to_owned(),
-        ));
+    if options.links.len() > LINKS_LIMIT {
+        return Err(Error::InvalidInput(format!(
+            "at most {LINKS_LIMIT} links are allowed"
+        )));
     }
     for (key, value) in &options.links {
         let valid_key = !key.is_empty()
@@ -2641,12 +3198,62 @@ fn now() -> Result<u64> {
         .map_err(|_| Error::InvalidInput("system clock is before the Unix epoch".to_owned()))
 }
 
-fn project_key(common_dir: &Path) -> Result<String> {
-    let path = common_dir
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(common_dir.to_path_buf()))?;
-    let digest = Sha256::digest(path.as_bytes());
-    Ok(hex::encode(&digest[..12]))
+fn require_stable_ignored_content(
+    initial: &IgnoredContentInventory,
+    final_inventory: &IgnoredContentInventory,
+) -> Result<()> {
+    if initial != final_inventory {
+        return Err(Error::UnsafeState(
+            "capsule ignored paths or content changed while close was finalizing; no artifacts were written"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CloseIgnoredInventoryTestHook {
+    capsule_id: String,
+    initial_inventory_captured: std::sync::Arc<std::sync::Barrier>,
+    mutation_finished: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static CLOSE_IGNORED_INVENTORY_TEST_HOOK: std::sync::Mutex<Option<CloseIgnoredInventoryTestHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_close_ignored_inventory_test_hook(capsule_id: &str) {
+    let hook = CLOSE_IGNORED_INVENTORY_TEST_HOOK
+        .lock()
+        .expect("close ignored-inventory test hook lock")
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.capsule_id == capsule_id) {
+        hook.initial_inventory_captured.wait();
+        hook.mutation_finished.wait();
+    }
+}
+
+fn require_stable_close_snapshot(
+    initial: &crate::git::Snapshot,
+    initial_head: &str,
+    initial_clean: bool,
+    final_snapshot: &crate::git::Snapshot,
+    final_head: &str,
+    final_clean: bool,
+) -> Result<()> {
+    if initial.patch != final_snapshot.patch
+        || initial.changed_paths != final_snapshot.changed_paths
+        || initial_head != final_head
+        || initial_clean != final_clean
+    {
+        return Err(Error::UnsafeState(
+            "capsule tracked content, HEAD, or clean state changed while close was finalizing; no artifacts were written"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn result_sha256(result: &CapsuleResult) -> Result<String> {
@@ -2680,5 +3287,286 @@ fn clean_absolute(path: &Path) -> Option<PathBuf> {
         Some(path.to_path_buf())
     } else {
         std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Barrier};
+
+    use super::{
+        CLOSE_IGNORED_INVENTORY_TEST_HOOK, CapsuleManager, CloseIgnoredInventoryTestHook,
+        CloseOptions, CreateOptions, IDEMPOTENT_CREATE_TEST_HOOK, IdempotentCreateTestStage,
+        require_stable_close_snapshot,
+    };
+    use crate::error::Error;
+    use crate::git::Snapshot;
+    use crate::idempotency::{IdempotencyStatus, key_sha256};
+    use crate::model::{CapsuleState, GitPath};
+
+    fn snapshot(patch: &[u8], paths: &[&str]) -> Snapshot {
+        Snapshot {
+            patch: patch.to_vec(),
+            changed_paths: paths
+                .iter()
+                .map(|path| GitPath::Utf8((*path).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(directory)
+            .args(arguments)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    static IDEMPOTENT_CREATE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn setup_repository() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repository = temporary.path().join("repository");
+        let state = temporary.path().join("state");
+        fs::create_dir(&repository).expect("create repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "core.autocrlf", "false"]);
+        fs::write(repository.join("tracked.txt"), b"base\n").expect("write tracked file");
+        git(&repository, &["add", "."]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        (temporary, repository, state)
+    }
+
+    fn idempotent_options(repository: &Path) -> CreateOptions {
+        CreateOptions {
+            repository: repository.to_path_buf(),
+            base: "HEAD".to_owned(),
+            label: Some("idempotent crash recovery".to_owned()),
+            links: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn idempotent_retry_resumes_reservation_only_and_manifest_only_windows() {
+        let _serial = IDEMPOTENT_CREATE_TEST_SERIAL
+            .lock()
+            .expect("idempotent test serial lock");
+        for stage in [
+            IdempotentCreateTestStage::AfterReservation,
+            IdempotentCreateTestStage::AfterManifest,
+        ] {
+            let (_temporary, repository, state) = setup_repository();
+            let manager = CapsuleManager::open(&state).expect("manager");
+            *IDEMPOTENT_CREATE_TEST_HOOK
+                .lock()
+                .expect("install idempotency hook") = Some(stage);
+            assert!(matches!(
+                manager.create_idempotent(idempotent_options(&repository), "crash:window"),
+                Err(Error::UnsafeState(message)) if message.contains("injected")
+            ));
+            let before = manager
+                .lookup_idempotency_key("crash:window")
+                .expect("lookup interrupted reservation");
+            let reserved_id = before.capsule_id.clone();
+            match stage {
+                IdempotentCreateTestStage::AfterReservation => {
+                    assert_eq!(before.status, IdempotencyStatus::Reserved);
+                    assert!(before.capsule.is_none());
+                }
+                IdempotentCreateTestStage::AfterManifest => {
+                    assert_eq!(before.status, IdempotencyStatus::Materialized);
+                    assert_eq!(
+                        before.capsule.expect("creating capsule").state,
+                        CapsuleState::Creating
+                    );
+                }
+            }
+            let resumed = manager
+                .create_idempotent(idempotent_options(&repository), "crash:window")
+                .expect("resume exact reservation");
+            assert_eq!(resumed.id, reserved_id);
+            assert_eq!(resumed.state, CapsuleState::Active);
+            assert_eq!(manager.list().expect("one capsule").len(), 1);
+        }
+    }
+
+    #[test]
+    fn contradictory_git_state_orphans_reserved_identity_without_replacement() {
+        let _serial = IDEMPOTENT_CREATE_TEST_SERIAL
+            .lock()
+            .expect("idempotent test serial lock");
+        let (_temporary, repository, state) = setup_repository();
+        let manager = CapsuleManager::open(&state).expect("manager");
+        *IDEMPOTENT_CREATE_TEST_HOOK
+            .lock()
+            .expect("install idempotency hook") = Some(IdempotentCreateTestStage::AfterReservation);
+        assert!(
+            manager
+                .create_idempotent(idempotent_options(&repository), "partial:git")
+                .is_err()
+        );
+        let digest = key_sha256("partial:git").expect("key digest");
+        let record = manager
+            .store
+            .read_idempotency_record(&digest)
+            .expect("read reservation")
+            .expect("reservation");
+        manager
+            .git
+            .create_ref(
+                &repository,
+                &format!("refs/heads/capsule/{}", &record.capsule_id[4..]),
+                &record.base_commit,
+            )
+            .expect("inject reserved branch only");
+        let replay = manager
+            .create_idempotent(idempotent_options(&repository), "partial:git")
+            .expect("same identity becomes orphaned");
+        assert_eq!(replay.id, record.capsule_id);
+        assert_eq!(replay.state, CapsuleState::Orphaned);
+        assert_eq!(manager.list().expect("one capsule").len(), 1);
+        // Orphaning is a successful lifecycle transition, so it must leave a
+        // record of why; otherwise the capsule is inexplicably stuck.
+        let event = replay
+            .audit_events
+            .last()
+            .expect("orphaning records an audit event");
+        assert_eq!(event.state, Some(CapsuleState::Orphaned));
+        assert_eq!(event.previous_state, Some(CapsuleState::Creating));
+        assert!(
+            event.attributes["reason"].contains("contradictory"),
+            "{:?}",
+            event.attributes
+        );
+        let again = manager
+            .create_idempotent(idempotent_options(&repository), "partial:git")
+            .expect("orphan replay");
+        assert_eq!(again.id, replay.id);
+        assert_eq!(again.state, CapsuleState::Orphaned);
+        // A replay of an orphan must not append a second orphaning event.
+        assert_eq!(again.audit_events.len(), replay.audit_events.len());
+    }
+
+    #[test]
+    fn close_rejects_ignored_content_mutated_between_inventories() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repository = temporary.path().join("repository");
+        let state = temporary.path().join("state");
+        fs::create_dir(&repository).expect("create repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "core.autocrlf", "false"]);
+        fs::write(repository.join("tracked.txt"), b"base\n").expect("write tracked file");
+        git(&repository, &["add", "."]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let manager = CapsuleManager::open(&state).expect("open manager");
+        let capsule = manager
+            .create(CreateOptions {
+                repository,
+                base: "HEAD".to_owned(),
+                label: Some("ignored close race".to_owned()),
+                links: BTreeMap::new(),
+            })
+            .expect("create capsule");
+        fs::write(capsule.workspace_path.join(".gitignore"), b"ignored.log\n")
+            .expect("write ignore rule");
+        let ignored = capsule.workspace_path.join("ignored.log");
+        fs::write(&ignored, b"initial ignored content\n").expect("write ignored content");
+
+        let initial_inventory_captured = Arc::new(Barrier::new(2));
+        let mutation_finished = Arc::new(Barrier::new(2));
+        *CLOSE_IGNORED_INVENTORY_TEST_HOOK
+            .lock()
+            .expect("install close test hook") = Some(CloseIgnoredInventoryTestHook {
+            capsule_id: capsule.id.clone(),
+            initial_inventory_captured: Arc::clone(&initial_inventory_captured),
+            mutation_finished: Arc::clone(&mutation_finished),
+        });
+        let mutation = std::thread::spawn(move || {
+            initial_inventory_captured.wait();
+            fs::write(ignored, b"mutated ignored content\n").expect("mutate ignored content");
+            mutation_finished.wait();
+        });
+
+        let close = manager.close(&capsule.id, CloseOptions::default());
+        mutation.join().expect("ignored-content mutation thread");
+        *CLOSE_IGNORED_INVENTORY_TEST_HOOK
+            .lock()
+            .expect("clear close test hook") = None;
+
+        assert!(matches!(
+            close,
+            Err(Error::UnsafeState(message))
+                if message.contains("ignored paths or content changed")
+                    && message.contains("no artifacts were written")
+        ));
+        assert_eq!(
+            manager.show(&capsule.id).expect("active capsule").state,
+            crate::model::CapsuleState::Active
+        );
+        let capsule_state = state.join("capsules").join(&capsule.id);
+        assert!(!capsule_state.join("result.patch").exists());
+        assert!(!capsule_state.join("result.json").exists());
+    }
+
+    #[test]
+    fn close_stability_requires_exact_patch_paths_and_head() {
+        let original = snapshot(b"patch", &["a"]);
+        assert!(
+            require_stable_close_snapshot(&original, "head", true, &original, "head", true).is_ok()
+        );
+        for final_snapshot in [snapshot(b"other", &["a"]), snapshot(b"patch", &["b"])] {
+            assert!(matches!(
+                require_stable_close_snapshot(
+                    &original,
+                    "head",
+                    true,
+                    &final_snapshot,
+                    "head",
+                    true,
+                ),
+                Err(Error::UnsafeState(message)) if message.contains("no artifacts were written")
+            ));
+        }
+        assert!(matches!(
+            require_stable_close_snapshot(&original, "head", true, &original, "other", true),
+            Err(Error::UnsafeState(_))
+        ));
+        assert!(matches!(
+            require_stable_close_snapshot(&original, "head", true, &original, "head", false),
+            Err(Error::UnsafeState(_))
+        ));
     }
 }

@@ -29,6 +29,23 @@
 //! patch applies to the pinned base and reproduces exactly the sealed bytes and
 //! changed paths.
 //!
+//! # Orchestration protocol
+//!
+//! [`Capabilities::current`] is a static compatibility contract: an independent
+//! capability schema version, protocol versions, stable versioned feature
+//! identifiers, supported schemas, and byte limits. It touches no state and no
+//! Git, so a coordinator can probe an unknown installation safely. It negotiates
+//! protocol features only, never trust in the binary or its host.
+//!
+//! [`CapsuleManager::create_idempotent`] binds a caller-supplied opaque key to
+//! one capsule identity within one canonical state root, publishing a durable
+//! reservation before any capsule, branch, worktree, or manifest side effect, so
+//! a retry after a timeout or crash resumes that same identity instead of
+//! creating a second attempt. [`CapsuleManager::lookup_idempotency_key`] and
+//! [`CapsuleManager::lookup_idempotency_key_at`] resolve one key directly,
+//! without enumerating state. Keys are local orchestration metadata, not
+//! credentials, and never appear in a portable receipt.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -62,17 +79,26 @@
 //! Library-only embedders can disable default features.
 
 pub mod artifact;
+pub mod capabilities;
 pub mod error;
 mod git;
+pub mod idempotency;
 mod manager;
 pub mod model;
 mod path;
 pub mod policy;
+pub mod signature;
 mod state;
 pub mod verify;
 
 pub use artifact::{ArtifactReader, ArtifactSink, PublishedArtifact};
+pub use capabilities::{
+    CAPABILITY_SCHEMA_VERSION, Capabilities, CapabilityLimits, CapabilitySchemas,
+    IDEMPOTENCY_KEY_BYTES_LIMIT, IDEMPOTENCY_RECORD_SCHEMA_VERSION, LABEL_BYTES_LIMIT,
+    LINK_KEY_BYTES_LIMIT, LINK_VALUE_BYTES_LIMIT, LINKS_LIMIT, PROTOCOL_VERSION,
+};
 pub use error::{Error, Result};
+pub use idempotency::{IdempotencyLookup, IdempotencyRecordInspection, IdempotencyStatus};
 pub use manager::{
     Author, CapsuleManager, CheckpointOptions, CloseOptions, CreateOptions, EvidenceInput,
     IntegrateOptions,
@@ -81,9 +107,14 @@ pub use model::{
     AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind, AuditEvent,
     AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth, CapsuleResult,
     CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint, CheckpointJournal, Cleanup, Evidence,
-    ExportReport, Integration, MetricsSnapshot, RecoveryAction, ResultKind, ResultRef,
-    SCHEMA_VERSION, StateInspection, StateRecordInspection, VerificationReport,
+    ExportReport, GitPath, Integration, LEGACY_SCHEMA_VERSION, MetricsSnapshot, MigrationReport,
+    RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, StateInspection, StateRecordInspection,
+    VerificationReport,
 };
 pub use policy::{HARD_PATCH_BYTES, POLICY_SCHEMA_VERSION, Policy, PolicyReport};
+pub use signature::{
+    GeneratedKeypair, bundle_signature_commitment, derive_public_key, generate_keypair,
+    sign_bundle, sign_bundle_bytes, verify_bundle_signature, verify_bundle_signature_bytes,
+};
 pub use state::default_state_root;
-pub use verify::{VerifyOptions, verify_bundle};
+pub use verify::{VerifyOptions, verify_authenticated_bundle, verify_bundle};
