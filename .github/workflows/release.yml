@@ -78,6 +78,14 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      # `cargo publish` unpacks the crate under target/package/. The cache
+      # action's post-step then walks it looking for test directories, does not
+      # find them, and logs ##[error] annotations on an otherwise green run.
+      # Removing the scratch keeps the cache useful and the run honestly green.
+      - name: Drop packaging scratch before the cache post-step
+        if: always()
+        run: rm -rf target/package
+
   finalize:
     needs: publish
     if: github.ref_type == 'tag'
