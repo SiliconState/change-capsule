@@ -1,17 +1,21 @@
 {
   "schema_version": 3,
-  "capsule_id": "cap-01kzgn0xhvc05hxpjjt1ryvad9",
-  "label": "windows json path assertion",
+  "capsule_id": "cap-01kzgrhswv3mdqa42b0vdy3e16",
+  "label": "documentation navigation pass",
   "links": {
-    "task": "platform-gating"
+    "task": "docs-organization"
   },
   "kind": "patch",
-  "base_commit": "d6f98489e5ed714f3e525051fac2b1c02c583f49",
-  "head_commit": "d6f98489e5ed714f3e525051fac2b1c02c583f49",
-  "patch_sha256": "d89f686d5f8b9b812abe65d86c84167b6df9b755b71c27791b69480836b4cfd8",
-  "patch_bytes": 1137,
+  "base_commit": "fb39c27ce224a930f3f149f56a7cd96b94bd8a14",
+  "head_commit": "fb39c27ce224a930f3f149f56a7cd96b94bd8a14",
+  "patch_sha256": "2704dbfccb1ce44f16f9e963ae1cf69b4be1166807eeb9e238ee4c686cf605a5",
+  "patch_bytes": 61757,
   "changed_paths": [
-    "tests/capsule.rs"
+    "README.md",
+    "docs/architecture.md",
+    "docs/composition.md",
+    "docs/protocol.md",
+    "docs/security.md"
   ],
   "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "evidence": [
@@ -19,21 +23,21 @@
       "command": "cargo fmt --all -- --check",
       "exit_code": 0,
       "summary": "formatting clean",
-      "recorded_at_unix": 1786191611
+      "recorded_at_unix": 1786195302
     },
     {
       "command": "cargo clippy --all-targets --all-features --locked -- -D warnings",
       "exit_code": 0,
-      "summary": "no warnings on linux, windows-msvc, and apple-darwin targets",
-      "recorded_at_unix": 1786191611
+      "summary": "no warnings",
+      "recorded_at_unix": 1786195302
     },
     {
       "command": "cargo test --all-features --locked",
       "exit_code": 0,
       "summary": "7 unit, 65 integration, 12 orchestration, 3 doctests passed",
-      "recorded_at_unix": 1786191611
+      "recorded_at_unix": 1786195302
     }
   ],
-  "created_at_unix": 1786191574,
-  "sealed_at_unix": 1786191611
+  "created_at_unix": 1786195273,
+  "sealed_at_unix": 1786195302
 }
