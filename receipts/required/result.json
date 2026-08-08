@@ -1,21 +1,65 @@
 {
   "schema_version": 3,
-  "capsule_id": "cap-01kzgrhswv3mdqa42b0vdy3e16",
-  "label": "documentation navigation pass",
+  "capsule_id": "cap-01kzgzrfrptxengwhj6vvywk01",
+  "label": "attestation, hardening, and audit fixes",
   "links": {
-    "task": "docs-organization"
+    "task": "audit-findings"
   },
   "kind": "patch",
-  "base_commit": "fb39c27ce224a930f3f149f56a7cd96b94bd8a14",
-  "head_commit": "fb39c27ce224a930f3f149f56a7cd96b94bd8a14",
-  "patch_sha256": "2704dbfccb1ce44f16f9e963ae1cf69b4be1166807eeb9e238ee4c686cf605a5",
-  "patch_bytes": 61757,
+  "base_commit": "40f884dac29bafb18f0e80aee73a890c1a0fbda4",
+  "head_commit": "40f884dac29bafb18f0e80aee73a890c1a0fbda4",
+  "patch_sha256": "9bef68bbb61e19774cbe1ba6c1c8f80d4677f8278516d32352aece7edf054899",
+  "patch_bytes": 457379,
   "changed_paths": [
+    ".github/ISSUE_TEMPLATE/bug_report.md",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/dependabot.yml",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "Cargo.lock",
+    "Cargo.toml",
     "README.md",
+    "SECURITY.md",
+    "benches/receipts.rs",
     "docs/architecture.md",
-    "docs/composition.md",
+    "docs/interop.md",
     "docs/protocol.md",
-    "docs/security.md"
+    "docs/releasing.md",
+    "docs/security.md",
+    "fuzz/Cargo.lock",
+    "fuzz/Cargo.toml",
+    "fuzz/fuzz_targets/git_path_roundtrip.rs",
+    "fuzz/fuzz_targets/receipt_decode.rs",
+    "fuzz/fuzz_targets/receipt_verify.rs",
+    "scripts/check-release-pins.sh",
+    "src/artifact.rs",
+    "src/attestation.rs",
+    "src/capabilities.rs",
+    "src/error.rs",
+    "src/idempotency.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/manager.rs",
+    "src/manager/admin.rs",
+    "src/manager/artifacts.rs",
+    "src/manager/create.rs",
+    "src/manager/lifecycle.rs",
+    "src/manager/mod.rs",
+    "src/manager/query.rs",
+    "src/manager/recover.rs",
+    "src/manager/tests.rs",
+    "src/model.rs",
+    "src/policy.rs",
+    "src/signature.rs",
+    "src/state.rs",
+    "src/verify.rs",
+    "tests/attestation.rs",
+    "tests/capsule.rs",
+    "tests/orchestration.rs"
   ],
   "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "evidence": [
@@ -23,21 +67,27 @@
       "command": "cargo fmt --all -- --check",
       "exit_code": 0,
       "summary": "formatting clean",
-      "recorded_at_unix": 1786195302
+      "recorded_at_unix": 1786202888
     },
     {
       "command": "cargo clippy --all-targets --all-features --locked -- -D warnings",
       "exit_code": 0,
-      "summary": "no warnings",
-      "recorded_at_unix": 1786195302
+      "summary": "no warnings on linux, windows-msvc, and apple-darwin targets",
+      "recorded_at_unix": 1786202888
     },
     {
       "command": "cargo test --all-features --locked",
       "exit_code": 0,
-      "summary": "7 unit, 65 integration, 12 orchestration, 3 doctests passed",
-      "recorded_at_unix": 1786195302
+      "summary": "13 unit, 65 integration, 13 orchestration, 7 attestation, 3 doctests passed",
+      "recorded_at_unix": 1786202888
+    },
+    {
+      "command": "cargo +1.85 check --all-features --all-targets --locked",
+      "exit_code": 0,
+      "summary": "declared MSRV verified",
+      "recorded_at_unix": 1786202888
     }
   ],
-  "created_at_unix": 1786195273,
-  "sealed_at_unix": 1786195302
+  "created_at_unix": 1786202832,
+  "sealed_at_unix": 1786202888
 }
