@@ -4,7 +4,6 @@
 //! `bundle.json` bytes. The bundle descriptors in turn bind `result.json` and
 //! `result.patch`. Public keys are supplied out of band by the verifier.
 
-use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -140,12 +139,15 @@ pub fn verify_bundle_signature(
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)
+    std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io(path, error))
 }
 
+/// Windows offers no portable directory-sync equivalent, so publication relies
+/// on the file sync plus the atomic rename already performed by the caller.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }

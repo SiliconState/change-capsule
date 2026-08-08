@@ -874,7 +874,10 @@ fn sync_parent_directory(path: &Path) -> change_capsule::Result<()> {
         })
 }
 
+/// Windows offers no portable directory-sync equivalent, so publication relies
+/// on the file sync plus the atomic rename already performed by the caller.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_parent_directory(_path: &Path) -> change_capsule::Result<()> {
     Ok(())
 }

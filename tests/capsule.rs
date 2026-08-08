@@ -2840,7 +2840,9 @@ fn key_inputs_reject_symlinks() {
     assert!(!output.status.success());
 }
 
-#[cfg(unix)]
+// macOS enforces UTF-8 filenames (EILSEQ), so the fixture itself cannot be
+// created there. The encoding under test stays platform-independent.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_ignored_names_and_symlink_targets_hash_losslessly() {
     use std::os::unix::ffi::OsStringExt;
@@ -2886,7 +2888,9 @@ fn git_path_raw_encoding_is_strictly_canonical() {
     }
 }
 
-#[cfg(unix)]
+// macOS enforces UTF-8 filenames (EILSEQ), so the fixture itself cannot be
+// created there. The encoding under test stays platform-independent.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_git_inventory_paths_round_trip_losslessly() {
     use std::os::unix::ffi::OsStringExt;
