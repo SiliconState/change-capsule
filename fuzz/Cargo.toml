@@ -1,0 +1,42 @@
+[package]
+name = "change-capsule-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root: fuzzing pulls in nightly-only machinery that the
+# published crate must never depend on.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+
+[dependencies.change-capsule]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "receipt_decode"
+path = "fuzz_targets/receipt_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receipt_verify"
+path = "fuzz_targets/receipt_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_path_roundtrip"
+path = "fuzz_targets/git_path_roundtrip.rs"
+test = false
+doc = false
+bench = false

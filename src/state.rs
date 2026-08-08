@@ -15,6 +15,7 @@ use crate::idempotency::{IDEMPOTENCY_RECORD_CAP, IdempotencyRecord, IdempotencyR
 use crate::model::{
     AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, BackupReport, Capsule, CapsuleResult, CapsuleState,
     LEGACY_SCHEMA_VERSION, MigrationReport, SCHEMA_VERSION, StateInspection, StateRecordInspection,
+    UnreadableRecord,
 };
 use crate::policy::{HARD_PATCH_BYTES, Policy};
 
@@ -343,6 +344,51 @@ impl StateStore {
         }
         capsules.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(capsules)
+    }
+
+    /// Enumerate capsules, reporting unreadable records instead of failing.
+    ///
+    /// Deliberately separate from [`Self::list_capsules`], which must stay
+    /// fail-closed because policy counts are derived from it. Undercounting
+    /// there would let a corrupt record raise an effective quota.
+    pub(crate) fn list_capsules_lenient(&self) -> Result<(Vec<Capsule>, Vec<UnreadableRecord>)> {
+        let directory = self.capsules_dir();
+        let mut capsules = Vec::new();
+        let mut unreadable = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {
+            let entry = entry.map_err(|error| io(&directory, error))?;
+            let file_type = entry.file_type().map_err(|error| io(entry.path(), error))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_id(&id).is_err() {
+                continue;
+            }
+            match path_entry_exists(&entry.path().join("capsule.json")) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    unreadable.push(UnreadableRecord {
+                        id,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            }
+            match self.read_capsule(&id) {
+                Ok(capsule) => capsules.push(capsule),
+                Err(error) => unreadable.push(UnreadableRecord {
+                    id,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        capsules.sort_by(|left, right| left.id.cmp(&right.id));
+        unreadable.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok((capsules, unreadable))
     }
 
     pub(crate) fn write_result(&self, id: &str, result: &CapsuleResult) -> Result<()> {

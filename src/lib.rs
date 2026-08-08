@@ -27,7 +27,9 @@
 //! produced a change and the process that reviews it never need to share a
 //! machine. Given a repository, verification additionally proves the sealed
 //! patch applies to the pinned base and reproduces exactly the sealed bytes and
-//! changed paths.
+//! changed paths. [`attest_bundle`] projects a verified receipt into a standard
+//! in-toto Statement for SLSA/Sigstore tooling; its `proof_boundary` states
+//! machine-readably what the receipt does and does not establish.
 //!
 //! # Orchestration protocol
 //!
@@ -79,6 +81,7 @@
 //! Library-only embedders can disable default features.
 
 pub mod artifact;
+pub mod attestation;
 pub mod capabilities;
 pub mod error;
 mod git;
@@ -92,6 +95,10 @@ mod state;
 pub mod verify;
 
 pub use artifact::{ArtifactReader, ArtifactSink, PublishedArtifact};
+pub use attestation::{
+    CHANGE_PREDICATE_TYPE, ChangePredicate, ClaimedEvidence, IN_TOTO_STATEMENT_TYPE, ProofBoundary,
+    ResourceDescriptor, Statement, attest_bundle, change_statement,
+};
 pub use capabilities::{
     CAPABILITY_SCHEMA_VERSION, Capabilities, CapabilityLimits, CapabilitySchemas,
     IDEMPOTENCY_KEY_BYTES_LIMIT, IDEMPOTENCY_RECORD_SCHEMA_VERSION, LABEL_BYTES_LIMIT,
@@ -105,11 +112,11 @@ pub use manager::{
 };
 pub use model::{
     AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind, AuditEvent,
-    AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth, CapsuleResult,
-    CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint, CheckpointJournal, Cleanup, Evidence,
-    ExportReport, GitPath, Integration, LEGACY_SCHEMA_VERSION, MetricsSnapshot, MigrationReport,
-    RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, StateInspection, StateRecordInspection,
-    VerificationReport,
+    AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth, CapsuleListing,
+    CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint, CheckpointJournal,
+    Cleanup, Evidence, ExportReport, GitPath, Integration, LEGACY_SCHEMA_VERSION, MetricsSnapshot,
+    MigrationReport, RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, StateInspection,
+    StateRecordInspection, UnreadableRecord, VerificationReport,
 };
 pub use policy::{HARD_PATCH_BYTES, POLICY_SCHEMA_VERSION, Policy, PolicyReport};
 pub use signature::{

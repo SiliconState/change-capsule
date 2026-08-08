@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/SiliconState/change-capsule"
 homepage = "https://github.com/SiliconState/change-capsule"
 documentation = "https://docs.rs/change-capsule"
-exclude = ["receipts/"]
+exclude = ["receipts/", "fuzz/", "benches/"]
 keywords = ["agents", "git", "worktree", "automation", "provenance"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -39,6 +39,14 @@ tempfile = "3"
 thiserror = "2"
 ulid = "1"
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "receipts"
+harness = false
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

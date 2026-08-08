@@ -42,6 +42,7 @@ pub const AUDIT_EVENT_CAP: usize = 128;
 /// those transitions it can prove are safe to finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CapsuleState {
     /// The workspace is being created and is not yet usable.
     Creating,
@@ -65,6 +66,7 @@ pub enum CapsuleState {
 
 /// A commit created inside the capsule during the attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Checkpoint {
     /// Git object ID of the checkpoint commit.
     pub commit: String,
@@ -83,6 +85,7 @@ pub struct Checkpoint {
 /// Capsule never runs verification itself. Evidence is provenance about
 /// what the caller says it ran, not a cryptographic attestation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Evidence {
     /// Exact command the caller reports having run.
     pub command: String,
@@ -105,6 +108,7 @@ pub struct Evidence {
 /// Every field is cross-checked against the stored `result.json` and
 /// `result.patch` before those artifacts are trusted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ResultRef {
     /// Shape of the sealed result.
     pub kind: ResultKind,
@@ -128,6 +132,7 @@ pub struct ResultRef {
 /// distinction records how the attempt left its workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResultKind {
     /// The workspace matched the base exactly; the patch is empty.
     NoChange,
@@ -139,6 +144,7 @@ pub enum ResultKind {
 
 /// Journal describing an explicit integration of a sealed result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Integration {
     /// Worktree the result is applied to.
     pub target_worktree: PathBuf,
@@ -169,6 +175,7 @@ pub struct Integration {
 /// Recovery finishes the transition only when the prepared commit's parent,
 /// patch digest, and protecting ref all agree with this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CheckpointJournal {
     /// Workspace `HEAD` before the checkpoint.
     pub head_before: String,
@@ -188,6 +195,7 @@ pub struct CheckpointJournal {
 
 /// Journal written before destructive cleanup begins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Cleanup {
     /// Capsule branch tip observed when cleanup started, if the branch existed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,6 +212,7 @@ pub struct Cleanup {
 /// revalidated on every read, so a manifest whose branch, workspace path, or
 /// repository identity has been edited is rejected rather than acted on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Capsule {
     /// Schema version of this record; always [`SCHEMA_VERSION`] when written.
     pub schema_version: u32,
@@ -274,6 +283,7 @@ pub struct Capsule {
 /// against `HEAD`, so it captures committed, staged, unstaged, deleted, and
 /// non-ignored untracked content as one complete change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapsuleResult {
     /// Schema version of this record; always [`SCHEMA_VERSION`] when written.
     pub schema_version: u32,
@@ -332,6 +342,7 @@ const fn is_zero(value: &u64) -> bool {
 /// Observed condition of a capsule's workspace relative to its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CapsuleHealth {
     /// The workspace is present, owned, and consistent with its record.
     Healthy,
@@ -351,6 +362,7 @@ pub enum CapsuleHealth {
 
 /// A point-in-time inspection of one capsule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapsuleStatus {
     /// The durable record as stored.
     pub capsule: Capsule,
@@ -378,6 +390,7 @@ pub struct CapsuleStatus {
 
 /// Compact listing entry for a capsule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapsuleSummary {
     /// Capsule identifier.
     pub id: String,
@@ -409,6 +422,7 @@ impl From<&Capsule> for CapsuleSummary {
 
 /// One interrupted transition that recovery was able to resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RecoveryAction {
     /// Capsule that was reconciled.
     pub capsule_id: String,
@@ -427,6 +441,7 @@ pub struct RecoveryAction {
 /// and round-trippable without unsafe code.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum GitPath {
     /// Ordinary UTF-8 Git path.
     Utf8(String),
@@ -535,6 +550,7 @@ impl std::fmt::Display for GitPath {
 /// Which sealed artifact a descriptor refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ArtifactKind {
     /// The sealed result manifest, `result.json`.
     ResultManifest,
@@ -544,6 +560,7 @@ pub enum ArtifactKind {
 
 /// Location, size, and content address of one sealed artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArtifactDescriptor {
     /// Which artifact this describes.
     pub kind: ArtifactKind,
@@ -571,6 +588,7 @@ pub struct ArtifactDescriptor {
 /// Serialized as `bundle.json`, which is written last during an export and so
 /// doubles as the completion marker for that directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArtifactBundle {
     /// Schema version of this bundle; always [`BUNDLE_SCHEMA_VERSION`] when written.
     pub schema_version: u32,
@@ -582,6 +600,7 @@ pub struct ArtifactBundle {
 
 /// Outcome of exporting a sealed result to a new directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExportReport {
     /// Bundle as written, with URIs pointing at the exported copies.
     pub bundle: ArtifactBundle,
@@ -595,6 +614,7 @@ pub struct ExportReport {
 /// Lifecycle transition an [`AuditEvent`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuditEventKind {
     /// A capsule and its workspace were created.
     Created,
@@ -624,6 +644,7 @@ pub enum AuditEventKind {
 /// bounded, but they are neither signed nor append-only against someone who can
 /// rewrite the state directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AuditEvent {
     /// Schema version of this event; always [`AUDIT_SCHEMA_VERSION`] when written.
     pub schema_version: u32,
@@ -654,6 +675,7 @@ pub struct AuditEvent {
 
 /// Summary of one stored record, readable even when its schema is unsupported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StateRecordInspection {
     /// Directory name of the record.
     pub id: String,
@@ -670,8 +692,34 @@ pub struct StateRecordInspection {
     pub error: Option<String>,
 }
 
+/// One capsule record that could not be read as a valid manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct UnreadableRecord {
+    /// Directory name the record occupies, which is its capsule ID.
+    pub id: String,
+    /// Why the record could not be read.
+    pub error: String,
+}
+
+/// A capsule listing that survives individually unreadable records.
+///
+/// [`crate::CapsuleManager::list`] stays fail-closed because policy counts
+/// depend on it. This shape is for operators who need to see the rest of a
+/// large state root when one record is corrupt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CapsuleListing {
+    /// Records that read and validated, ordered by identifier.
+    pub capsules: Vec<CapsuleSummary>,
+    /// Records that did not, ordered by identifier. Empty on a healthy root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<UnreadableRecord>,
+}
+
 /// Inventory of a state directory, independent of schema compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StateInspection {
     /// Root directory that was inspected.
     pub state_root: PathBuf,
@@ -692,6 +740,7 @@ pub struct StateInspection {
 ///
 /// Computed on demand. There is no collector, exporter, or background job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MetricsSnapshot {
     /// When the snapshot was taken.
     pub observed_at_unix: u64,
@@ -717,6 +766,7 @@ pub struct MetricsSnapshot {
 
 /// Outcome of copying durable state to a new directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BackupReport {
     /// State root that was copied.
     pub source: PathBuf,
@@ -730,6 +780,7 @@ pub struct BackupReport {
 
 /// Outcome of an explicit durable-state migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MigrationReport {
     /// State root inspected or migrated.
     pub state_root: PathBuf,
@@ -755,6 +806,7 @@ pub struct MigrationReport {
 /// requested check passed; failures are reported as
 /// [`Error::Verification`](crate::Error::Verification) instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VerificationReport {
     /// Directory that was verified.
     pub bundle_directory: PathBuf,

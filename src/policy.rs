@@ -27,6 +27,7 @@ pub const HARD_PATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// Use filesystem or OS quotas when continuous hard enforcement is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Policy {
     /// Schema version; must equal [`POLICY_SCHEMA_VERSION`].
     pub schema_version: u32,
@@ -119,6 +120,7 @@ impl Policy {
 /// Evaluation is observational and never mutates state. Usage that cannot be
 /// inspected is reported as a violation rather than assumed compliant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PolicyReport {
     /// Whether every evaluated limit was satisfied.
     pub compliant: bool,

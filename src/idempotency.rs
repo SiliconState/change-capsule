@@ -22,6 +22,7 @@ const RECORD_DOMAIN: &[u8] = b"change-capsule idempotency reservation v1\0";
 /// Whether an idempotency reservation has a durable capsule manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IdempotencyStatus {
     /// The capsule identity is reserved but no manifest has been published.
     Reserved,
@@ -31,6 +32,7 @@ pub enum IdempotencyStatus {
 
 /// Direct lookup result for one state-root-scoped idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IdempotencyLookup {
     /// Independent lookup/record schema version.
     pub schema_version: u32,
@@ -46,6 +48,7 @@ pub struct IdempotencyLookup {
 
 /// Administrative inspection of one indexed idempotency entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IdempotencyRecordInspection {
     /// Indexed filename, never a raw idempotency key.
     pub filename: String,
@@ -286,4 +289,133 @@ fn valid_capsule_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use proptest::prelude::*;
+
+    use super::canonical_request_sha256;
+
+    /// Build a request digest from the parts that define request equivalence.
+    fn digest(
+        worktree: &str,
+        common_dir: &str,
+        project_key: &str,
+        selector: &str,
+        commit: &str,
+        label: Option<&str>,
+        links: &BTreeMap<String, String>,
+    ) -> String {
+        canonical_request_sha256(
+            &PathBuf::from(worktree),
+            &PathBuf::from(common_dir),
+            project_key,
+            selector,
+            commit,
+            label,
+            links,
+        )
+        .expect("digest")
+    }
+
+    /// The framing exists to stop adjacent fields from being reinterpreted.
+    ///
+    /// Without explicit length prefixes, `("ab", "c")` and `("a", "bc")` would
+    /// hash the same bytes, letting two materially different creation requests
+    /// share one reservation.
+    #[test]
+    fn adjacent_fields_cannot_be_confused_by_concatenation() {
+        let links = BTreeMap::new();
+        let left = digest("/w", "/c", "k", "ab", "c", None, &links);
+        let right = digest("/w", "/c", "k", "a", "bc", None, &links);
+        assert_ne!(left, right, "length framing must separate adjacent fields");
+
+        // The same hazard across the label boundary, which is optional.
+        let with_label = digest("/w", "/c", "k", "x", "y", Some("ab"), &links);
+        let shifted = digest("/w", "/c", "k", "x", "yab", None, &links);
+        assert_ne!(with_label, shifted);
+    }
+
+    /// An absent label must not collide with a present but empty one.
+    #[test]
+    fn absent_label_differs_from_empty_label() {
+        let links = BTreeMap::new();
+        assert_ne!(
+            digest("/w", "/c", "k", "s", "c", None, &links),
+            digest("/w", "/c", "k", "s", "c", Some(""), &links)
+        );
+    }
+
+    /// Link ordering is structural, not insertion-dependent.
+    #[test]
+    fn link_order_does_not_change_the_digest() {
+        let forward = BTreeMap::from([
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "2".to_owned()),
+        ]);
+        let mut reverse = BTreeMap::new();
+        reverse.insert("b".to_owned(), "2".to_owned());
+        reverse.insert("a".to_owned(), "1".to_owned());
+        assert_eq!(
+            digest("/w", "/c", "k", "s", "c", None, &forward),
+            digest("/w", "/c", "k", "s", "c", None, &reverse)
+        );
+    }
+
+    proptest! {
+        /// Equal inputs always produce equal digests.
+        #[test]
+        fn digest_is_deterministic(
+            worktree in "/[a-z/]{1,24}",
+            selector in "[a-zA-Z0-9^~/-]{1,24}",
+            label in proptest::option::of("[a-zA-Z0-9 ]{0,32}"),
+        ) {
+            let links = BTreeMap::new();
+            let first = digest(&worktree, "/c", "k", &selector, "commit", label.as_deref(), &links);
+            let second = digest(&worktree, "/c", "k", &selector, "commit", label.as_deref(), &links);
+            prop_assert_eq!(first, second);
+        }
+
+        /// Any change to any covered field changes the digest.
+        ///
+        /// This is the property the whole reservation model rests on: two
+        /// materially different requests must never share a digest.
+        #[test]
+        fn distinct_requests_have_distinct_digests(
+            left_selector in "[a-z]{1,12}",
+            right_selector in "[a-z]{1,12}",
+            left_label in proptest::option::of("[a-z]{0,12}"),
+            right_label in proptest::option::of("[a-z]{0,12}"),
+            left_link in "[a-z]{1,8}",
+            right_link in "[a-z]{1,8}",
+        ) {
+            let left_links = BTreeMap::from([("k".to_owned(), left_link.clone())]);
+            let right_links = BTreeMap::from([("k".to_owned(), right_link.clone())]);
+            let differ = left_selector != right_selector
+                || left_label != right_label
+                || left_link != right_link;
+            let left = digest("/w", "/c", "k", &left_selector, "c", left_label.as_deref(), &left_links);
+            let right = digest("/w", "/c", "k", &right_selector, "c", right_label.as_deref(), &right_links);
+            if differ {
+                prop_assert_ne!(left, right);
+            } else {
+                prop_assert_eq!(left, right);
+            }
+        }
+
+        /// Path bytes are framed too, so a longer path cannot absorb the next field.
+        #[test]
+        fn path_boundaries_are_framed(suffix in "[a-z]{1,10}") {
+            let links = BTreeMap::new();
+            let joined = format!("/w{suffix}");
+            prop_assert_ne!(
+                digest(&joined, "/c", "k", "s", "c", None, &links),
+                digest("/w", &format!("{suffix}/c"), "k", "s", "c", None, &links)
+            );
+        }
+    }
 }

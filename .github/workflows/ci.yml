@@ -27,6 +27,56 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  # Cargo.toml declares rust-version; nothing else in CI would notice a
+  # dependency or language feature that silently raises it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$version" || { echo "rust-version missing from Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features --all-targets --locked
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --locked --summary-only
+
+  # Fuzz targets are compiled, not run, so the build cannot rot unnoticed.
+  # Actual fuzzing is a deliberate, long-running local or scheduled activity.
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Not available through taiki-e/install-action; install from source.
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build --dev
+
+  # The published-action pin and the committed receipt schema must move
+  # together at release; drift between them turns main red.
+  release-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-release-pins.sh
+
   demo:
     runs-on: ubuntu-latest
     steps:

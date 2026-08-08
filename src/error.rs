@@ -8,6 +8,7 @@ use std::path::PathBuf;
 /// parsing messages. The `capsule` binary maps each variant to a stable `kind`
 /// string in its JSON error output.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The given path is not inside a Git repository.
     #[error("not a Git repository: {0}")]

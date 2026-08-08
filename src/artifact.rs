@@ -13,6 +13,7 @@ use crate::{ArtifactDescriptor, Result};
 
 /// A bounded reader over one validated artifact snapshot.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ArtifactReader {
     inner: Cursor<Vec<u8>>,
 }
@@ -46,6 +47,7 @@ pub trait ArtifactSink {
 
 /// An artifact that a sink accepted, paired with the URI it was given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PublishedArtifact {
     /// Descriptor of the bytes that were published.
     pub descriptor: ArtifactDescriptor,

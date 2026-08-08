@@ -113,31 +113,19 @@ fn parallel_capsules_isolate_changes_and_integrate_one_explicit_result() {
     let checkpoint = manager
         .checkpoint(
             &first.id,
-            CheckpointOptions {
-                message: "first implementation".to_owned(),
-                author: test_author(),
-            },
+            CheckpointOptions::new("first implementation".to_owned(), test_author()),
         )
         .expect("checkpoint first");
     assert_eq!(checkpoint.commit.len(), 40);
     manager
         .add_evidence(
             &first.id,
-            EvidenceInput {
-                command: "cargo test".to_owned(),
-                exit_code: 0,
-                summary: Some("all tests passed".to_owned()),
-            },
+            EvidenceInput::new("cargo test".to_owned(), 0)
+                .with_summary("all tests passed".to_owned()),
         )
         .expect("first evidence");
     let first_result = manager
-        .close(
-            &first.id,
-            CloseOptions {
-                require_successful_evidence: true,
-                require_current_successful_evidence: false,
-            },
-        )
+        .close(&first.id, CloseOptions::new(true, false))
         .expect("close first");
     let second_result = manager
         .close(&second.id, CloseOptions::default())
@@ -163,11 +151,8 @@ fn parallel_capsules_isolate_changes_and_integrate_one_explicit_result() {
     let integrated = reopened
         .integrate(
             &first.id,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: Some("select first approach".to_owned()),
-                author: test_author(),
-            },
+            &IntegrateOptions::new(fixture.repo.clone(), test_author())
+                .with_message("select first approach".to_owned()),
         )
         .expect("integrate first");
     assert_eq!(integrated.state, CapsuleState::Integrated);
@@ -179,11 +164,7 @@ fn parallel_capsules_isolate_changes_and_integrate_one_explicit_result() {
     let second_error = reopened
         .integrate(
             &second.id,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: None,
-                author: test_author(),
-            },
+            &IntegrateOptions::new(fixture.repo.clone(), test_author()),
         )
         .expect_err("stale second base must not integrate implicitly");
     assert!(
@@ -414,10 +395,7 @@ fn recover_finalizes_a_checkpoint_commit_missing_its_manifest_update() {
     let checkpoint = manager
         .checkpoint(
             &capsule.id,
-            CheckpointOptions {
-                message: "recover this checkpoint".to_owned(),
-                author: test_author(),
-            },
+            CheckpointOptions::new("recover this checkpoint".to_owned(), test_author()),
         )
         .expect("checkpoint");
     let head_before = git_text(
@@ -622,11 +600,8 @@ fn ignored_content_churn_after_close_does_not_block_integration_or_drop() {
     let integrated = manager
         .integrate(
             &capsule.id,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: Some("integrate despite ignored churn".to_owned()),
-                author: test_author(),
-            },
+            &IntegrateOptions::new(fixture.repo.clone(), test_author())
+                .with_message("integrate despite ignored churn"),
         )
         .expect("ignored churn must not block integration");
     assert_eq!(integrated.state, CapsuleState::Integrated);
@@ -702,11 +677,8 @@ fn integration_into_a_detached_target_preserves_detached_head_identity() {
     let integrated = manager
         .integrate(
             &capsule.id,
-            &IntegrateOptions {
-                target: detached.clone(),
-                message: Some("integrate detached".to_owned()),
-                author: test_author(),
-            },
+            &IntegrateOptions::new(detached.clone(), test_author())
+                .with_message("integrate detached".to_owned()),
         )
         .expect("integrate into detached target");
     assert_eq!(integrated.state, CapsuleState::Integrated);
@@ -900,11 +872,7 @@ fn lifecycle_audit_events_and_metrics_are_runtime_neutral() {
     manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "cargo test".to_owned(),
-                exit_code: 0,
-                summary: Some("passed".to_owned()),
-            },
+            EvidenceInput::new("cargo test".to_owned(), 0).with_summary("passed".to_owned()),
         )
         .expect("add evidence");
     manager
@@ -936,13 +904,12 @@ fn lifecycle_audit_events_and_metrics_are_runtime_neutral() {
 fn policy_enforces_repository_count_patch_and_ignored_limits() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
-    let policy = Policy {
-        allowed_repository_roots: vec![fixture.temp.path().to_path_buf()],
-        max_capsules: Some(1),
-        max_patch_bytes: 8,
-        max_ignored_paths: Some(0),
-        ..Policy::default()
-    };
+    // Policy is #[non_exhaustive]: build from Default and set what matters.
+    let mut policy = Policy::default();
+    policy.allowed_repository_roots = vec![fixture.temp.path().to_path_buf()];
+    policy.max_capsules = Some(1);
+    policy.max_patch_bytes = 8;
+    policy.max_ignored_paths = Some(0);
     manager.set_policy(policy).expect("set policy");
 
     let capsule = fixture.create("policy");
@@ -983,10 +950,7 @@ fn checkpoint_policy_applies_to_the_complete_capsule_result() {
     manager
         .checkpoint(
             &capsule.id,
-            CheckpointOptions {
-                message: "first checkpoint".to_owned(),
-                author: test_author(),
-            },
+            CheckpointOptions::new("first checkpoint".to_owned(), test_author()),
         )
         .expect("first checkpoint");
 
@@ -1009,10 +973,7 @@ fn checkpoint_policy_applies_to_the_complete_capsule_result() {
 
     let attempt = manager.checkpoint(
         &capsule.id,
-        CheckpointOptions {
-            message: "second checkpoint".to_owned(),
-            author: test_author(),
-        },
+        CheckpointOptions::new("second checkpoint".to_owned(), test_author()),
     );
     assert!(
         matches!(
@@ -1130,10 +1091,7 @@ fn result_seal_covers_provenance_and_rejects_metadata_tampering() {
     let checkpoint = manager
         .checkpoint(
             &capsule.id,
-            CheckpointOptions {
-                message: "preserve provenance".to_owned(),
-                author: test_author(),
-            },
+            CheckpointOptions::new("preserve provenance".to_owned(), test_author()),
         )
         .expect("checkpoint");
     let result = manager
@@ -1223,11 +1181,8 @@ fn integration_recovery_requires_the_exact_prepared_commit() {
     let integrated = manager
         .integrate(
             &capsule.id,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: Some("expected integration".to_owned()),
-                author: test_author(),
-            },
+            &IntegrateOptions::new(fixture.repo.clone(), test_author())
+                .with_message("expected integration".to_owned()),
         )
         .expect("integrate capsule");
     let expected_head = integrated
@@ -1296,10 +1251,7 @@ fn configured_git_hooks_are_not_executed() {
     manager
         .checkpoint(
             &capsule.id,
-            CheckpointOptions {
-                message: "hook-free checkpoint".to_owned(),
-                author: test_author(),
-            },
+            CheckpointOptions::new("hook-free checkpoint".to_owned(), test_author()),
         )
         .expect("checkpoint must not run repository hook");
 }
@@ -1678,11 +1630,7 @@ fn exported_bundles_verify_offline_and_detect_tampering() {
     manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "cargo test".to_owned(),
-                exit_code: 0,
-                summary: Some("passed".to_owned()),
-            },
+            EvidenceInput::new("cargo test".to_owned(), 0).with_summary("passed".to_owned()),
         )
         .expect("add evidence");
     manager
@@ -1695,11 +1643,7 @@ fn exported_bundles_verify_offline_and_detect_tampering() {
 
     let report = verify_bundle(
         &exported,
-        &VerifyOptions {
-            require_successful_evidence: true,
-            require_current_successful_evidence: false,
-            repository: Some(fixture.repo.clone()),
-        },
+        &VerifyOptions::new(true, false, Some(fixture.repo.clone())),
     )
     .expect("verify exported bundle");
     assert_eq!(report.capsule_id, capsule.id);
@@ -1759,11 +1703,7 @@ fn verification_confirms_the_patch_reproduces_exactly_against_the_base() {
     assert!(matches!(
         verify_bundle(
             &exported,
-            &VerifyOptions {
-                require_successful_evidence: false,
-                require_current_successful_evidence: false,
-                repository: Some(fixture.repo.clone()),
-            },
+            &VerifyOptions::new(false, false, Some(fixture.repo.clone())),
         ),
         Err(Error::Verification(message)) if message.contains("changed paths")
     ));
@@ -1823,10 +1763,7 @@ fn checkpoint_growth_is_refused_before_it_can_wedge_the_manifest() {
         .expect("workspace edit");
         match manager.checkpoint(
             &capsule.id,
-            CheckpointOptions {
-                message: message.clone(),
-                author: test_author(),
-            },
+            CheckpointOptions::new(message.clone(), test_author()),
         ) {
             Ok(_) => accepted += 1,
             Err(error) => {
@@ -1879,22 +1816,14 @@ fn evidence_payload_is_bounded_before_it_can_wedge_the_manifest() {
         manager
             .add_evidence(
                 &capsule.id,
-                EvidenceInput {
-                    command: "x".to_owned(),
-                    exit_code: 0,
-                    summary: Some(summary.clone()),
-                },
+                EvidenceInput::new("x".to_owned(), 0).with_summary(summary.clone()),
             )
             .expect("bounded evidence");
     }
     assert!(matches!(
         manager.add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "x".to_owned(),
-                exit_code: 0,
-                summary: Some(summary),
-            },
+            EvidenceInput::new("x".to_owned(), 0).with_summary(summary),
         ),
         Err(Error::InvalidInput(message)) if message.contains("evidence payload")
     ));
@@ -2013,10 +1942,10 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
                     manager
                         .checkpoint(
                             &capsule.id,
-                            CheckpointOptions {
-                                message: format!("candidate {index} checkpoint"),
-                                author: test_author(),
-                            },
+                            CheckpointOptions::new(
+                                format!("candidate {index} checkpoint"),
+                                test_author(),
+                            ),
                         )
                         .expect("checkpoint candidate");
                     fs::write(
@@ -2031,34 +1960,18 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
                 manager
                     .add_evidence(
                         &capsule.id,
-                        EvidenceInput {
-                            command: format!("verify-candidate-{index}"),
-                            exit_code: 0,
-                            summary: Some("deterministic stress evidence".to_owned()),
-                        },
+                        EvidenceInput::new(format!("verify-candidate-{index}"), 0)
+                            .with_summary("deterministic stress evidence".to_owned()),
                     )
                     .expect("record evidence");
                 manager
-                    .close(
-                        &capsule.id,
-                        CloseOptions {
-                            require_successful_evidence: true,
-                            require_current_successful_evidence: false,
-                        },
-                    )
+                    .close(&capsule.id, CloseOptions::new(true, false))
                     .expect("seal candidate");
                 manager
                     .export_artifacts(&capsule.id, &receipt)
                     .expect("export candidate receipt");
-                let report = verify_bundle(
-                    &receipt,
-                    &VerifyOptions {
-                        require_successful_evidence: true,
-                        require_current_successful_evidence: false,
-                        repository: Some(repo),
-                    },
-                )
-                .expect("verify candidate receipt");
+                let report = verify_bundle(&receipt, &VerifyOptions::new(true, false, Some(repo)))
+                    .expect("verify candidate receipt");
                 assert_eq!(report.capsule_id, capsule.id);
                 (index, capsule.id, receipt)
             })
@@ -2081,11 +1994,8 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
     manager
         .integrate(
             &selected.1,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: Some("select stress candidate 7".to_owned()),
-                author: test_author(),
-            },
+            &IntegrateOptions::new(fixture.repo.clone(), test_author())
+                .with_message("select stress candidate 7".to_owned()),
         )
         .expect("integrate selected candidate");
     assert_eq!(
@@ -2102,11 +2012,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
     for (_, _, receipt) in &candidates {
         verify_bundle(
             receipt,
-            &VerifyOptions {
-                require_successful_evidence: true,
-                require_current_successful_evidence: false,
-                repository: Some(fixture.repo.clone()),
-            },
+            &VerifyOptions::new(true, false, Some(fixture.repo.clone())),
         )
         .expect("every candidate remains independently verifiable");
     }
@@ -2156,11 +2062,7 @@ fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected()
     let evidence = manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "caller-ran-tests".to_owned(),
-                exit_code: 0,
-                summary: None,
-            },
+            EvidenceInput::new("caller-ran-tests".to_owned(), 0),
         )
         .expect("record bound claim");
     assert!(evidence.patch_sha256.is_some());
@@ -2168,31 +2070,18 @@ fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected()
     assert!(matches!(
         manager.close(
             &capsule.id,
-            CloseOptions {
-                require_successful_evidence: false,
-                require_current_successful_evidence: true,
-            },
+            CloseOptions::new(false, true),
         ),
         Err(Error::InvalidInput(message)) if message.contains("current successful evidence")
     ));
     let current = manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "caller-ran-tests-again".to_owned(),
-                exit_code: 0,
-                summary: None,
-            },
+            EvidenceInput::new("caller-ran-tests-again".to_owned(), 0),
         )
         .expect("record current claim");
     let result = manager
-        .close(
-            &capsule.id,
-            CloseOptions {
-                require_successful_evidence: false,
-                require_current_successful_evidence: true,
-            },
-        )
+        .close(&capsule.id, CloseOptions::new(false, true))
         .expect("seal current claim");
     assert_eq!(
         current.patch_sha256.as_deref(),
@@ -2205,11 +2094,7 @@ fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected()
         .expect("export");
     verify_bundle(
         &receipt,
-        &VerifyOptions {
-            require_successful_evidence: false,
-            require_current_successful_evidence: true,
-            repository: Some(fixture.repo.clone()),
-        },
+        &VerifyOptions::new(false, true, Some(fixture.repo.clone())),
     )
     .expect("verify current evidence against seal");
 }
@@ -2222,11 +2107,7 @@ fn state_v3_migration_is_dry_run_then_backup_first_and_marks_evidence_unbound() 
     manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput {
-                command: "legacy claim".to_owned(),
-                exit_code: 0,
-                summary: None,
-            },
+            EvidenceInput::new("legacy claim".to_owned(), 0),
         )
         .expect("evidence");
     fs::write(capsule.workspace_path.join("shared.txt"), "legacy\n").expect("edit");
@@ -2937,10 +2818,7 @@ fn non_utf8_git_inventory_paths_round_trip_losslessly() {
         .expect("export");
     verify_bundle(
         receipt,
-        &VerifyOptions {
-            repository: Some(fixture.repo.clone()),
-            ..VerifyOptions::default()
-        },
+        &VerifyOptions::new(false, false, Some(fixture.repo.clone())),
     )
     .expect("verify non-UTF-8 inventory");
 }
@@ -3038,10 +2916,7 @@ fn write_json(path: &Path, value: &serde_json::Value) {
 }
 
 fn test_author() -> Author {
-    Author {
-        name: "Test Agent".to_owned(),
-        email: "agent@example.test".to_owned(),
-    }
+    Author::new("Test Agent".to_owned(), "agent@example.test".to_owned())
 }
 
 fn git_success<I, S>(directory: &Path, args: I)

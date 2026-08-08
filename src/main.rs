@@ -48,7 +48,7 @@ enum Command {
     /// Directly resolve one state-root-scoped idempotency key.
     Lookup(LookupArgs),
     /// List durable capsule records.
-    List,
+    List(ListArgs),
     /// Show one capsule manifest.
     Show(IdArgs),
     /// Print the capsule workspace path.
@@ -69,6 +69,8 @@ enum Command {
     Sign(SignArgs),
     /// Verify an exported bundle offline, without capsule state or a workspace.
     Verify(VerifyArgs),
+    /// Emit an in-toto Statement for a verified receipt, for SLSA/Sigstore tooling.
+    Attest(AttestArgs),
     /// Show structured lifecycle audit events for one capsule or all capsules.
     Audit(AuditArgs),
     /// Show an aggregate observability snapshot.
@@ -119,6 +121,13 @@ struct LookupArgs {
     /// Opaque state-root-scoped idempotency key. Do not put secrets here.
     #[arg(long)]
     idempotency_key: String,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Report unreadable records instead of failing on the first one.
+    #[arg(long)]
+    skip_invalid: bool,
 }
 
 #[derive(Debug, Args)]
@@ -179,6 +188,27 @@ struct SignArgs {
     /// New raw 64-byte detached signature file.
     #[arg(long)]
     output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AttestArgs {
+    /// Directory containing bundle.json, result.json, and result.patch.
+    bundle: PathBuf,
+
+    /// Also require the sealed patch to apply to its pinned base here.
+    ///
+    /// Without this, the statement still verifies the receipt's internal
+    /// integrity, but nothing has re-derived the tree from the base.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Write the statement here instead of stdout. Never overwrites.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Emit only the predicate body, for `cosign attest-blob --predicate`.
+    #[arg(long)]
+    predicate_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -332,10 +362,7 @@ struct AuthorArgs {
 
 impl From<AuthorArgs> for Author {
     fn from(value: AuthorArgs) -> Self {
-        Self {
-            name: value.author_name,
-            email: value.author_email,
-        }
+        Self::new(value.author_name, value.author_email)
     }
 }
 
@@ -450,6 +477,29 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             cli.json,
         );
     }
+    if let Command::Attest(arguments) = &cli.command {
+        let statement = change_capsule::attest_bundle(
+            &arguments.bundle,
+            &VerifyOptions::new(false, false, arguments.repo.clone()),
+        )?;
+        let mut rendered = if arguments.predicate_only {
+            serde_json::to_vec_pretty(&statement.predicate)
+        } else {
+            serde_json::to_vec_pretty(&statement)
+        }
+        .map_err(|source| change_capsule::Error::Json {
+            path: PathBuf::from("attestation"),
+            source,
+        })?;
+        // One byte-identical document on both paths, so `--output` and a shell
+        // redirection of stdout produce the same file.
+        rendered.push(b'\n');
+        if let Some(path) = &arguments.output {
+            return write_new_file(path, &rendered);
+        }
+        print!("{}", String::from_utf8_lossy(&rendered));
+        return Ok(());
+    }
     if let Command::Verify(arguments) = &cli.command {
         let report = if let (Some(signature), Some(public_key)) =
             (&arguments.signature, &arguments.trusted_public_key)
@@ -460,22 +510,20 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 &arguments.bundle,
                 &signature,
                 &key,
-                &VerifyOptions {
-                    require_successful_evidence: arguments.require_successful_evidence,
-                    require_current_successful_evidence: arguments
-                        .require_current_successful_evidence,
-                    repository: arguments.repo.clone(),
-                },
+                &VerifyOptions::new(
+                    arguments.require_successful_evidence,
+                    arguments.require_current_successful_evidence,
+                    arguments.repo.clone(),
+                ),
             )?
         } else {
             verify_bundle(
                 &arguments.bundle,
-                &VerifyOptions {
-                    require_successful_evidence: arguments.require_successful_evidence,
-                    require_current_successful_evidence: arguments
-                        .require_current_successful_evidence,
-                    repository: arguments.repo.clone(),
-                },
+                &VerifyOptions::new(
+                    arguments.require_successful_evidence,
+                    arguments.require_current_successful_evidence,
+                    arguments.repo.clone(),
+                ),
             )?
         };
         return print_value(&report, cli.json);
@@ -518,7 +566,20 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
         Command::Lookup(_) => {
             unreachable!("lookup is handled before state initialization")
         }
-        Command::List => {
+        Command::List(arguments) if arguments.skip_invalid => {
+            let listing = manager.list_reporting()?;
+            if cli.json {
+                print_json(&listing)?;
+            } else {
+                for capsule in &listing.capsules {
+                    println!("{} {:?} {}", capsule.id, capsule.state, capsule.base_commit);
+                }
+                for record in &listing.unreadable {
+                    println!("{} UNREADABLE {}", record.id, record.error);
+                }
+            }
+        }
+        Command::List(_) => {
             let capsules = manager.list()?;
             if cli.json {
                 print_json(&capsules)?;
@@ -610,8 +671,8 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 cli.json,
             )?;
         }
-        Command::Keygen(_) | Command::Sign(_) | Command::Verify(_) => {
-            unreachable!("keygen, sign, and verify are handled before state initialization")
+        Command::Keygen(_) | Command::Sign(_) | Command::Verify(_) | Command::Attest(_) => {
+            unreachable!("keygen, sign, verify, and attest run before state initialization")
         }
         Command::Audit(arguments) => {
             let events = match arguments.id {
@@ -646,44 +707,34 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
         Command::Checkpoint(arguments) => {
             let checkpoint = manager.checkpoint(
                 &arguments.id,
-                CheckpointOptions {
-                    message: arguments.message,
-                    author: arguments.author.into(),
-                },
+                CheckpointOptions::new(arguments.message, arguments.author.into()),
             )?;
             print_value(&checkpoint, cli.json)?;
         }
         Command::Evidence(arguments) => {
-            let evidence = manager.add_evidence(
-                &arguments.id,
-                EvidenceInput {
-                    command: arguments.command,
-                    exit_code: arguments.exit_code,
-                    summary: arguments.summary,
-                },
-            )?;
+            let evidence = manager.add_evidence(&arguments.id, {
+                let mut input = EvidenceInput::new(arguments.command, arguments.exit_code);
+                input.summary = arguments.summary;
+                input
+            })?;
             print_value(&evidence, cli.json)?;
         }
         Command::Close(arguments) => {
             let result = manager.close(
                 &arguments.id,
-                CloseOptions {
-                    require_successful_evidence: arguments.require_successful_evidence,
-                    require_current_successful_evidence: arguments
-                        .require_current_successful_evidence,
-                },
+                CloseOptions::new(
+                    arguments.require_successful_evidence,
+                    arguments.require_current_successful_evidence,
+                ),
             )?;
             print_value(&result, cli.json)?;
         }
         Command::Integrate(arguments) => {
-            let capsule = manager.integrate(
-                &arguments.id,
-                &IntegrateOptions {
-                    target: arguments.target,
-                    message: arguments.message,
-                    author: arguments.author.into(),
-                },
-            )?;
+            let capsule = manager.integrate(&arguments.id, &{
+                let mut options = IntegrateOptions::new(arguments.target, arguments.author.into());
+                options.message = arguments.message;
+                options
+            })?;
             print_value(&capsule, cli.json)?;
         }
         Command::Drop(arguments) => {
@@ -720,6 +771,28 @@ fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// Publish a new non-secret file without ever overwriting an existing path.
+///
+/// Attestations are inputs to signing and gating, so a silent overwrite could
+/// swap the document a later `cosign` step signs.
+fn write_new_file(path: &Path, bytes: &[u8]) -> change_capsule::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| change_capsule::Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    sync_parent_directory(parent_directory(path))
 }
 
 fn write_new_key_file(path: &Path, bytes: &[u8], private: bool) -> change_capsule::Result<()> {
@@ -983,6 +1056,12 @@ fn write_output_file(path: &Path, bytes: &[u8]) -> change_capsule::Result<()> {
     Ok(())
 }
 
+/// Map a library error to its stable CLI `kind`.
+///
+/// `Error` is `#[non_exhaustive]`, so this cannot be a compiler-checked
+/// exhaustive match. Every new variant MUST be given an explicit arm above the
+/// fallback; landing in the fallback is a bug, not a design.
+#[allow(clippy::match_same_arms)]
 fn error_kind(error: &change_capsule::Error) -> &'static str {
     match error {
         change_capsule::Error::NotRepository(_) => "not_repository",
@@ -1011,5 +1090,6 @@ fn error_kind(error: &change_capsule::Error) -> &'static str {
         change_capsule::Error::Io { .. }
         | change_capsule::Error::Json { .. }
         | change_capsule::Error::CaptureWorker => "internal",
+        _ => "internal",
     }
 }

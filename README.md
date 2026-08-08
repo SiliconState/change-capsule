@@ -45,6 +45,7 @@ No daemon, VFS, container, shell interpreter, object store, task tracker, model 
 - [CLI reference](#cli-reference)
 - [Orchestration protocol](#orchestration-protocol) — [capabilities](#capability-negotiation), [idempotent creation](#idempotent-creation)
 - [Policy and operations](#policy-and-operations) — [policy](#policy), [state administration](#state-administration), [migration](#state-migration)
+- [What a receipt proves](#what-a-receipt-proves)
 - [Merge gate](#merge-gate) — [committed-receipt protocol](#committed-receipt-protocol)
 - [Rust API](#rust-api)
 - [Guarantees](#guarantees)
@@ -199,6 +200,7 @@ capsule export       create a self-describing result artifact directory
 capsule keygen       generate matching raw Ed25519 private/public key files
 capsule sign         create an optional detached Ed25519 signature over bundle.json
 capsule verify       verify an exported receipt offline, optionally against a repository
+capsule attest       emit an in-toto Statement for a verified receipt
 capsule audit        show one capsule's events or the administrative event stream
 capsule metrics      show aggregate lifecycle and storage counters
 capsule policy       show, replace, or evaluate resource/repository policy
@@ -313,6 +315,35 @@ capsule --json state migrate --apply --backup /safe/new/capsule-v3-backup
 
 Migrated v3 evidence is explicitly unbound (`patch_sha256` absent), remains a caller claim, and cannot satisfy current-evidence policy.
 
+## What a receipt proves
+
+Stated plainly, because "verifiable AI code" claims more than anything can
+deliver. Every attestation carries this same list machine-readably under
+`predicate.proof_boundary`.
+
+**Proves**, recomputable by anyone holding the receipt, trusting nothing:
+
+- the patch bytes match their sealed digest and byte count;
+- the patch applies to the pinned base and reproduces exactly the sealed bytes
+  and changed paths;
+- with `--verify-head`, the tree being merged **is** base plus that patch;
+- with a signature, a specific out-of-band key signed those exact bundle bytes.
+
+**Does not prove**, and signing does not change this:
+
+- that any recorded evidence command actually ran, or that its output is honest
+  — Capsule records claims and never executes them, which is why an attestation
+  calls the field `claimed_evidence`;
+- who or what wrote the change;
+- that the change is correct, safe, reviewed, or good;
+- that the producing host was uncompromised.
+
+So a merge gate built on this proves **the diff being merged is the diff that
+was reviewed and sealed**. That is an integrity control, not a quality control;
+keep running your own tests. If you already use in-toto, SLSA, or Sigstore,
+`capsule attest` emits a standard in-toto Statement — see
+[`docs/interop.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/interop.md).
+
 ## Merge gate
 
 A receipt is only useful if something checks it. This repository ships a GitHub Action that verifies a receipt in CI and, with `verify-head`, refuses the merge unless the tree being merged is exactly the pinned base plus the sealed patch:
@@ -422,6 +453,8 @@ Out of scope: remote execution, distributed persistence, background jobs, non-Gi
 - [`docs/protocol.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/protocol.md) — the framework-neutral contract for agents and automation
 - [`docs/security.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/security.md) — trust assumptions, protections, and explicit known limits
 - [`docs/composition.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/composition.md) — composing with agents, CI, trackers, and multi-agent systems
+- [`docs/interop.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/interop.md) — in-toto, SLSA, and Sigstore interoperability, and what a receipt proves
+- [`docs/releasing.md`](https://github.com/SiliconState/change-capsule/blob/main/docs/releasing.md) — the coupled receipt-schema and published-pin release protocol
 
 ## License
 

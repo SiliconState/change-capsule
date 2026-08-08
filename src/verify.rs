@@ -23,6 +23,7 @@ const BUNDLE_JSON_CAP: u64 = 1024 * 1024;
 
 /// What a verification run should require beyond structural consistency.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct VerifyOptions {
     /// Reject bundles whose evidence is absent or contains a non-zero exit code.
     pub require_successful_evidence: bool,
@@ -32,6 +33,24 @@ pub struct VerifyOptions {
     /// base commit exists and that the sealed patch applies to it, reproducing
     /// exactly the sealed patch bytes and changed paths.
     pub repository: Option<PathBuf>,
+}
+
+impl VerifyOptions {
+    /// Verification policy.
+    ///
+    /// Pass `repository` to additionally require that the sealed patch applies
+    /// to its pinned base and reproduces exactly.
+    pub fn new(
+        require_successful_evidence: bool,
+        require_current_successful_evidence: bool,
+        repository: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            require_successful_evidence,
+            require_current_successful_evidence,
+            repository,
+        }
+    }
 }
 
 /// Verify an exported receipt directory.
@@ -56,11 +75,12 @@ pub struct VerifyOptions {
 /// ```no_run
 /// use change_capsule::{VerifyOptions, verify_bundle};
 ///
-/// let report = verify_bundle("./receipt", &VerifyOptions {
-///     require_successful_evidence: true,
-///     require_current_successful_evidence: false,
-///     repository: Some(".".into()),
-/// })?;
+/// // Options types are `#[non_exhaustive]`, so build them with a constructor
+/// // rather than a struct literal; new fields can then be added compatibly.
+/// let report = verify_bundle(
+///     "./receipt",
+///     &VerifyOptions::new(true, false, Some(".".into())),
+/// )?;
 /// println!("{} changed {} path(s)", report.capsule_id, report.changed_paths);
 /// # Ok::<(), change_capsule::Error>(())
 /// ```
@@ -103,6 +123,18 @@ fn verify_bundle_snapshot(
     bundle_bytes: &[u8],
     options: &VerifyOptions,
 ) -> Result<VerificationReport> {
+    verify_bundle_snapshot_full(directory, bundle_bytes, options).map(|(report, _)| report)
+}
+
+/// Verify a bundle and hand back the validated result alongside its report.
+///
+/// Attestation needs the decoded result, and must never be able to describe a
+/// receipt that did not verify, so both come from this one checked path.
+fn verify_bundle_snapshot_full(
+    directory: &Path,
+    bundle_bytes: &[u8],
+    options: &VerifyOptions,
+) -> Result<(VerificationReport, CapsuleResult)> {
     let bundle: ArtifactBundle = serde_json::from_slice(bundle_bytes)
         .map_err(|error| fail(format!("bundle.json is not a valid bundle: {error}")))?;
     if bundle.schema_version != BUNDLE_SCHEMA_VERSION {
@@ -163,14 +195,14 @@ fn verify_bundle_snapshot(
         false
     };
 
-    Ok(VerificationReport {
+    let report = VerificationReport {
         bundle_directory: directory.to_path_buf(),
-        capsule_id: result.capsule_id,
+        capsule_id: result.capsule_id.clone(),
         kind: result.kind,
-        base_commit: result.base_commit,
-        head_commit: result.head_commit,
+        base_commit: result.base_commit.clone(),
+        head_commit: result.head_commit.clone(),
         patch_bytes: result.patch_bytes,
-        patch_sha256: result.patch_sha256,
+        patch_sha256: result.patch_sha256.clone(),
         changed_paths: result.changed_paths.len(),
         evidence_total: result.evidence.len(),
         evidence_failed: result
@@ -180,7 +212,17 @@ fn verify_bundle_snapshot(
             .count(),
         repository_checked,
         signature_authenticated: false,
-    })
+    };
+    Ok((report, result))
+}
+
+/// Verify a receipt directory and return its validated sealed result.
+pub(crate) fn verified_bundle_result(
+    directory: &Path,
+    options: &VerifyOptions,
+) -> Result<(VerificationReport, CapsuleResult)> {
+    let bundle_bytes = read_bundle_snapshot(directory)?;
+    verify_bundle_snapshot_full(directory, &bundle_bytes, options)
 }
 
 fn single_descriptor(bundle: &ArtifactBundle, kind: ArtifactKind) -> Result<&ArtifactDescriptor> {

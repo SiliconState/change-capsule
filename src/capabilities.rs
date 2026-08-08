@@ -27,6 +27,7 @@ pub const IDEMPOTENCY_KEY_BYTES_LIMIT: usize = 256;
 
 /// Schemas supported by the current build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct CapabilitySchemas {
     /// Durable capsule/result schemas this build reads and writes.
     pub durable_read_write: Vec<u32>,
@@ -44,6 +45,7 @@ pub struct CapabilitySchemas {
 ///
 /// Every `*_bytes` field is a UTF-8 byte limit. `links` is a count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct CapabilityLimits {
     /// Maximum label length in UTF-8 bytes.
     pub label_bytes: usize,
@@ -63,6 +65,7 @@ pub struct CapabilityLimits {
 /// feature identifiers. Unknown additive fields and feature identifiers are
 /// safe to ignore. This document does not authenticate the binary or its host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// Independent schema version of this capability document.
     pub capability_schema_version: u32,
@@ -97,6 +100,7 @@ impl Capabilities {
                 "diff.sha256.v1",
                 "receipt.export.v1",
                 "receipt.verify.v1",
+                "receipt.attest.intoto.v1",
                 "state.inspect.v1",
             ],
             schemas: CapabilitySchemas {

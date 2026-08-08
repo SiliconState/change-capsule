@@ -210,6 +210,12 @@ Byte/count quotas are cooperative checkpoints, not kernel reservations: workers 
 
 A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
 
+Administrative reads (`inspect_state`, `backup_state`, `metrics`, `audit_log`)
+take the global lock plus every known project lock, so they serialise against all
+capsule mutation. The idempotency index grows one record per capsule and is never
+reclaimed, because reclaiming would make a key reusable; it is bounded by the same
+`max_capsules` limit as capsule records, which are likewise retained after drop.
+
 ## Integration
 
 Integration is intentionally conservative:

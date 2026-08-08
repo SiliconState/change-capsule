@@ -46,6 +46,7 @@ Its output is one bounded deterministic JSON object with no timestamps, host pat
     "diff.sha256.v1",
     "receipt.export.v1",
     "receipt.verify.v1",
+    "receipt.attest.intoto.v1",
     "state.inspect.v1"
   ],
   "schemas": {

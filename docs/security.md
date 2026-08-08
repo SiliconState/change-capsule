@@ -127,6 +127,27 @@ Evidence records are explicit caller claims. Schema-v4 evidence binds to the com
 
 Idempotent creation guarantees at most one capsule identity and worktree per key within one state root. It does not guarantee that the external agent process ran exactly once — Capsule does not launch, observe, or supervise that process. A replay may legitimately return a capsule that is already closed, integrated, orphaned, or dropped, so callers still need targeted lifecycle recovery and state inspection rather than treating a successful replay as "the work is in progress". Idempotency is local orchestration state and is deliberately absent from portable receipts: a receipt proves result consistency, not agent authorship or execution count.
 
+## Scaling characteristics
+
+These are design properties, not defects, but they surprise operators of large
+multi-agent state roots:
+
+- **One reservation per capsule, retained for the life of the state root.** An
+  idempotency key is bound permanently so it can never be silently reused, which
+  means the index grows exactly in step with capsule records — and those are also
+  retained after drop, by design. Both are bounded by `max_capsules`. There is
+  deliberately no garbage collector: reclaiming a reservation would make its key
+  reusable and break the one guarantee the index exists to provide.
+- **Some operations are stop-the-world.** `state inspect`, `state backup`,
+  `metrics`, and the administrative `audit` stream take the global lock plus
+  every known project lock in deterministic order, so they serialise against all
+  concurrent capsule mutation. Targeted commands avoid this: `recover <id>`,
+  `lookup`, `show`, and `status` read only what they name.
+- **`list` is fail-closed and all-or-nothing**, because policy counts derive
+  from it and undercounting would raise an effective quota. Use
+  `list --skip-invalid` when you need to see the rest of a root that contains a
+  corrupt record.
+
 ## Known limits
 
 - A capsule created from a sparse source materializes a complete independent checkout; enabling sparse checkout inside the managed workspace is rejected. Independent temporary indexes make `skip-worktree` and `assume-unchanged` flags irrelevant to snapshots.

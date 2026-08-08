@@ -24,6 +24,7 @@ const SIGNATURE_BYTES: usize = 64;
 /// only in appropriately protected secret storage.
 #[derive(Zeroize)]
 #[zeroize(drop)]
+#[non_exhaustive]
 pub struct GeneratedKeypair {
     private_seed: [u8; 32],
     public_key: [u8; 32],

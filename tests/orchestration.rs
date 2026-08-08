@@ -97,6 +97,7 @@ fn capabilities_current_json_is_an_exact_static_contract() {
     "diff.sha256.v1",
     "receipt.export.v1",
     "receipt.verify.v1",
+    "receipt.attest.intoto.v1",
     "state.inspect.v1"
   ],
   "schemas": {
@@ -373,6 +374,57 @@ fn lookup_is_direct_and_ignores_unrelated_malformed_state() {
     ));
 }
 
+/// A single corrupt manifest must not hide an entire state root.
+#[test]
+fn skip_invalid_listing_reports_bad_records_without_hiding_good_ones() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let healthy = manager
+        .create_idempotent(fixture.options("healthy"), "list:healthy")
+        .expect("create");
+
+    let broken = fixture.state.join("capsules").join("cap-corrupted01");
+    fs::create_dir(&broken).expect("corrupt record dir");
+    fs::write(broken.join("capsule.json"), b"not json").expect("corrupt manifest");
+
+    // The fail-closed path is what policy counts depend on: it must still fail.
+    assert!(
+        manager.list().is_err(),
+        "strict listing must stay fail-closed"
+    );
+
+    let listing = manager.list_reporting().expect("lenient listing");
+    assert_eq!(listing.capsules.len(), 1);
+    assert_eq!(listing.capsules[0].id, healthy.id);
+    assert_eq!(listing.unreadable.len(), 1);
+    assert_eq!(listing.unreadable[0].id, "cap-corrupted01");
+    assert!(!listing.unreadable[0].error.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args(["--json", "--home"])
+        .arg(&fixture.state)
+        .args(["list", "--skip-invalid"])
+        .output()
+        .expect("list --skip-invalid");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("listing JSON");
+    assert_eq!(value["capsules"][0]["id"], healthy.id);
+    assert_eq!(value["unreadable"][0]["id"], "cap-corrupted01");
+
+    // Without the flag the CLI still refuses to report a partial view.
+    let strict = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .args(["--json", "--home"])
+        .arg(&fixture.state)
+        .arg("list")
+        .output()
+        .expect("strict list");
+    assert!(!strict.status.success());
+}
+
 #[test]
 fn replay_after_every_terminal_lifecycle_state_returns_the_same_identity() {
     let fixture = Fixture::new();
@@ -420,14 +472,11 @@ fn replay_after_every_terminal_lifecycle_state_returns_the_same_identity() {
     manager
         .integrate(
             &integrated.id,
-            &IntegrateOptions {
-                target: fixture.repo.clone(),
-                message: Some("integrate".to_owned()),
-                author: Author {
-                    name: "Fixture".to_owned(),
-                    email: "fixture@example.test".to_owned(),
-                },
-            },
+            &IntegrateOptions::new(
+                fixture.repo.clone(),
+                Author::new("Fixture".to_owned(), "fixture@example.test".to_owned()),
+            )
+            .with_message("integrate".to_owned()),
         )
         .expect("integrate");
     let integrated_replay = manager
