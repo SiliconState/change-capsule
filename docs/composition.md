@@ -42,11 +42,11 @@ An interactive agent can be launched manually from the path printed by `capsule 
 
 ## CI and evaluation harnesses
 
-A CI job can create one capsule per candidate implementation, test each independently, record evidence, close all results, and compare their patches without allowing candidates to race on one checkout.
+A CI job can create one capsule per candidate implementation, have Capsule run each candidate's tests inside its own workspace, close all results, and compare their patches without allowing candidates to race on one checkout. Because the runs are executed rather than reported, a candidate cannot be recorded as passing unless it did.
 
-A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-current-successful-evidence` plus a byte comparison of `result.patch` against the proposed diff. This proves the claimed passing evidence was attached to that exact patch, but evidence remains caller-supplied, so CI should independently rerun critical tests.
+A merge gate can require a receipt: the agent-side harness runs `capsule export`, attaches the bundle to the change, and CI runs `capsule verify <bundle> --repo . --require-executed-evidence` plus a byte comparison of `result.patch` against the proposed diff. That proves the sealed patch reproduces the tree and that a command Capsule ran itself passed against exactly that patch. It does not prove the producing host was honest, so CI should still rerun security-critical tests on its own hardware.
 
-When the receipt itself is committed, use two commits because a tree cannot contain a receipt that describes itself. The first commit is exactly the integrated sealed result; the second adds only the three receipt artifacts. A required gate validates that envelope and checks the first commit through `SiliconState/change-capsule@v0.2.0`. Rebases or implementation amendments require a new capsule and receipt, and squash merges are incompatible with this protocol. This repository's `receipt-gate` job and `scripts/prepare-committed-receipt.sh` are a copy-pasteable implementation.
+Attach the receipt to the change however your review tool already carries artifacts: a CI artifact, a release asset, or a directory the gate fetches by capsule ID. Capsule deliberately does not ask you to commit receipts into the repository, because a tree cannot contain a receipt that describes itself, and every workaround for that taxes the commit graph.
 
 An evaluation harness can attach dimensions using links:
 
@@ -85,9 +85,9 @@ task
 └── capsule candidate-c
 ```
 
-Workers may modify identical paths concurrently because their files and indexes are isolated. Reviewers consume sealed result manifests, patches, or self-describing exports. The coordinator chooses if and when to integrate. Lifecycle events and aggregate metrics are available through the same crate/CLI without requiring a coordinator-specific adapter.
+Workers may modify identical paths concurrently because their files and indexes are isolated. Reviewers consume sealed result manifests, patches, or self-describing exports. The coordinator chooses if and when to integrate. Every worker reports through the same crate and CLI, with no coordinator-specific adapter.
 
-Capsule intentionally does not choose workers, route tasks, retry models, resolve conflicts, or select winners. Idempotent creation is the one concession to coordinator failure modes, and it is deliberately narrow: it binds a caller-supplied key to one capsule identity. It does not add a workflow database, generic task/agent/run tables, arbitrary link queries, a daemon, a background index, key expiration, automatic retry policy, or winner selection.
+Capsule intentionally does not choose workers, route tasks, retry models, resolve conflicts, or select winners. Idempotent creation is the one concession to coordinator failure modes, and it is deliberately narrow: it binds a caller-supplied key to one capsule identity. It does not add a workflow database, generic task/agent/run tables, arbitrary link queries, a daemon, a background index, key expiration, automatic retries, or winner selection.
 
 ## Editors and humans
 
@@ -102,13 +102,10 @@ The reusable API is `CapsuleManager`. Embedders can:
 - create capsules with labels and arbitrary links;
 - create idempotently with `create_idempotent` and resolve a key directly with `lookup_idempotency_key`, or with manager-free `lookup_idempotency_key_at`;
 - retrieve paths and status;
-- record checkpoints and evidence;
+- record checkpoints, and run or record evidence;
 - close and inspect results;
 - discover, stream, publish, or export sealed artifacts;
 - verify exported v3/v4 bundles offline with `verify_bundle`, or authenticate and verify one exact bundle snapshot with `verify_authenticated_bundle` and an out-of-band trusted key;
-- read per-capsule or administrative audit events and aggregate metrics;
-- install and evaluate repository/resource policy;
-- inspect, back up, and explicitly migrate schema-v3 durable state;
 - integrate and drop explicitly;
 - call recovery at startup.
 
@@ -133,11 +130,12 @@ workspace=$(printf '%s' "$created" | jq -r .workspace_path)
 )
 agent_status=$?
 
-capsule --json evidence "$id" \
-  --command "your-agent-command" \
-  --exit-code "$agent_status"
+# Capsule runs the tests itself, in the capsule workspace, and records the exit
+# code and output digest it observed. The harness cannot assert a pass it did
+# not get, which is what makes the receipt worth checking later.
+capsule --json evidence "$id" --timeout-seconds 900 -- your-test-command
 
-capsule --json close "$id" --require-current-successful-evidence
+capsule --json close "$id" --require-executed-evidence
 ```
 
 Production runners should avoid shell parsing by calling the Rust library or decoding JSON in their native language. No cloud, agent, or workflow wrapper is required: any caller can invoke the crate API or `capsule` binary directly.
@@ -149,7 +147,7 @@ An adapter should not:
 - modify capsule state files directly;
 - assume branch names or workspace layout;
 - write into a closed capsule;
-- auto-integrate without an explicit policy decision;
+- auto-integrate without an explicit decision;
 - claim that a worktree is a security sandbox;
 - place credentials in links or evidence;
 - make Capsule depend on one agent or tracker.

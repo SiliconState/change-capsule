@@ -7,18 +7,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::process::{Command, Output};
 
-use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
 use change_capsule::{
-    ArtifactDescriptor, ArtifactKind, ArtifactSink, AuditEventKind, Author, CapsuleHealth,
-    CapsuleManager, CapsuleState, CheckpointOptions, CloseOptions, CreateOptions, Error,
-    EvidenceInput, GitPath, IntegrateOptions, Policy, ResultKind, VerifyOptions, sign_bundle,
-    sign_bundle_bytes, verify_authenticated_bundle, verify_bundle, verify_bundle_signature_bytes,
+    ArtifactDescriptor, ArtifactKind, ArtifactSink, Author, CapsuleHealth, CapsuleManager,
+    CapsuleState, CheckpointOptions, CloseOptions, CreateOptions, Error, EvidenceInput, GitPath,
+    IntegrateOptions, ResultKind, VerifyOptions, sign_bundle, sign_bundle_bytes,
+    verify_authenticated_bundle, verify_bundle, verify_bundle_signature_bytes,
 };
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -120,12 +117,12 @@ fn parallel_capsules_isolate_changes_and_integrate_one_explicit_result() {
     manager
         .add_evidence(
             &first.id,
-            EvidenceInput::new("cargo test".to_owned(), 0)
+            EvidenceInput::claim("cargo test".to_owned(), 0)
                 .with_summary("all tests passed".to_owned()),
         )
         .expect("first evidence");
     let first_result = manager
-        .close(&first.id, CloseOptions::new(true, false))
+        .close(&first.id, CloseOptions::requiring(true, false, false))
         .expect("close first");
     let second_result = manager
         .close(&second.id, CloseOptions::default())
@@ -864,225 +861,6 @@ fn artifact_publication_uses_one_validated_byte_snapshot() {
 }
 
 #[test]
-fn lifecycle_audit_events_and_metrics_are_runtime_neutral() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("audit");
-    fs::write(capsule.workspace_path.join("shared.txt"), "audited\n").expect("edit capsule");
-    manager
-        .add_evidence(
-            &capsule.id,
-            EvidenceInput::new("cargo test".to_owned(), 0).with_summary("passed".to_owned()),
-        )
-        .expect("add evidence");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close capsule");
-
-    let events = manager.audit_events(&capsule.id).expect("audit events");
-    assert_eq!(
-        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
-        vec![
-            AuditEventKind::Created,
-            AuditEventKind::EvidenceAdded,
-            AuditEventKind::Closed,
-        ]
-    );
-    assert!(events.windows(2).all(|events| {
-        events[0].occurred_at_unix <= events[1].occurred_at_unix
-            && events[0].event_id != events[1].event_id
-    }));
-    let metrics = manager.metrics().expect("metrics");
-    assert_eq!(metrics.capsules, 1);
-    assert_eq!(metrics.live_capsules, 1);
-    assert_eq!(metrics.sealed_results, 1);
-    assert_eq!(metrics.audit_events, 3);
-    assert_eq!(metrics.states.get("closed"), Some(&1));
-}
-
-#[test]
-fn policy_enforces_repository_count_patch_and_ignored_limits() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    // Policy is #[non_exhaustive]: build from Default and set what matters.
-    let mut policy = Policy::default();
-    policy.allowed_repository_roots = vec![fixture.temp.path().to_path_buf()];
-    policy.max_capsules = Some(1);
-    policy.max_patch_bytes = 8;
-    policy.max_ignored_paths = Some(0);
-    manager.set_policy(policy).expect("set policy");
-
-    let capsule = fixture.create("policy");
-    assert!(matches!(
-        manager.create(CreateOptions::new(&fixture.repo)),
-        Err(Error::PolicyViolation(message)) if message.contains("capsule records")
-    ));
-    fs::write(
-        capsule.workspace_path.join("shared.txt"),
-        "larger than eight bytes\n",
-    )
-    .expect("edit capsule");
-    assert!(matches!(
-        manager.close(&capsule.id, CloseOptions::default()),
-        Err(Error::PolicyViolation(message)) if message.contains("patch bytes")
-    ));
-
-    let mut policy = manager.policy().expect("read policy");
-    policy.max_patch_bytes = change_capsule::HARD_PATCH_BYTES;
-    manager.set_policy(policy).expect("relax patch policy");
-    fs::write(capsule.workspace_path.join(".gitignore"), "ignored.log\n")
-        .expect("write ignore rule");
-    fs::write(capsule.workspace_path.join("ignored.log"), "ignored\n")
-        .expect("write ignored content");
-    assert!(matches!(
-        manager.close(&capsule.id, CloseOptions::default()),
-        Err(Error::PolicyViolation(message)) if message.contains("ignored paths")
-    ));
-    assert!(!manager.policy_report().expect("policy report").compliant);
-}
-
-#[test]
-fn checkpoint_policy_applies_to_the_complete_capsule_result() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("checkpoint-policy");
-    fs::write(capsule.workspace_path.join("first.txt"), "first\n").expect("first edit");
-    manager
-        .checkpoint(
-            &capsule.id,
-            CheckpointOptions::new("first checkpoint".to_owned(), test_author()),
-        )
-        .expect("first checkpoint");
-
-    let mut policy = manager.policy().expect("read policy");
-    policy.max_changed_paths = Some(1);
-    manager.set_policy(policy).expect("set path policy");
-    assert_eq!(
-        manager
-            .policy()
-            .expect("read path policy")
-            .max_changed_paths,
-        Some(1)
-    );
-    let head_before = git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]);
-    fs::write(capsule.workspace_path.join("second.txt"), "second\n").expect("second edit");
-    assert_eq!(
-        manager.status(&capsule.id).expect("status").changed_paths,
-        vec!["first.txt", "second.txt"]
-    );
-
-    let attempt = manager.checkpoint(
-        &capsule.id,
-        CheckpointOptions::new("second checkpoint".to_owned(), test_author()),
-    );
-    assert!(
-        matches!(
-            attempt,
-            Err(Error::PolicyViolation(ref message)) if message.contains("changed paths")
-        ),
-        "unexpected checkpoint result: {attempt:?}"
-    );
-    assert_eq!(
-        git_text(&capsule.workspace_path, ["rev-parse", "HEAD"]),
-        head_before
-    );
-    assert_eq!(
-        manager
-            .show(&capsule.id)
-            .expect("show capsule")
-            .checkpoints
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn policy_report_evaluates_active_results_and_reports_uninspectable_workspaces() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("active-policy-report");
-    fs::write(
-        capsule.workspace_path.join("shared.txt"),
-        "active violation\n",
-    )
-    .expect("active edit");
-
-    let mut policy = manager.policy().expect("read policy");
-    policy.max_changed_paths = Some(0);
-    manager.set_policy(policy).expect("set path policy");
-    assert_eq!(
-        manager
-            .policy()
-            .expect("read path policy")
-            .max_changed_paths,
-        Some(0)
-    );
-    assert_eq!(
-        manager.status(&capsule.id).expect("status").changed_paths,
-        vec!["shared.txt"]
-    );
-    let report = manager.policy_report().expect("report active violation");
-    assert!(!report.compliant, "unexpected report: {report:?}");
-    assert!(report.violations.iter().any(|violation| {
-        violation.contains(&capsule.id) && violation.contains("changed paths")
-    }));
-
-    git_success(
-        &fixture.repo,
-        [
-            "worktree",
-            "remove",
-            "--force",
-            capsule.workspace_path.to_str().expect("utf8 workspace"),
-        ],
-    );
-    let report = manager.policy_report().expect("report missing workspace");
-    assert!(!report.compliant);
-    assert!(report.violations.iter().any(|violation| {
-        violation.contains(&capsule.id) && violation.contains("cannot be inspected")
-    }));
-}
-
-#[test]
-fn unsupported_schema_versions_fail_closed_but_remain_inspectable_and_backupable() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("old-schema");
-    fs::write(capsule.workspace_path.join("shared.txt"), "old schema\n").expect("edit capsule");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close capsule");
-
-    let manifest_path = manifest_path(&fixture, &capsule.id);
-    let mut manifest = read_json(&manifest_path);
-    manifest["schema_version"] = serde_json::json!(2);
-    write_json(&manifest_path, &manifest);
-
-    assert!(matches!(
-        manager.show(&capsule.id),
-        Err(Error::SchemaVersion {
-            found: 2,
-            supported: 4
-        })
-    ));
-    let inspection = manager.inspect_state().expect("inspect old state");
-    assert_eq!(inspection.records[0].schema_version, Some(2));
-    assert!(inspection.records[0].error.is_none());
-
-    let backup = fixture.temp.path().join("old-schema-backup");
-    let report = manager.backup_state(&backup).expect("backup old state");
-    assert!(report.files > 0);
-    assert!(
-        backup
-            .join("capsules")
-            .join(&capsule.id)
-            .join("capsule.json")
-            .is_file()
-    );
-    assert!(backup.join("backup.json").is_file());
-}
-
-#[test]
 fn result_seal_covers_provenance_and_rejects_metadata_tampering() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -1375,98 +1153,6 @@ fn status_reports_ignored_untracked_content_excluded_from_results() {
 }
 
 #[test]
-fn cli_exposes_artifacts_observability_policy_and_state_tools() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("cli-surfaces");
-    fs::write(capsule.workspace_path.join("shared.txt"), "cli result\n").expect("edit capsule");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close capsule");
-
-    for (command, assertion) in [("artifacts", "artifacts"), ("audit", "created")] {
-        let output = capsule_cli(&fixture, [command, &capsule.id]);
-        assert_success(&output);
-        let rendered = String::from_utf8(output.stdout).expect("utf8 CLI JSON");
-        assert!(rendered.contains(assertion));
-    }
-    for command in [["metrics", ""], ["policy", "show"], ["state", "inspect"]] {
-        let args: Vec<_> = command
-            .into_iter()
-            .filter(|argument| !argument.is_empty())
-            .collect();
-        let output = capsule_cli(&fixture, args);
-        assert_success(&output);
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("parse CLI JSON");
-    }
-
-    let exported = fixture.temp.path().join("cli-export");
-    let output = capsule_cli(
-        &fixture,
-        [
-            "export",
-            &capsule.id,
-            "--output",
-            exported.to_str().expect("utf8 export path"),
-        ],
-    );
-    assert_success(&output);
-    assert!(exported.join("bundle.json").is_file());
-
-    let backup = fixture.temp.path().join("cli-backup");
-    let output = capsule_cli(
-        &fixture,
-        [
-            "state",
-            "backup",
-            "--output",
-            backup.to_str().expect("utf8 backup path"),
-        ],
-    );
-    assert_success(&output);
-    assert!(backup.join("capsules").join(&capsule.id).is_dir());
-}
-
-#[cfg(unix)]
-#[test]
-fn export_and_backup_refuse_dangling_symlink_destinations() {
-    use std::os::unix::fs::symlink;
-
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("dangling-output");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close capsule");
-
-    let export = fixture.temp.path().join("export-link");
-    symlink("missing-export-target", &export).expect("create dangling export link");
-    assert!(matches!(
-        manager.export_artifacts(&capsule.id, &export),
-        Err(Error::InvalidInput(message)) if message.contains("already exists")
-    ));
-    assert!(
-        fs::symlink_metadata(&export)
-            .expect("export link survives")
-            .file_type()
-            .is_symlink()
-    );
-
-    let backup = fixture.temp.path().join("backup-link");
-    symlink("missing-backup-target", &backup).expect("create dangling backup link");
-    assert!(matches!(
-        manager.backup_state(&backup),
-        Err(Error::InvalidInput(message)) if message.contains("already exists")
-    ));
-    assert!(
-        fs::symlink_metadata(&backup)
-            .expect("backup link survives")
-            .file_type()
-            .is_symlink()
-    );
-}
-
-#[test]
 fn unregistered_embedded_repository_is_rejected_instead_of_becoming_a_gitlink() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -1630,7 +1316,7 @@ fn exported_bundles_verify_offline_and_detect_tampering() {
     manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput::new("cargo test".to_owned(), 0).with_summary("passed".to_owned()),
+            EvidenceInput::claim("cargo test".to_owned(), 0).with_summary("passed".to_owned()),
         )
         .expect("add evidence");
     manager
@@ -1643,7 +1329,7 @@ fn exported_bundles_verify_offline_and_detect_tampering() {
 
     let report = verify_bundle(
         &exported,
-        &VerifyOptions::new(true, false, Some(fixture.repo.clone())),
+        &VerifyOptions::requiring(true, false, false).with_repository(fixture.repo.clone()),
     )
     .expect("verify exported bundle");
     assert_eq!(report.capsule_id, capsule.id);
@@ -1703,7 +1389,7 @@ fn verification_confirms_the_patch_reproduces_exactly_against_the_base() {
     assert!(matches!(
         verify_bundle(
             &exported,
-            &VerifyOptions::new(false, false, Some(fixture.repo.clone())),
+            &VerifyOptions::requiring(false, false, false).with_repository(fixture.repo.clone()),
         ),
         Err(Error::Verification(message)) if message.contains("changed paths")
     ));
@@ -1816,14 +1502,14 @@ fn evidence_payload_is_bounded_before_it_can_wedge_the_manifest() {
         manager
             .add_evidence(
                 &capsule.id,
-                EvidenceInput::new("x".to_owned(), 0).with_summary(summary.clone()),
+                EvidenceInput::claim("x".to_owned(), 0).with_summary(summary.clone()),
             )
             .expect("bounded evidence");
     }
     assert!(matches!(
         manager.add_evidence(
             &capsule.id,
-            EvidenceInput::new("x".to_owned(), 0).with_summary(summary),
+            EvidenceInput::claim("x".to_owned(), 0).with_summary(summary),
         ),
         Err(Error::InvalidInput(message)) if message.contains("evidence payload")
     ));
@@ -1960,18 +1646,21 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
                 manager
                     .add_evidence(
                         &capsule.id,
-                        EvidenceInput::new(format!("verify-candidate-{index}"), 0)
+                        EvidenceInput::claim(format!("verify-candidate-{index}"), 0)
                             .with_summary("deterministic stress evidence".to_owned()),
                     )
                     .expect("record evidence");
                 manager
-                    .close(&capsule.id, CloseOptions::new(true, false))
+                    .close(&capsule.id, CloseOptions::requiring(true, false, false))
                     .expect("seal candidate");
                 manager
                     .export_artifacts(&capsule.id, &receipt)
                     .expect("export candidate receipt");
-                let report = verify_bundle(&receipt, &VerifyOptions::new(true, false, Some(repo)))
-                    .expect("verify candidate receipt");
+                let report = verify_bundle(
+                    &receipt,
+                    &VerifyOptions::requiring(true, false, false).with_repository(repo),
+                )
+                .expect("verify candidate receipt");
                 assert_eq!(report.capsule_id, capsule.id);
                 (index, capsule.id, receipt)
             })
@@ -1985,10 +1674,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
     candidates.sort_by_key(|candidate| candidate.0);
 
     let manager = fixture.manager();
-    let before_selection = manager.metrics().expect("campaign metrics");
-    assert_eq!(before_selection.capsules, CANDIDATES as u64);
-    assert_eq!(before_selection.live_capsules, CANDIDATES as u64);
-    assert_eq!(before_selection.sealed_results, CANDIDATES as u64);
+    assert_eq!(manager.list().expect("campaign listing").len(), CANDIDATES);
 
     let selected = &candidates[7];
     manager
@@ -2012,7 +1698,7 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
     for (_, _, receipt) in &candidates {
         verify_bundle(
             receipt,
-            &VerifyOptions::new(true, false, Some(fixture.repo.clone())),
+            &VerifyOptions::requiring(true, false, false).with_repository(fixture.repo.clone()),
         )
         .expect("every candidate remains independently verifiable");
     }
@@ -2038,13 +1724,12 @@ fn stress_campaign_parallel_candidates_export_verify_select_and_cleanup() {
         );
     }
 
-    let after_cleanup = manager.metrics().expect("post-campaign metrics");
-    assert_eq!(after_cleanup.capsules, CANDIDATES as u64);
-    assert_eq!(after_cleanup.live_capsules, 0);
-    assert_eq!(after_cleanup.sealed_results, CANDIDATES as u64);
-    assert_eq!(
-        after_cleanup.states.get("dropped"),
-        Some(&(CANDIDATES as u64))
+    let after_cleanup = manager.list().expect("post-campaign listing");
+    assert_eq!(after_cleanup.len(), CANDIDATES);
+    assert!(
+        after_cleanup
+            .iter()
+            .all(|capsule| capsule.state == CapsuleState::Dropped)
     );
     assert!(manager.recover().expect("idempotent recovery").is_empty());
     for (_, _, receipt) in candidates {
@@ -2062,31 +1747,31 @@ fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected()
     let evidence = manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput::new("caller-ran-tests".to_owned(), 0),
+            EvidenceInput::claim("caller-ran-tests".to_owned(), 0),
         )
         .expect("record bound claim");
-    assert!(evidence.patch_sha256.is_some());
+    assert!(
+        !evidence.executed,
+        "a claim must never report itself as executed"
+    );
     fs::write(capsule.workspace_path.join("shared.txt"), "changed later\n").expect("stale edit");
     assert!(matches!(
         manager.close(
             &capsule.id,
-            CloseOptions::new(false, true),
+            CloseOptions::requiring(false, true, false),
         ),
         Err(Error::InvalidInput(message)) if message.contains("current successful evidence")
     ));
     let current = manager
         .add_evidence(
             &capsule.id,
-            EvidenceInput::new("caller-ran-tests-again".to_owned(), 0),
+            EvidenceInput::claim("caller-ran-tests-again".to_owned(), 0),
         )
         .expect("record current claim");
     let result = manager
-        .close(&capsule.id, CloseOptions::new(false, true))
+        .close(&capsule.id, CloseOptions::requiring(false, true, false))
         .expect("seal current claim");
-    assert_eq!(
-        current.patch_sha256.as_deref(),
-        Some(result.patch_sha256.as_str())
-    );
+    assert_eq!(current.patch_sha256, result.patch_sha256);
 
     let receipt = fixture.temp.path().join("current-evidence-receipt");
     manager
@@ -2094,313 +1779,9 @@ fn current_evidence_binds_to_the_complete_patch_and_stale_evidence_is_rejected()
         .expect("export");
     verify_bundle(
         &receipt,
-        &VerifyOptions::new(false, true, Some(fixture.repo.clone())),
+        &VerifyOptions::requiring(false, true, false).with_repository(fixture.repo.clone()),
     )
     .expect("verify current evidence against seal");
-}
-
-#[test]
-fn state_v3_migration_is_dry_run_then_backup_first_and_marks_evidence_unbound() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("migration");
-    manager
-        .add_evidence(
-            &capsule.id,
-            EvidenceInput::new("legacy claim".to_owned(), 0),
-        )
-        .expect("evidence");
-    fs::write(capsule.workspace_path.join("shared.txt"), "legacy\n").expect("edit");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close");
-    for path in [
-        manifest_path(&fixture, &capsule.id),
-        result_path(&fixture, &capsule.id),
-    ] {
-        let mut value = read_json(&path);
-        value["schema_version"] = serde_json::json!(3);
-        for evidence in value["evidence"].as_array_mut().expect("evidence array") {
-            evidence
-                .as_object_mut()
-                .expect("evidence object")
-                .remove("patch_sha256");
-        }
-        write_json(&path, &value);
-    }
-
-    let before = fs::read(manifest_path(&fixture, &capsule.id)).expect("before dry run");
-    let dry = manager
-        .migrate_state_v3(None::<&Path>, false)
-        .expect("dry-run migration");
-    assert!(!dry.applied);
-    assert!(dry.backup_directory.is_none());
-    assert_eq!(dry.capsules, 1);
-    assert_eq!(dry.results, 1);
-    assert_eq!(dry.unbound_evidence, 2);
-    assert_eq!(
-        fs::read(manifest_path(&fixture, &capsule.id)).expect("after dry run"),
-        before
-    );
-    assert!(manager.migrate_state_v3(None::<&Path>, true).is_err());
-
-    let backup = fixture.temp.path().join("migration-backup");
-    let report = manager
-        .migrate_state_v3(Some(&backup), true)
-        .expect("apply migration");
-    assert!(report.applied);
-    assert!(backup.join("backup.json").is_file());
-    assert_eq!(
-        read_json(
-            &backup
-                .join("capsules")
-                .join(&capsule.id)
-                .join("capsule.json")
-        )["schema_version"],
-        3
-    );
-    let migrated = manager.show(&capsule.id).expect("read migrated state");
-    assert_eq!(migrated.schema_version, 4);
-    assert_eq!(migrated.evidence[0].patch_sha256, None);
-    assert_eq!(report.unbound_evidence, 2);
-    assert_eq!(
-        manager
-            .result(&capsule.id)
-            .expect("migrated seal")
-            .schema_version,
-        4
-    );
-}
-
-#[test]
-fn migration_dry_run_rejects_backup_at_library_and_cli_boundaries() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let backup = fixture.temp.path().join("dry-backup");
-    assert!(matches!(
-        manager.migrate_state_v3(Some(&backup), false),
-        Err(Error::InvalidInput(message)) if message.contains("apply=true")
-    ));
-    assert!(!backup.exists());
-
-    let output = Command::new(env!("CARGO_BIN_EXE_capsule"))
-        .args([
-            "--home",
-            fixture.state.to_str().expect("utf8 state path"),
-            "--json",
-            "state",
-            "migrate",
-            "--dry-run",
-            "--backup",
-            backup.to_str().expect("utf8 backup path"),
-        ])
-        .output()
-        .expect("run capsule CLI");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let error: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("parse CLI error JSON");
-    assert_eq!(error["kind"], "invalid_input");
-    assert!(!backup.exists());
-}
-
-#[test]
-fn migration_rejects_adversarial_pair_mismatches_before_backup_or_write() {
-    for (target, field, value) in [
-        ("result", "label", serde_json::json!("different")),
-        ("manifest-result", "changed_paths", serde_json::json!(999)),
-        ("manifest-result", "sealed_at_unix", serde_json::json!(0)),
-    ] {
-        let fixture = Fixture::new();
-        let manager = fixture.manager();
-        let capsule = fixture.create(&format!("mismatch-{field}"));
-        fs::write(capsule.workspace_path.join("shared.txt"), "changed\n").expect("edit");
-        manager
-            .close(&capsule.id, CloseOptions::default())
-            .expect("close");
-        for path in [
-            manifest_path(&fixture, &capsule.id),
-            result_path(&fixture, &capsule.id),
-        ] {
-            let mut json = read_json(&path);
-            json["schema_version"] = serde_json::json!(3);
-            write_json(&path, &json);
-        }
-        let changed_path = if target == "result" {
-            result_path(&fixture, &capsule.id)
-        } else {
-            manifest_path(&fixture, &capsule.id)
-        };
-        let mut changed = read_json(&changed_path);
-        if target == "result" {
-            changed[field] = value;
-        } else {
-            changed["result"][field] = value;
-        }
-        write_json(&changed_path, &changed);
-        let before_manifest = fs::read(manifest_path(&fixture, &capsule.id)).expect("manifest");
-        let before_result = fs::read(result_path(&fixture, &capsule.id)).expect("result");
-        let backup = fixture.temp.path().join("must-not-exist");
-        assert!(manager.migrate_state_v3(Some(&backup), true).is_err());
-        assert!(!backup.exists());
-        assert_eq!(
-            fs::read(manifest_path(&fixture, &capsule.id)).expect("manifest unchanged"),
-            before_manifest
-        );
-        assert_eq!(
-            fs::read(result_path(&fixture, &capsule.id)).expect("result unchanged"),
-            before_result
-        );
-    }
-}
-
-#[test]
-fn migration_rejects_mixed_current_and_legacy_pairs() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("mixed-schema");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close");
-    let result = result_path(&fixture, &capsule.id);
-    let mut legacy = read_json(&result);
-    legacy["schema_version"] = serde_json::json!(3);
-    write_json(&result, &legacy);
-    let backup = fixture.temp.path().join("must-not-exist");
-    assert!(matches!(
-        manager.migrate_state_v3(Some(&backup), true),
-        Err(Error::UnsafeState(message)) if message.contains("mixed-schema")
-    ));
-    assert!(!backup.exists());
-}
-
-#[test]
-fn opening_store_does_not_recover_a_live_migration_before_global_lock() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    drop(manager);
-    let lock_path = fixture.state.join("locks/global.lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .expect("open global lock");
-    lock.lock_exclusive().expect("hold global lock");
-    let journal = fixture.state.join(".migration-v3-v4");
-    fs::create_dir(&journal).expect("create live staging journal");
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_capsule"))
-        .args([
-            "--home",
-            fixture.state.to_str().expect("utf8 state path"),
-            "--json",
-            "list",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start concurrent opener");
-    thread::sleep(Duration::from_millis(200));
-    assert!(child.try_wait().expect("poll opener").is_none());
-    assert!(
-        journal.is_dir(),
-        "live journal must remain while lock is held"
-    );
-
-    lock.unlock().expect("release global lock");
-    let output = child.wait_with_output().expect("finish opener");
-    assert_success(&output);
-    assert!(
-        !journal.exists(),
-        "opener recovers only after taking the lock"
-    );
-}
-
-#[test]
-fn migration_recovery_distinguishes_active_rollback_from_committed_cleanup() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("migration-recovery");
-    let manifest = manifest_path(&fixture, &capsule.id);
-    let original = fs::read(&manifest).expect("original manifest");
-    drop(manager);
-
-    let active = fixture.state.join(".migration-v3-v4");
-    fs::create_dir(&active).expect("active journal");
-    fs::write(active.join("0.json"), &original).expect("journal original");
-    write_json(
-        &active.join("targets.json"),
-        &serde_json::json!([format!("capsules/{}/capsule.json", capsule.id)]),
-    );
-    fs::write(&manifest, b"partially migrated").expect("partial target write");
-    drop(fixture.manager());
-    assert_eq!(fs::read(&manifest).expect("rolled back manifest"), original);
-    assert!(!active.exists());
-
-    let committed = fixture.state.join(".migration-v3-v4-committed-cleanup");
-    fs::create_dir(&committed).expect("committed cleanup");
-    fs::write(committed.join("0.json"), b"partially deleted journal").expect("partial cleanup");
-    drop(fixture.manager());
-    assert!(!committed.exists());
-    assert_eq!(
-        fs::read(&manifest).expect("committed target retained"),
-        original
-    );
-
-    drop(fixture.manager());
-    assert_eq!(fs::read(&manifest).expect("idempotent reopen"), original);
-}
-
-#[test]
-fn migration_recovery_fails_closed_when_both_namespaces_exist() {
-    let fixture = Fixture::new();
-    drop(fixture.manager());
-    let active = fixture.state.join(".migration-v3-v4");
-    let committed = fixture.state.join(".migration-v3-v4-committed-cleanup");
-    fs::create_dir(&active).expect("active journal");
-    fs::create_dir(&committed).expect("committed journal");
-    assert!(matches!(
-        CapsuleManager::open(&fixture.state),
-        Err(Error::UnsafeState(message)) if message.contains("both active and committed")
-    ));
-    assert!(active.is_dir());
-    assert!(committed.is_dir());
-}
-
-#[test]
-fn migration_rejects_result_patch_corruption_without_writing_or_backup() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = fixture.create("migration-corrupt");
-    fs::write(capsule.workspace_path.join("shared.txt"), "changed\n").expect("edit");
-    manager
-        .close(&capsule.id, CloseOptions::default())
-        .expect("close");
-    for path in [
-        manifest_path(&fixture, &capsule.id),
-        result_path(&fixture, &capsule.id),
-    ] {
-        let mut value = read_json(&path);
-        value["schema_version"] = serde_json::json!(3);
-        write_json(&path, &value);
-    }
-    fs::write(
-        fixture
-            .state
-            .join("capsules")
-            .join(&capsule.id)
-            .join("result.patch"),
-        b"corrupt",
-    )
-    .expect("corrupt patch");
-    let before = fs::read(result_path(&fixture, &capsule.id)).expect("legacy result");
-    let backup = fixture.temp.path().join("must-not-exist");
-    assert!(manager.migrate_state_v3(Some(&backup), true).is_err());
-    assert!(!backup.exists());
-    assert_eq!(
-        fs::read(result_path(&fixture, &capsule.id)).expect("unchanged result"),
-        before
-    );
 }
 
 #[test]
@@ -2818,85 +2199,9 @@ fn non_utf8_git_inventory_paths_round_trip_losslessly() {
         .expect("export");
     verify_bundle(
         receipt,
-        &VerifyOptions::new(false, false, Some(fixture.repo.clone())),
+        &VerifyOptions::requiring(false, false, false).with_repository(fixture.repo.clone()),
     )
     .expect("verify non-UTF-8 inventory");
-}
-
-#[test]
-fn concurrent_policy_limit_is_linearizable_under_create_pressure() {
-    const CONTENDERS: usize = 16;
-    const LIMIT: usize = 5;
-
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let mut policy = manager.policy().expect("read policy");
-    policy.max_live_capsules = Some(LIMIT as u64);
-    manager.set_policy(policy).expect("set live limit");
-
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
-    let contenders: Vec<_> = (0..CONTENDERS)
-        .map(|index| {
-            let barrier = barrier.clone();
-            let repo = fixture.repo.clone();
-            let state = fixture.state.clone();
-            std::thread::spawn(move || {
-                let manager = CapsuleManager::open(state).expect("open contender manager");
-                barrier.wait();
-                let mut options = CreateOptions::new(repo);
-                options.label = Some(format!("quota-contender-{index}"));
-                manager.create(options)
-            })
-        })
-        .collect();
-
-    let mut admitted = Vec::new();
-    let mut rejected = 0;
-    for contender in contenders {
-        match contender.join().expect("quota contender") {
-            Ok(capsule) => admitted.push(capsule.id),
-            Err(Error::PolicyViolation(message)) if message.contains("live capsules") => {
-                rejected += 1;
-            }
-            Err(error) => panic!("unexpected quota result: {error}"),
-        }
-    }
-    assert_eq!(admitted.len(), LIMIT);
-    assert_eq!(rejected, CONTENDERS - LIMIT);
-    assert_eq!(
-        admitted
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        LIMIT
-    );
-    assert_eq!(manager.list().expect("list admitted capsules").len(), LIMIT);
-    assert_eq!(
-        manager.metrics().expect("quota metrics").live_capsules,
-        LIMIT as u64
-    );
-
-    let cleanup: Vec<_> = admitted
-        .into_iter()
-        .map(|id| {
-            let state = fixture.state.clone();
-            std::thread::spawn(move || {
-                CapsuleManager::open(state)
-                    .expect("open quota cleanup manager")
-                    .drop_capsule(&id, true)
-                    .expect("force-drop admitted contender")
-            })
-        })
-        .collect();
-    for worker in cleanup {
-        assert_eq!(
-            worker.join().expect("quota cleanup").state,
-            CapsuleState::Dropped
-        );
-    }
-    let metrics = manager.metrics().expect("final quota metrics");
-    assert_eq!(metrics.capsules, LIMIT as u64);
-    assert_eq!(metrics.live_capsules, 0);
 }
 
 fn manifest_path(fixture: &Fixture, id: &str) -> PathBuf {

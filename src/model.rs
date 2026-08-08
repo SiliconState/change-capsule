@@ -1,5 +1,4 @@
-//! Durable data types for capsules, sealed results, artifacts, and audit
-//! records.
+//! Durable data types for capsules, sealed results, and artifacts.
 //!
 //! Every type here is the on-disk and JSON representation of some part of an
 //! attempt. Timestamps are seconds since the Unix epoch. Commit fields hold
@@ -11,28 +10,20 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::idempotency::IdempotencyRecordInspection;
-
 /// Schema version of the durable capsule manifest and sealed result.
 ///
 /// State written by a different version fails closed rather than being
 /// interpreted under current assumptions.
-pub const SCHEMA_VERSION: u32 = 4;
-
-/// Previous durable/result schema accepted only for receipt verification and
-/// explicit state migration.
-pub const LEGACY_SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Schema version of the exported artifact bundle (`bundle.json`).
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 
-/// Schema version of individual [`AuditEvent`] records.
-pub const AUDIT_SCHEMA_VERSION: u32 = 1;
-
-/// Maximum number of audit events retained in one capsule manifest.
+/// Hard upper bound on a sealed patch, in bytes.
 ///
-/// Older events roll off and are counted by [`Capsule::audit_events_dropped`].
-pub const AUDIT_EVENT_CAP: usize = 128;
+/// This is a safety bound on how much a single operation will buffer, not a
+/// configurable quota. Anything larger fails closed.
+pub const HARD_PATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Lifecycle position of a capsule.
 ///
@@ -80,25 +71,43 @@ pub struct Checkpoint {
     pub created_at_unix: u64,
 }
 
-/// A verification claim recorded by the caller.
+/// A verification record attached to a capsule.
 ///
-/// Capsule never runs verification itself. Evidence is provenance about
-/// what the caller says it ran, not a cryptographic attestation.
+/// Two kinds exist, and the difference is the whole point of the field
+/// [`Self::executed`]:
+///
+/// - **Executed.** Capsule ran the command itself in the capsule workspace and
+///   observed the exit code and the output bytes directly. Nothing is taken on
+///   trust from the caller, so a verifier that requires executed evidence is
+///   checking a fact rather than an assertion.
+/// - **Claimed.** The caller ran something elsewhere and reported the result.
+///   Capsule records it verbatim and vouches for nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Evidence {
-    /// Exact command the caller reports having run.
+    /// The command, rendered for reading.
+    ///
+    /// For an executed record this is the argument vector with POSIX quoting
+    /// applied. No shell ever saw it; Capsule spawned the program directly.
     pub command: String,
-    /// Exit status the caller observed.
+    /// Exit status: observed by Capsule when executed, reported by the caller otherwise.
     pub exit_code: i32,
+    /// Whether Capsule executed this command itself.
+    pub executed: bool,
+    /// SHA-256 of the captured stdout and stderr bytes. Executed evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
+    /// Byte length of the captured output. Executed evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
     /// Optional bounded human- or machine-generated summary.
+    ///
+    /// For executed evidence Capsule fills this with the tail of the captured
+    /// output when the caller supplies nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// SHA-256 of the complete patch as it existed when this claim was attached.
-    ///
-    /// Absent only on evidence migrated from schema v3, where no binding existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub patch_sha256: Option<String>,
+    /// SHA-256 of the complete patch as it existed when this record was attached.
+    pub patch_sha256: String,
     /// When the record was attached to the capsule.
     pub recorded_at_unix: u64,
 }
@@ -251,15 +260,9 @@ pub struct Capsule {
     /// Journal for a checkpoint that has not finished transitioning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointJournal>,
-    /// Verification claims recorded by the caller, oldest first.
+    /// Verification records attached during the attempt, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
-    /// Retained lifecycle events, newest last, capped at [`AUDIT_EVENT_CAP`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub audit_events: Vec<AuditEvent>,
-    /// Count of audit events that rolled off the retained window.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub audit_events_dropped: u64,
     /// Seal binding this capsule to its result artifacts, once closed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultRef>,
@@ -315,8 +318,9 @@ pub struct CapsuleResult {
     pub ignored_bytes: u64,
     /// Structural digest of ignored content observed at seal time.
     ///
-    /// Present on every schema-v4 result. Optional only so exported schema-v3
-    /// receipts, which predate this field, remain decodable and verifiable.
+    /// Always written. It stays optional in the type so that a receipt missing
+    /// it decodes and then fails verification with a specific message, rather
+    /// than failing as unparseable JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_content_sha256: Option<String>,
     /// Ignored paths excluded from the patch, as reported by Git.
@@ -611,87 +615,6 @@ pub struct ExportReport {
     pub output_directory: PathBuf,
 }
 
-/// Lifecycle transition an [`AuditEvent`] records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum AuditEventKind {
-    /// A capsule and its workspace were created.
-    Created,
-    /// A checkpoint commit was completed.
-    Checkpointed,
-    /// Verification evidence was attached.
-    EvidenceAdded,
-    /// The result was sealed.
-    Closed,
-    /// Integration began and was journaled.
-    IntegrationStarted,
-    /// Integration failed before changing the target and was rolled back.
-    IntegrationAborted,
-    /// A sealed result was applied to a target worktree.
-    Integrated,
-    /// Cleanup began and was journaled.
-    CleanupStarted,
-    /// The owned worktree and branch were removed.
-    Dropped,
-    /// Recovery completed an interrupted transition.
-    Recovered,
-}
-
-/// One structured record of a successful lifecycle transition.
-///
-/// Audit events are local administrative history. They are validated and
-/// bounded, but they are neither signed nor append-only against someone who can
-/// rewrite the state directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct AuditEvent {
-    /// Schema version of this event; always [`AUDIT_SCHEMA_VERSION`] when written.
-    pub schema_version: u32,
-    /// Unique event identifier, formatted as `evt-<ulid>`.
-    pub event_id: String,
-    /// When the transition occurred.
-    pub occurred_at_unix: u64,
-    /// Which transition this records.
-    pub kind: AuditEventKind,
-    /// Capsule the event belongs to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capsule_id: Option<String>,
-    /// Repository grouping key of that capsule.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_key: Option<String>,
-    /// State the capsule left, when the transition had a distinct origin.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_state: Option<CapsuleState>,
-    /// State the capsule entered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<CapsuleState>,
-    /// Bounded transition details, such as a commit ID or patch digest.
-    ///
-    /// Evidence commands appear here by digest rather than verbatim.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub attributes: BTreeMap<String, String>,
-}
-
-/// Summary of one stored record, readable even when its schema is unsupported.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct StateRecordInspection {
-    /// Directory name of the record.
-    pub id: String,
-    /// Declared schema version, when the manifest could be parsed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<u32>,
-    /// Declared lifecycle state as raw text, without interpreting it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
-    /// Whether a `result.json` is present alongside the manifest.
-    pub has_result: bool,
-    /// Why the record could not be summarized, when it could not be.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// One capsule record that could not be read as a valid manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -704,9 +627,9 @@ pub struct UnreadableRecord {
 
 /// A capsule listing that survives individually unreadable records.
 ///
-/// [`crate::CapsuleManager::list`] stays fail-closed because policy counts
-/// depend on it. This shape is for operators who need to see the rest of a
-/// large state root when one record is corrupt.
+/// [`crate::CapsuleManager::list`] stays fail-closed, because a caller that
+/// counts records needs an exact answer. This shape is for operators who need
+/// to see the rest of a large state root when one record is corrupt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CapsuleListing {
@@ -715,89 +638,6 @@ pub struct CapsuleListing {
     /// Records that did not, ordered by identifier. Empty on a healthy root.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<UnreadableRecord>,
-}
-
-/// Inventory of a state directory, independent of schema compatibility.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct StateInspection {
-    /// Root directory that was inspected.
-    pub state_root: PathBuf,
-    /// Schema version this build can operate on.
-    pub supported_schema_version: u32,
-    /// Bytes of durable state, excluding workspaces and locks.
-    pub state_bytes: u64,
-    /// One entry per stored record, ordered by identifier.
-    pub records: Vec<StateRecordInspection>,
-    /// Number of entries in the direct idempotency index.
-    pub idempotency_record_count: u64,
-    /// Validation findings for idempotency index entries, ordered by filename.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub idempotency_records: Vec<IdempotencyRecordInspection>,
-}
-
-/// Instantaneous aggregate counters across all capsules.
-///
-/// Computed on demand. There is no collector, exporter, or background job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MetricsSnapshot {
-    /// When the snapshot was taken.
-    pub observed_at_unix: u64,
-    /// Total durable capsule records.
-    pub capsules: u64,
-    /// Records not yet dropped.
-    pub live_capsules: u64,
-    /// Records carrying a sealed result.
-    pub sealed_results: u64,
-    /// Sum of sealed patch sizes in bytes.
-    pub result_patch_bytes: u64,
-    /// Bytes of durable state, excluding workspaces and locks.
-    pub state_bytes: u64,
-    /// Bytes occupied by live capsule workspaces.
-    pub workspace_bytes: u64,
-    /// Audit events currently retained.
-    pub audit_events: u64,
-    /// Audit events that rolled off retention.
-    pub audit_events_dropped: u64,
-    /// Capsule counts keyed by lifecycle state name.
-    pub states: BTreeMap<String, u64>,
-}
-
-/// Outcome of copying durable state to a new directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct BackupReport {
-    /// State root that was copied.
-    pub source: PathBuf,
-    /// Directory the copy was written to.
-    pub destination: PathBuf,
-    /// Number of files copied.
-    pub files: u64,
-    /// Total bytes copied.
-    pub bytes: u64,
-}
-
-/// Outcome of an explicit durable-state migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MigrationReport {
-    /// State root inspected or migrated.
-    pub state_root: PathBuf,
-    /// Backup destination required before apply; absent for dry-run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backup_directory: Option<PathBuf>,
-    /// Whether changes were atomically applied.
-    pub applied: bool,
-    /// Number of capsule manifests migrated.
-    pub capsules: u64,
-    /// Number of sealed result manifests migrated.
-    pub results: u64,
-    /// Number of legacy evidence records marked unbound.
-    ///
-    /// Includes both capsule manifests and sealed result manifests, because each
-    /// persisted copy is independently migrated.
-    pub unbound_evidence: u64,
 }
 
 /// Outcome of verifying an exported receipt.
@@ -826,6 +666,8 @@ pub struct VerificationReport {
     pub changed_paths: usize,
     /// Evidence records present in the receipt.
     pub evidence_total: usize,
+    /// Evidence records that Capsule executed itself, rather than being told about.
+    pub evidence_executed: usize,
     /// Evidence records with a non-zero exit code.
     pub evidence_failed: usize,
     /// Whether the patch was additionally checked against a repository.

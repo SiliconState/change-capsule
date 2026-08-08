@@ -151,26 +151,11 @@ fn contradictory_git_state_orphans_reserved_identity_without_replacement() {
     assert_eq!(replay.id, record.capsule_id);
     assert_eq!(replay.state, CapsuleState::Orphaned);
     assert_eq!(manager.list().expect("one capsule").len(), 1);
-    // Orphaning is a successful lifecycle transition, so it must leave a
-    // record of why; otherwise the capsule is inexplicably stuck.
-    let event = replay
-        .audit_events
-        .last()
-        .expect("orphaning records an audit event");
-    assert_eq!(event.state, Some(CapsuleState::Orphaned));
-    assert_eq!(event.previous_state, Some(CapsuleState::Creating));
-    assert!(
-        event.attributes["reason"].contains("contradictory"),
-        "{:?}",
-        event.attributes
-    );
     let again = manager
         .create_idempotent(idempotent_options(&repository), "partial:git")
         .expect("orphan replay");
     assert_eq!(again.id, replay.id);
     assert_eq!(again.state, CapsuleState::Orphaned);
-    // A replay of an orphan must not append a second orphaning event.
-    assert_eq!(again.audit_events.len(), replay.audit_events.len());
 }
 
 #[test]

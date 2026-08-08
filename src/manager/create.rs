@@ -19,15 +19,6 @@ impl CapsuleManager {
         let project_key = project_key(&repository.common_dir)?;
         let _global_lock = self.store.lock_global()?;
         let _lock = self.store.lock_project(&project_key)?;
-        let policy = self.store.read_policy()?;
-        let capsules = self.store.list_capsules()?;
-        let pending_reservations =
-            if policy.max_capsules.is_some() || policy.max_live_capsules.is_some() {
-                self.store.unmaterialized_idempotency_count()?
-            } else {
-                0
-            };
-        self.enforce_create_policy(&policy, &capsules, &repository, pending_reservations)?;
         let id = new_capsule_id();
         let capsule =
             self.initial_capsule(id, options, &repository, project_key, base_commit, now()?)?;
@@ -55,17 +46,6 @@ impl CapsuleManager {
         let base_commit = self
             .git
             .resolve_commit(&repository.worktree, &options.base)?;
-        let policy = self.store.read_policy()?;
-        let (capsules, pending_reservations) =
-            if policy.max_capsules.is_some() || policy.max_live_capsules.is_some() {
-                (
-                    self.store.list_capsules()?,
-                    self.store.unmaterialized_idempotency_count()?,
-                )
-            } else {
-                (Vec::new(), 0)
-            };
-        self.enforce_create_policy(&policy, &capsules, &repository, pending_reservations)?;
         let record = IdempotencyRecord {
             schema_version: IDEMPOTENCY_RECORD_SCHEMA_VERSION,
             idempotency_key_sha256: key_digest,
@@ -246,8 +226,6 @@ impl CapsuleManager {
             checkpoints: Vec::new(),
             checkpoint: None,
             evidence: Vec::new(),
-            audit_events: Vec::new(),
-            audit_events_dropped: 0,
             result: None,
             integration: None,
             cleanup: None,
@@ -364,14 +342,6 @@ impl CapsuleManager {
     pub(super) fn activate_created_capsule(&self, capsule: &mut Capsule) -> Result<String> {
         capsule.state = CapsuleState::Active;
         capsule.updated_at_unix = now()?;
-        let base_commit = capsule.base_commit.clone();
-        append_event(
-            capsule,
-            AuditEventKind::Created,
-            Some(CapsuleState::Creating),
-            CapsuleState::Active,
-            BTreeMap::from([("base_commit".to_owned(), base_commit)]),
-        )?;
         self.store.write_capsule(capsule)?;
         Ok("completed an interrupted workspace creation".to_owned())
     }
@@ -388,16 +358,8 @@ impl CapsuleManager {
                 capsule.id
             )));
         }
-        let previous = capsule.state;
         capsule.state = CapsuleState::Orphaned;
         capsule.updated_at_unix = now()?;
-        append_event(
-            capsule,
-            AuditEventKind::Recovered,
-            Some(previous),
-            CapsuleState::Orphaned,
-            BTreeMap::from([("reason".to_owned(), reason.to_owned())]),
-        )?;
         self.store.write_capsule(capsule)?;
         Ok(format!(
             "marked an incomplete creation orphaned: {reason}; explicit inspection is required"

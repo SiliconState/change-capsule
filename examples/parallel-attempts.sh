@@ -4,7 +4,7 @@
 # The demo needs only bash, git, and this crate. It:
 #   1. creates a scratch repository with a failing script;
 #   2. runs two competing "agents" (deterministic edits) in isolated capsules;
-#   3. records real verification evidence and seals both results;
+#   3. has Capsule run the tests itself and seals both results;
 #   4. exports the winning result and verifies the receipt offline;
 #   5. shows that a tampered receipt is rejected;
 #   6. integrates the winner explicitly and cleans up, keeping both receipts.
@@ -27,6 +27,10 @@ state="$workdir/state"
 repo="$workdir/project"
 
 cap() { capsule --home "$state" "$@"; }
+
+# Read one scalar field out of a JSON response, so the demo needs no jq.
+# Only used for numbers and booleans, which never contain separators.
+json_field() { printf '%s' "$2" | tr -d ' ' | sed -n "s/.*\"$1\":\\([^,}]*\\).*/\\1/p" | head -1; }
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
@@ -59,9 +63,10 @@ create_capsule() {
 step "Attempt A: minimal fix, in its own capsule"
 IFS=$'\t' read -r id_a ws_a < <(create_capsule "approach A: minimal fix")
 sed -i.bak 's/Hallo/Hello/' "$ws_a/greet.sh" && rm -f "$ws_a/greet.sh.bak"
-if sh "$ws_a/test.sh"; then status_a=0; else status_a=$?; fi
-cap evidence "$id_a" --command "sh test.sh" --exit-code "$status_a" --summary "greeting test" > /dev/null
-echo "capsule $id_a: test exit code $status_a"
+# Capsule runs the test itself, inside the capsule, and records what it saw.
+# Nothing below has to be trusted to say the test passed.
+evidence_a=$(cap --json evidence "$id_a" -- sh test.sh)
+echo "capsule $id_a: exit $(json_field exit_code "$evidence_a"), executed by Capsule: $(json_field executed "$evidence_a")"
 
 step "Attempt B: rewrite, in a parallel capsule from the same base"
 IFS=$'\t' read -r id_b ws_b < <(create_capsule "approach B: rewrite")
@@ -69,15 +74,14 @@ cat > "$ws_b/greet.sh" <<'EOF'
 #!/bin/sh
 printf '%s\n' "Hello, World!"
 EOF
-if sh "$ws_b/test.sh"; then status_b=0; else status_b=$?; fi
-cap evidence "$id_b" --command "sh test.sh" --exit-code "$status_b" --summary "greeting test" > /dev/null
-echo "capsule $id_b: test exit code $status_b"
+evidence_b=$(cap --json evidence "$id_b" -- sh test.sh)
+echo "capsule $id_b: exit $(json_field exit_code "$evidence_b"), executed by Capsule: $(json_field executed "$evidence_b")"
 echo "primary worktree untouched: $(cat "$repo/greet.sh" | tail -1)"
 
-step "Seal both attempts; sealing refuses missing or failed evidence"
-cap close "$id_a" --require-successful-evidence > /dev/null
-cap close "$id_b" --require-successful-evidence > /dev/null
-echo "both results sealed with evidence"
+step "Seal both attempts; sealing refuses anything Capsule did not run and see pass"
+cap close "$id_a" --require-executed-evidence > /dev/null
+cap close "$id_b" --require-executed-evidence > /dev/null
+echo "both results sealed with executed evidence"
 
 step "Export the selected result as a portable receipt"
 bundle="$workdir/receipt-a"
@@ -85,9 +89,9 @@ cap export "$id_a" --output "$bundle" > /dev/null
 ls -1 "$bundle"
 
 step "Verify the receipt offline, then against the repository"
-cap verify "$bundle" --require-successful-evidence > /dev/null
+cap verify "$bundle" --require-executed-evidence > /dev/null
 echo "offline verification passed"
-cap verify "$bundle" --repo "$repo" --require-successful-evidence > /dev/null
+cap verify "$bundle" --repo "$repo" --require-executed-evidence > /dev/null
 echo "patch reproduces exactly against the pinned base"
 
 step "A tampered receipt is rejected"

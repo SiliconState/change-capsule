@@ -18,13 +18,11 @@ use crate::idempotency::{
     IdempotencyLookup, IdempotencyRecord, IdempotencyStatus, canonical_request_sha256, key_sha256,
 };
 use crate::model::{
-    AUDIT_EVENT_CAP, AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind,
-    AuditEvent, AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth,
-    CapsuleListing, CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint,
-    CheckpointJournal, Cleanup, Evidence, ExportReport, Integration, MetricsSnapshot,
-    RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, StateInspection,
+    ArtifactBundle, ArtifactDescriptor, ArtifactKind, BUNDLE_SCHEMA_VERSION, Capsule,
+    CapsuleHealth, CapsuleListing, CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary,
+    Checkpoint, CheckpointJournal, Cleanup, Evidence, ExportReport, Integration, RecoveryAction,
+    ResultKind, ResultRef, SCHEMA_VERSION,
 };
-use crate::policy::{Policy, PolicyReport};
 use crate::state::{StateStore, default_state_root, project_key};
 
 const LABEL_CAP: usize = LABEL_BYTES_LIMIT;
@@ -140,60 +138,169 @@ impl CheckpointOptions {
     }
 }
 
-/// A verification claim to attach to a capsule.
+/// How a verification record is produced.
+///
+/// The two variants are deliberately separate types rather than a flag, because
+/// everything a verifier can conclude from the resulting [`Evidence`] depends on
+/// which one was used.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct EvidenceInput {
-    /// Exact command the caller ran.
-    pub command: String,
-    /// Exit status the caller observed.
-    pub exit_code: i32,
-    /// Optional bounded summary of what happened.
-    pub summary: Option<String>,
+pub enum EvidenceInput {
+    /// Run this argument vector in the capsule workspace and record what happened.
+    ///
+    /// Capsule spawns the program directly, with no shell, and observes the exit
+    /// status and output itself. The resulting record has `executed: true`.
+    Run {
+        /// Program and arguments. The first element is the program.
+        argv: Vec<String>,
+        /// Optional summary. Defaults to the tail of the captured output.
+        summary: Option<String>,
+        /// Kill the command and fail if it runs longer than this.
+        timeout: Option<std::time::Duration>,
+    },
+    /// Record a caller-supplied claim. Capsule executes nothing and vouches for nothing.
+    Claim {
+        /// Exact command line the caller reports having run.
+        command: String,
+        /// Exit status the caller reports having observed.
+        exit_code: i32,
+        /// Optional bounded summary of what happened.
+        summary: Option<String>,
+    },
 }
 
 impl EvidenceInput {
-    /// A claim that `command` was run and exited with `exit_code`.
+    /// Have Capsule execute `argv` in the capsule workspace.
     ///
-    /// Capsule records the claim; it never executes the command. Set
-    /// [`Self::summary`] afterwards to attach bounded detail.
-    pub fn new(command: impl Into<String>, exit_code: i32) -> Self {
-        Self {
+    /// This produces the only evidence a verifier can treat as fact.
+    pub fn run<I, S>(argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Run {
+            argv: argv.into_iter().map(Into::into).collect(),
+            summary: None,
+            timeout: None,
+        }
+    }
+
+    /// Record that `command` was run elsewhere and exited with `exit_code`.
+    ///
+    /// Capsule records the claim and never executes it.
+    pub fn claim(command: impl Into<String>, exit_code: i32) -> Self {
+        Self::Claim {
             command: command.into(),
             exit_code,
             summary: None,
         }
     }
 
-    /// Attach a bounded summary to this claim.
+    /// Attach a bounded summary.
     #[must_use]
-    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
-        self.summary = Some(summary.into());
+    pub fn with_summary(mut self, text: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Run { summary, .. } | Self::Claim { summary, .. } => {
+                *summary = Some(text.into());
+            }
+        }
         self
+    }
+
+    /// Kill an executed command that runs longer than this. Ignored for a claim.
+    #[must_use]
+    pub fn with_timeout(mut self, limit: std::time::Duration) -> Self {
+        if let Self::Run { timeout, .. } = &mut self {
+            *timeout = Some(limit);
+        }
+        self
+    }
+
+    /// The command line this record will carry.
+    ///
+    /// For an executed run this renders `argv` with POSIX quoting, so an
+    /// argument containing spaces stays one argument to anyone reading the
+    /// receipt. It is a faithful rendering of what ran, not a string that was
+    /// ever handed to a shell: Capsule spawns the program directly.
+    pub fn command_line(&self) -> String {
+        match self {
+            Self::Run { argv, .. } => argv
+                .iter()
+                .map(|argument| render_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Claim { command, .. } => command.clone(),
+        }
+    }
+}
+
+/// Render one argument so a reader can tell where it starts and ends.
+fn render_argument(argument: &str) -> String {
+    let plain = !argument.is_empty()
+        && argument.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'/' | b'=' | b':' | b'+' | b'@' | b','
+                )
+        });
+    if plain {
+        argument.to_owned()
+    } else {
+        format!("'{}'", argument.replace('\'', r"'\''"))
     }
 }
 
 /// Requirements a capsule must satisfy before its result is sealed.
+///
+/// These are independent, not a ladder. In particular
+/// [`Self::require_successful_evidence`] asks something the other two do not:
+/// that **no** record anywhere on the capsule failed. That deliberately forbids
+/// the ordinary agent loop of running tests, fixing what broke, and running them
+/// again, so combine it with the others only when you really mean it.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct CloseOptions {
-    /// Refuse to seal unless evidence exists and every exit code is zero.
+    /// Refuse to seal unless evidence exists and *every* record's exit code is zero.
+    ///
+    /// A single earlier failure blocks sealing, even if the capsule has since
+    /// been fixed and re-verified.
     pub require_successful_evidence: bool,
-    /// Refuse to seal unless successful evidence is bound to the patch being sealed.
+    /// Refuse to seal unless some successful record is bound to the patch being sealed.
     pub require_current_successful_evidence: bool,
+    /// Refuse to seal unless Capsule itself ran a command that passed on this patch.
+    ///
+    /// This is the strongest useful requirement, and it subsumes the one above:
+    /// the record it looks for is executed, passing, and bound to this patch.
+    pub require_executed_evidence: bool,
 }
 
 impl CloseOptions {
-    /// Sealing policy for close.
-    ///
-    /// `CloseOptions::default()` seals without requiring evidence.
-    pub fn new(
+    /// Seal with an explicit combination of requirements.
+    #[must_use]
+    pub fn requiring(
         require_successful_evidence: bool,
         require_current_successful_evidence: bool,
+        require_executed_evidence: bool,
     ) -> Self {
         Self {
             require_successful_evidence,
             require_current_successful_evidence,
+            require_executed_evidence,
+        }
+    }
+
+    /// Seal only when Capsule ran a passing command against the exact sealed patch.
+    ///
+    /// This is the level a merge gate should use. It does not also demand a
+    /// spotless history: an attempt whose tests failed and were then fixed
+    /// still seals, because what matters is the state of the patch being sealed.
+    #[must_use]
+    pub fn executed() -> Self {
+        Self {
+            require_successful_evidence: false,
+            require_current_successful_evidence: false,
+            require_executed_evidence: true,
         }
     }
 }
@@ -256,7 +363,6 @@ pub struct CapsuleManager {
     git: Git,
 }
 
-mod admin;
 mod artifacts;
 mod create;
 mod lifecycle;
@@ -341,121 +447,6 @@ fn file_uri(path: &Path) -> Result<String> {
     Ok(encoded)
 }
 
-fn bounded_error(error: &Error) -> String {
-    error
-        .to_string()
-        .chars()
-        .take(512)
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-fn append_event(
-    capsule: &mut Capsule,
-    kind: AuditEventKind,
-    previous_state: Option<CapsuleState>,
-    state: CapsuleState,
-    attributes: BTreeMap<String, String>,
-) -> Result<()> {
-    let occurred_at_unix = now()?.max(
-        capsule
-            .audit_events
-            .last()
-            .map_or(capsule.created_at_unix, |event| event.occurred_at_unix),
-    );
-    if capsule.audit_events.len() >= AUDIT_EVENT_CAP {
-        capsule.audit_events.remove(0);
-        capsule.audit_events_dropped = capsule.audit_events_dropped.saturating_add(1);
-    }
-    capsule.audit_events.push(AuditEvent {
-        schema_version: AUDIT_SCHEMA_VERSION,
-        event_id: format!("evt-{}", Ulid::generate().to_string().to_ascii_lowercase()),
-        occurred_at_unix,
-        kind,
-        capsule_id: Some(capsule.id.clone()),
-        project_key: Some(capsule.project_key.clone()),
-        previous_state,
-        state: Some(state),
-        attributes,
-    });
-    Ok(())
-}
-
-fn state_name(state: CapsuleState) -> &'static str {
-    match state {
-        CapsuleState::Creating => "creating",
-        CapsuleState::Checkpointing => "checkpointing",
-        CapsuleState::Active => "active",
-        CapsuleState::Closed => "closed",
-        CapsuleState::Integrating => "integrating",
-        CapsuleState::Integrated => "integrated",
-        CapsuleState::Dropping => "dropping",
-        CapsuleState::Orphaned => "orphaned",
-        CapsuleState::Dropped => "dropped",
-    }
-}
-
-fn repository_allowed(policy: &Policy, repository: &Path) -> bool {
-    policy.allowed_repository_roots.is_empty()
-        || policy
-            .allowed_repository_roots
-            .iter()
-            .any(|root| repository.starts_with(root))
-}
-
-fn enforce_limit(name: &str, observed: u64, limit: Option<u64>) -> Result<()> {
-    if let Some(limit) = limit {
-        if observed > limit {
-            return Err(Error::PolicyViolation(format!(
-                "{name} {observed} exceeds limit {limit}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn enforce_next_limit(name: &str, observed: u64, limit: Option<u64>) -> Result<()> {
-    if let Some(limit) = limit {
-        let next = observed.saturating_add(1);
-        if next > limit {
-            return Err(Error::PolicyViolation(format!(
-                "creating a capsule would make {name} {next}, exceeding limit {limit}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn check_limit(violations: &mut Vec<String>, name: &str, observed: u64, limit: Option<u64>) {
-    if let Some(limit) = limit {
-        if observed > limit {
-            violations.push(format!("{name} {observed} exceeds limit {limit}"));
-        }
-    }
-}
-
-fn check_capsule_limit(
-    violations: &mut Vec<String>,
-    id: &str,
-    name: &str,
-    observed: u64,
-    limit: Option<u64>,
-) {
-    if let Some(limit) = limit {
-        if observed > limit {
-            violations.push(format!(
-                "capsule {id} {name} {observed} exceeds limit {limit}"
-            ));
-        }
-    }
-}
-
 fn safe_ignored_relative(ignored: &crate::model::GitPath) -> Result<PathBuf> {
     let relative = ignored.to_path_buf().ok_or_else(|| {
         Error::InvalidInput(format!(
@@ -507,44 +498,6 @@ fn ignored_content_inventory(
         bytes: total,
         content_sha256: hex::encode(digest.finalize()),
     })
-}
-
-fn ignored_usage(workspace: &Path, ignored_paths: &[crate::model::GitPath]) -> Result<u64> {
-    let mut total = 0_u64;
-    let mut seen = BTreeSet::new();
-    for ignored in ignored_paths {
-        let relative = safe_ignored_relative(ignored)?;
-        usage_path(workspace, &relative, &mut seen, &mut total)?;
-    }
-    Ok(total)
-}
-
-fn usage_path(
-    workspace: &Path,
-    relative: &Path,
-    seen: &mut BTreeSet<PathBuf>,
-    total: &mut u64,
-) -> Result<()> {
-    if !seen.insert(relative.to_path_buf()) {
-        return Ok(());
-    }
-    let path = workspace.join(relative);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        let mut entries = fs::read_dir(&path)
-            .map_err(|error| io(&path, error))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| io(&path, error))?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            usage_path(workspace, &relative.join(entry.file_name()), seen, total)?;
-        }
-        return Ok(());
-    }
-    *total = total
-        .checked_add(metadata.len())
-        .ok_or_else(|| Error::UnsafeState("ignored byte count overflowed".to_owned()))?;
-    Ok(())
 }
 
 fn inventory_path(

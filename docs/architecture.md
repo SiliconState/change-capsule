@@ -11,9 +11,8 @@ How Capsule is put together: what it owns, where its state lives, and how a resu
 - [Protocol surfaces](#protocol-surfaces)
 - [Lifecycle](#lifecycle)
 - [Result construction](#result-construction)
+- [Verification runner](#verification-runner)
 - [Artifact interface](#artifact-interface)
-- [Policy and quotas](#policy-and-quotas)
-- [State administration](#state-administration)
 - [Integration](#integration)
 - [Library and CLI packaging](#library-and-cli-packaging)
 - [Future-compatible seams](#future-compatible-seams)
@@ -58,11 +57,11 @@ Git remains the source of truth for repository content. Capsule state provides l
                          │ Rust API or CLI/JSON
 ┌────────────────────────▼────────────────────────────────┐
 │ CapsuleManager                                           │
-│ state machine · validation · sealing · policy           │
+│ state machine · validation · sealing · execution        │
 ├────────────────────────┬────────────────────────────────┤
 │ StateStore             │ Git adapter                    │
-│ atomic JSON + backups  │ pinned executable              │
-│ artifacts + audit      │ scrubbed GIT_* environment     │
+│ atomic JSON writes     │ pinned executable              │
+│ artifacts + receipts   │ scrubbed GIT_* environment     │
 │ global/project locks   │ hooks/signing/ext diff off     │
 ├────────────────────────┴────────────────────────────────┤
 │ Native filesystem and system Git                        │
@@ -75,10 +74,9 @@ Default roots follow `CAPSULE_HOME`, then `XDG_STATE_HOME`/`HOME` on Unix-like p
 
 ```text
 change-capsule/
-├── policy.json                  # optional, versioned policy
 ├── capsules/
 │   └── cap-<ulid>/
-│       ├── capsule.json         # lifecycle plus bounded audit events
+│       ├── capsule.json         # lifecycle manifest
 │       ├── result.json          # after close
 │       └── result.patch         # after close
 ├── idempotency/
@@ -91,7 +89,7 @@ change-capsule/
     └── project-<key>.lock
 ```
 
-On Unix, directories are repaired to `0700` and state files to `0600`. Bounded state and artifact reads open with `O_NOFOLLOW | O_NONBLOCK`, then reject non-regular or oversized opened descriptors, so symlinks and special files cannot redirect or wedge a read. Windows uses reparse-point-aware opens and rejects reparse-point descriptors after opening. Writes use a temporary file, `fsync`, atomic persistence, and parent-directory sync. Artifact exports and backups are assembled in temporary sibling directories, reserve a new destination without clobbering, and publish `bundle.json` or `backup.json` last as a completion marker.
+On Unix, directories are repaired to `0700` and state files to `0600`. Bounded state and artifact reads open with `O_NOFOLLOW | O_NONBLOCK`, then reject non-regular or oversized opened descriptors, so symlinks and special files cannot redirect or wedge a read. Windows uses reparse-point-aware opens and rejects reparse-point descriptors after opening. Writes use a temporary file, `fsync`, atomic persistence, and parent-directory sync. Artifact exports are assembled in a temporary sibling directory, reserve a new destination without clobbering, and publish `bundle.json` last as a completion marker.
 
 The project key is a truncated SHA-256 of the canonical Git common-directory path. It avoids exposing repository names in state paths while grouping locks and workspaces by repository identity.
 
@@ -138,7 +136,7 @@ Idempotent creation publishes the reservation before the first capsule-directory
 
 `creating`, `checkpointing`, `integrating`, and `dropping` are journal states. Prepared checkpoint and integration commits are temporarily protected by namespaced Git refs until they become reachable from the capsule or target branch. `recover` completes only transitions whose worktree identity, Git ref or branch, commit parent, patch, and journal agree; ambiguous state remains available for explicit diagnosis.
 
-Successful lifecycle operations retain the newest 128 versioned `AuditEvent` records in the capsule manifest and increment `audit_events_dropped` when older records roll off. Events identify the capsule/project, transition, timestamp, and bounded attributes; evidence commands are represented by SHA-256 rather than copied into event attributes. `audit_log` merges per-capsule records into an administrative stream while preserving each capsule's order. `metrics` computes aggregate state, artifact-byte, retained/dropped-event, and storage counters on demand. There is no daemon, telemetry exporter, network transmission, or background collector.
+Every lifecycle transition is recorded in the capsule manifest as state: the current `state`, the journals for interrupted transitions, checkpoints, evidence, and the result seal. There is no separate event log, daemon, telemetry exporter, or background collector; a reader that wants history reads the manifest.
 
 ## Result construction
 
@@ -160,7 +158,7 @@ The real worktree index is not modified by status, diff, close, or drift checks.
 - Git-ignored untracked files are intentionally outside the patch unless the repository's ignore rules are changed to include them.
 - Dirty nested submodules and unregistered embedded repositories remain rejected.
 
-**Ignored-content provenance.** Close computes a complete ignored-content inventory before and after the tracked snapshot transaction and requires exact agreement on path identities, total bytes, and structural content SHA-256 before publishing. The stable final inventory is used for policy and recorded in the sealed result as provenance. The hash uses a versioned domain and explicit native-path encoding: Unix pathname bytes (including non-UTF-8 names and symlink targets), Windows UTF-16LE code units, or fail-closed UTF-8 on other platforms.
+**Ignored-content provenance.** Close computes a complete ignored-content inventory before and after the tracked snapshot transaction and requires exact agreement on path identities, total bytes, and structural content SHA-256 before publishing. The stable final inventory is recorded in the sealed result as provenance. The hash uses a versioned domain and explicit native-path encoding: Unix pathname bytes (including non-UTF-8 names and symlink targets), Windows UTF-16LE code units, or fail-closed UTF-8 on other platforms.
 
 A closed result is:
 
@@ -173,48 +171,38 @@ complete patch SHA-256 and byte count
 changed paths
 ignored-path inventory plus excluded-content byte count and SHA-256
 checkpoint records
-caller-recorded evidence, including the current patch digest for schema-v4 records
+evidence records, each carrying the patch digest it was bound to and whether Capsule executed it
 creation and seal timestamps
 ```
 
 `commit` means the worktree was clean and all changes from base were committed. `patch` means uncommitted state was included. Both carry the same complete patch and can be integrated identically.
+
+## Verification runner
+
+`EvidenceInput::Run` spawns the program directly, with the capsule workspace as
+its working directory, no shell, and no inherited standard input. Standard
+output and error are drained by two threads, so a chatty command cannot block on
+a full pipe, and both are bounded at 8 MiB combined; more than that fails rather
+than being silently truncated, because a digest over truncated output would not
+describe the run. The digest is domain-separated and length-framed across the
+two streams, so output cannot be shifted between them without changing it.
+
+The command runs while **no lock is held**. A test suite can take minutes, and
+holding the global lock for that long would serialize every other capsule in the
+state root, which is exactly what a harness running attempts in parallel is
+trying to avoid. Capsule reads the capsule and validates worktree ownership
+before running, then re-acquires both locks, re-reads, and re-validates before
+recording. A capsule closed or dropped while the command ran therefore fails to
+record, rather than writing into a sealed manifest.
+
+An optional timeout kills the spawned process. It does not kill a process group;
+see `docs/security.md`.
 
 ## Artifact interface
 
 A sealed result exposes two `ArtifactDescriptor` values for `result.json` and `result.patch`. Each descriptor contains a media type, byte length, SHA-256 digest, `sha256:` content address, and percent-encoded local `file://` URI. Embedders may open either artifact as a bounded `ArtifactReader`, publish streams through the runtime-neutral `ArtifactSink` trait, or export both artifacts into a no-clobber destination whose `bundle.json` completion marker is published last. Each operation reads and validates one immutable in-memory byte snapshot before exposing it, preventing later same-sized filesystem mutation from diverging from its descriptors. Core assigns no cloud, CAS, or runtime-specific transport.
 
 An exported bundle is a portable receipt. `verify_bundle` (CLI: `capsule verify`) re-checks it with no capsule state: descriptor digests and sizes, schema versions, and internal result consistency, plus — given a repository — that the pinned base exists and the sealed patch applies to it, reproducing exactly the sealed bytes and changed paths. Emitters and verifiers never need to share a machine.
-
-## Policy and quotas
-
-`policy.json` has an independent schema version. An absent file means permissive defaults under the fixed 64 MiB patch safety bound. Policy may allowlist canonical repository roots and limit total/live records, age, observed state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes.
-
-How limits are measured:
-
-- Patch and changed-path limits always measure the complete base-to-current result, including at a checkpoint boundary rather than only that checkpoint's delta.
-- Lifecycle mutations check applicable policy while holding the global and project locks.
-- When a count limit is configured, capsule-record and live-capsule counts also include reservations whose manifest does not exist yet, so a burst of interrupted idempotent creations cannot slip past a configured cap.
-- Usage that no configured policy limit references is not measured; permissive defaults avoid policy-only state/workspace directory accounting.
-- Close is the deliberate exception: it always reads two complete ignored-content inventories to establish stable sealed provenance.
-- Ignored-byte policy checks outside close use file metadata rather than reading content.
-- `policy_report` evaluates active and sealed results without mutating them and records uninspectable usage as a violation.
-
-Byte/count quotas are cooperative checkpoints, not kernel reservations: workers can grow workspaces between capsule operations, and another same-user process can consume disk independently. Every relevant core mutation rechecks observed usage; callers that need continuous hard enforcement must add filesystem or OS quotas.
-
-## State administration
-
-- **`inspect_state`** reports record schema/state summaries without deserializing records as the current schema, and reports the idempotency index's record count plus per-entry validation findings keyed by indexed digest.
-- **`backup_state`** copies recognized durable manifests, results, patches, policy, and the idempotency index in its indexed layout under all known project locks; workspaces and Git repositories are deliberately excluded.
-- **State-byte accounting** includes the index, and migration does not reinterpret the index's independent schema.
-- **Migration** of schema-v3 state happens only through explicit dry-run/apply operations. Apply requires and completes an external backup first, then uses a local rollback journal; migrated v3 evidence remains unbound. Exported v3 receipts continue to verify.
-
-A reserved export/backup directory without its marker is incomplete and is never reused implicitly.
-
-Administrative reads (`inspect_state`, `backup_state`, `metrics`, `audit_log`)
-take the global lock plus every known project lock, so they serialise against all
-capsule mutation. The idempotency index grows one record per capsule and is never
-reclaimed, because reclaiming would make a key reusable; it is bounded by the same
-`max_capsules` limit as capsule records, which are likewise retained after drop.
 
 ## Integration
 
@@ -240,8 +228,6 @@ The default `cli` feature enables Clap. Consumers embedding only the library may
 
 Potential additions that preserve this boundary:
 
-- signed result attestations;
-- caller-defined evidence schemas;
 - artifact import and verification;
 - Jujutsu or Sapling backends behind a repository-driver trait;
 - optional process-job provenance linked to a capsule;

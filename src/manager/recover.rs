@@ -55,14 +55,6 @@ impl CapsuleManager {
         };
         if let Some(action) = action {
             capsule.updated_at_unix = now()?;
-            let recovered_state = capsule.state;
-            append_event(
-                &mut capsule,
-                AuditEventKind::Recovered,
-                Some(previous),
-                recovered_state,
-                BTreeMap::from([("action".to_owned(), action.clone())]),
-            )?;
             self.store.write_capsule(&capsule)?;
             Ok(Some(RecoveryAction {
                 capsule_id: capsule.id.clone(),

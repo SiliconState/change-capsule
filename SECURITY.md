@@ -34,9 +34,15 @@ short, these **are** in scope:
 These are **not** vulnerabilities, because they are documented properties rather
 than defects:
 
-- **Evidence is caller-asserted.** Capsule records the command and exit code a
-  caller reports; it never runs them. A false evidence claim is a false claim,
-  not a Capsule bug. The receipt proves change *integrity*, not change *quality*.
+- **A claimed evidence record is caller-asserted.** For `EvidenceInput::Claim`,
+  Capsule records the command and exit code a caller reports and runs nothing.
+  A false claim is a false claim, not a Capsule bug. Use
+  `--require-executed-evidence` when that matters: it accepts only records
+  produced by a command Capsule ran itself.
+- **Executed evidence still trusts the producing host.** Capsule observed the
+  exit code and output, so the caller cannot lie about them. A compromised host
+  running a modified binary still can. That boundary is stated in every
+  attestation as `producing-host-was-uncompromised`.
 - **The workspace is not a sandbox.** It isolates Git state, not processes,
   network, or credentials. Run untrusted code under a real sandbox.
 - **The threat model assumes one trusted local user.** A same-user process can

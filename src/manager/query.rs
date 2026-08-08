@@ -23,7 +23,7 @@ impl CapsuleManager {
     /// Summarize capsules, reporting unreadable records rather than failing.
     ///
     /// [`Self::list`] fails closed on the first malformed record, which is
-    /// correct for policy but leaves an operator with no way to see the rest of
+    /// correct for exact counts but leaves an operator with no way to see the rest of
     /// a large state root. This returns everything that reads, plus a bounded
     /// description of everything that did not.
     pub fn list_reporting(&self) -> Result<CapsuleListing> {

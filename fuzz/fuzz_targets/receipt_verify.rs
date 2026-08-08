@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // No repository: this target is about parsing and digest checking, not Git.
-    let options = VerifyOptions::new(false, false, None);
+    let options = VerifyOptions::integrity();
     let verified = verify_bundle(root, &options).is_ok();
 
     // Attestation must succeed exactly when verification does. A statement for

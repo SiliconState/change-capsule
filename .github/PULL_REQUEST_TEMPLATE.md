@@ -1,28 +1,23 @@
 ## What this changes
 
-<!-- What behaviour differs after this lands, and why. -->
+<!-- One or two sentences. Link the issue if there is one. -->
 
-## Receipt protocol
+## Why
 
-This repository lands changes as two commits: the implementation, then a commit
-adding only `receipts/required/{bundle.json,result.json,result.patch}`. See
-[CONTRIBUTING.md](../CONTRIBUTING.md).
-
-- [ ] The tip commit changes only the three receipt artifacts
-- [ ] The receipt's pinned base equals this PR's base commit
-- [ ] No amend/squash/rebase since the receipt was sealed
-- [ ] Evidence recorded in the receipt reflects commands actually run
+<!-- What problem does this solve? If it narrows or widens what Capsule proves,
+say so, and update docs/security.md in this same change. -->
 
 ## Checks
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
 - [ ] `cargo test --all-features --locked`
-- [ ] Cross-target clippy for `x86_64-pc-windows-msvc` and `x86_64-apple-darwin`
-- [ ] `bash scripts/check-release-pins.sh`
+- [ ] `CAPSULE_BIN="$PWD/target/debug/capsule" bash scripts/self-gate.sh`
+- [ ] New safety behaviour has a regression test that fails without the fix.
 
-## Safety
+Cross-compiling catches most platform breakage before CI does:
 
-- [ ] New safety behaviour has a regression that fails without the fix
-- [ ] Public API additions are `#[non_exhaustive]`-compatible
-- [ ] `docs/security.md` updated if what Capsule proves changed
+```sh
+cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+cargo clippy --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
+```

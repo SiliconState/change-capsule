@@ -16,11 +16,21 @@ inputs:
       the sealed patch must apply to it cleanly.
     required: false
     default: "."
-  require-successful-evidence:
+  require-executed-evidence:
     description: >-
-      Reject receipts with no evidence or any non-zero evidence exit code.
+      Reject unless Capsule itself ran a passing command against the sealed
+      patch. This is the only evidence check that verifies a fact rather than an
+      assertion, and it is the one to set in a merge gate.
     required: false
     default: "true"
+  require-successful-evidence:
+    description: >-
+      Reject receipts in which *any* record failed, including an earlier attempt
+      that was later fixed. This is stricter than it sounds and is off by
+      default: it rejects a perfectly good receipt whose tests failed once
+      before passing. Evidence at this level may also be a caller assertion.
+    required: false
+    default: "false"
   verify-head:
     description: >-
       Also require that the checked-out tree equals the pinned base plus the
@@ -36,7 +46,7 @@ inputs:
       Version of the change-capsule crate to install. Pass an empty string to
       install the newest published release (disables the binary cache).
     required: false
-    default: "0.2.0"
+    default: "0.3.0"
 
 outputs:
   verified:
@@ -103,11 +113,13 @@ runs:
       run: |
         args=(--bundle "$INPUT_BUNDLE" --repo "$INPUT_REPO")
         [[ "$INPUT_REQUIRE_EVIDENCE" == "true" ]] && args+=(--require-successful-evidence)
+        [[ "$INPUT_REQUIRE_EXECUTED" == "true" ]] && args+=(--require-executed-evidence)
         [[ "$INPUT_VERIFY_HEAD" == "true" ]] && args+=(--verify-head)
         bash "$ACTION_PATH/scripts/verify-gate.sh" "${args[@]}"
       env:
         INPUT_BUNDLE: ${{ inputs.bundle }}
         INPUT_REPO: ${{ inputs.repo }}
         INPUT_REQUIRE_EVIDENCE: ${{ inputs.require-successful-evidence }}
+        INPUT_REQUIRE_EXECUTED: ${{ inputs.require-executed-evidence }}
         INPUT_VERIFY_HEAD: ${{ inputs.verify-head }}
         ACTION_PATH: ${{ github.action_path }}

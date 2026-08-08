@@ -84,9 +84,6 @@ pub enum Error {
         /// Version this build supports.
         supported: u32,
     },
-    /// Configured policy forbids the operation.
-    #[error("policy violation: {0}")]
-    PolicyViolation(String),
     /// The requested artifact is not part of this capsule's sealed result.
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),

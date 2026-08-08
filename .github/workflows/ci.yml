@@ -69,14 +69,6 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build --dev
 
-  # The published-action pin and the committed receipt schema must move
-  # together at release; drift between them turns main red.
-  release-pins:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: bash scripts/check-release-pins.sh
-
   demo:
     runs-on: ubuntu-latest
     steps:
@@ -86,63 +78,8 @@ jobs:
       - run: cargo build --all-features
       - name: Run the parallel-attempts walkthrough
         run: CAPSULE_BIN="$PWD/target/debug/capsule" bash examples/parallel-attempts.sh
-
-  # Mandatory dogfood gate. The branch tip must be a receipt-only envelope
-  # commit whose sole parent is the exact implementation tree Capsule sealed.
-  receipt-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          # Pull requests normally check out a synthetic merge commit. Verify
-          # the contributor's actual two-commit protocol instead.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Stress the committed-receipt binder
-        run: bash scripts/test-committed-receipt.sh
-      - name: Bind the receipt to its implementation parent
-        id: receipt
-        run: |
-          bash scripts/prepare-committed-receipt.sh \
-            --bundle receipts/required \
-            --output "$RUNNER_TEMP/capsule-sealed-tree"
-      - name: Gate on the committed receipt with the published action
-        id: gate
-        uses: SiliconState/change-capsule@v0
-        with:
-          bundle: ./receipts/required
-          repo: ${{ steps.receipt.outputs.repo }}
-          require-successful-evidence: "true"
-          verify-head: "true"
-          version: "0.2.0"
-      - name: Gate on the committed receipt with the current source binary
-        env:
-          SEALED_REPO: ${{ steps.receipt.outputs.repo }}
-        run: |
-          cargo build --all-features
-          CAPSULE_BIN="$PWD/target/debug/capsule" \
-            bash scripts/verify-gate.sh \
-              --bundle receipts/required \
-              --repo "$SEALED_REPO" \
-              --require-successful-evidence \
-              --verify-head
-      - name: Confirm the gate bound the exact implementation tree
-        env:
-          SEALED_REPO: ${{ steps.receipt.outputs.repo }}
-          RECEIPT_PARENT: ${{ steps.receipt.outputs.receipt-parent }}
-          RECEIPT_BASE: ${{ steps.receipt.outputs.implementation-base }}
-          VERIFIED_BASE: ${{ steps.gate.outputs.base-commit }}
-          EXPECTED_BASE: ${{ github.event.pull_request.base.sha || github.event.before || steps.receipt.outputs.implementation-base }}
-          VERIFIED: ${{ steps.gate.outputs.verified }}
-          CAPSULE_ID: ${{ steps.gate.outputs.capsule-id }}
-        run: |
-          test "$VERIFIED" = "true"
-          test -n "$CAPSULE_ID"
-          test "$RECEIPT_PARENT" = "$(git -C "$SEALED_REPO" rev-parse HEAD)"
-          test "$VERIFIED_BASE" = "$RECEIPT_BASE"
-          test "$RECEIPT_BASE" = "$EXPECTED_BASE"
-          echo "gate verified $CAPSULE_ID"
+      - name: Gate a freshly produced receipt the way a consumer would
+        run: CAPSULE_BIN="$PWD/target/debug/capsule" bash scripts/self-gate.sh
 
   dependency-policy:
     runs-on: ubuntu-latest

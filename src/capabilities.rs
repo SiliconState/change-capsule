@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::model::{BUNDLE_SCHEMA_VERSION, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION};
+use crate::model::{BUNDLE_SCHEMA_VERSION, SCHEMA_VERSION};
 
 /// Schema version of the static capability document.
 pub const CAPABILITY_SCHEMA_VERSION: u32 = 1;
@@ -31,8 +31,6 @@ pub const IDEMPOTENCY_KEY_BYTES_LIMIT: usize = 256;
 pub struct CapabilitySchemas {
     /// Durable capsule/result schemas this build reads and writes.
     pub durable_read_write: Vec<u32>,
-    /// Durable capsule/result schemas this build can explicitly migrate.
-    pub durable_migrate_from: Vec<u32>,
     /// Portable result schemas accepted by receipt verification.
     pub receipt_verify: Vec<u32>,
     /// Exported bundle schemas accepted by this build.
@@ -101,12 +99,11 @@ impl Capabilities {
                 "receipt.export.v1",
                 "receipt.verify.v1",
                 "receipt.attest.intoto.v1",
-                "state.inspect.v1",
+                "evidence.executed.v1",
             ],
             schemas: CapabilitySchemas {
                 durable_read_write: vec![SCHEMA_VERSION],
-                durable_migrate_from: vec![LEGACY_SCHEMA_VERSION],
-                receipt_verify: vec![LEGACY_SCHEMA_VERSION, SCHEMA_VERSION],
+                receipt_verify: vec![SCHEMA_VERSION],
                 bundle: vec![BUNDLE_SCHEMA_VERSION],
                 idempotency_record: vec![IDEMPOTENCY_RECORD_SCHEMA_VERSION],
             },

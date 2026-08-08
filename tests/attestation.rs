@@ -53,7 +53,8 @@ impl Fixture {
         manager
             .add_evidence(
                 &capsule.id,
-                EvidenceInput::new("cargo test".to_owned(), 0).with_summary("all green".to_owned()),
+                EvidenceInput::claim("cargo test".to_owned(), 0)
+                    .with_summary("all green".to_owned()),
             )
             .expect("evidence");
         manager
@@ -68,7 +69,7 @@ impl Fixture {
 }
 
 fn plain() -> VerifyOptions {
-    VerifyOptions::new(false, false, None)
+    VerifyOptions::requiring(false, false, false)
 }
 
 /// in-toto discourages `.` and `$` in field names for query safety.
@@ -133,7 +134,7 @@ fn statement_conforms_to_in_toto_v1() {
 
 /// A statement with empty optional collections must survive a round trip.
 ///
-/// `links` and `claimed_evidence` are omitted from the JSON when empty, so the
+/// `links` and `evidence` are omitted from the JSON when empty, so the
 /// deserializer must treat their absence as empty rather than as an error.
 #[test]
 fn minimal_statement_round_trips_through_its_own_types() {
@@ -161,10 +162,7 @@ fn minimal_statement_round_trips_through_its_own_types() {
     let bytes = serde_json::to_vec(&statement).expect("serialize");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("as value");
     assert!(value["predicate"].get("links").is_none(), "{value}");
-    assert!(
-        value["predicate"].get("claimed_evidence").is_none(),
-        "{value}"
-    );
+    assert!(value["predicate"].get("evidence").is_none(), "{value}");
     let reparsed: change_capsule::Statement =
         serde_json::from_slice(&bytes).expect("omitted collections must deserialize as empty");
     assert_eq!(reparsed, statement);
@@ -200,23 +198,21 @@ fn attestation_refuses_to_launder_a_tampered_receipt() {
 }
 
 #[test]
-fn evidence_is_labelled_as_claimed_and_bound_only_when_it_really_is() {
+fn evidence_is_labelled_as_unexecuted_and_bound_only_when_it_really_is() {
     let fixture = Fixture::new();
     let receipt = fixture.sealed_receipt();
     let statement = attest_bundle(&receipt, &plain()).expect("attest");
     let value = serde_json::to_value(&statement).expect("json");
     let predicate = &value["predicate"];
 
-    // The field is named so no consumer mistakes an assertion for a result.
-    assert!(predicate.get("evidence").is_none());
-    let claims = predicate["claimed_evidence"]
-        .as_array()
-        .expect("claimed_evidence");
+    let claims = predicate["evidence"].as_array().expect("evidence");
     assert_eq!(claims.len(), 1);
     let claim = &claims[0];
     assert_eq!(claim["command"], "cargo test");
     assert_eq!(claim["exit_code"], 0);
-    // Schema-v4 evidence is bound to the exact sealed patch.
+    // Nothing ran this: the record must say so, and carry no output digest.
+    assert_eq!(claim["executed"], false);
+    assert!(claim.get("output_sha256").is_none());
     assert_eq!(claim["current_for_sealed_patch"], true);
     assert_eq!(
         claim["bound_patch_sha256"],
@@ -238,7 +234,7 @@ fn evidence_is_labelled_as_claimed_and_bound_only_when_it_really_is() {
         .map(|v| v.as_str().expect("str"))
         .collect();
     assert!(proves.contains(&"patch-applies-to-pinned-base"));
-    assert!(refutes.contains(&"claimed-evidence-command-actually-ran"));
+    assert!(refutes.contains(&"evidence-command-actually-ran"));
     assert!(refutes.contains(&"human-or-agent-authorship"));
 }
 
@@ -246,7 +242,8 @@ fn evidence_is_labelled_as_claimed_and_bound_only_when_it_really_is() {
 fn repository_bound_attestation_matches_the_verified_base() {
     let fixture = Fixture::new();
     let receipt = fixture.sealed_receipt();
-    let options = VerifyOptions::new(false, false, Some(fixture.repo.clone()));
+    let options =
+        VerifyOptions::requiring(false, false, false).with_repository(fixture.repo.clone());
     let statement = attest_bundle(&receipt, &options).expect("attest against repository");
     let head = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
     assert_eq!(statement.predicate.base_commit, head.trim());

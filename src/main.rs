@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use change_capsule::{
     Author, CapsuleManager, CheckpointOptions, CloseOptions, CreateOptions, EvidenceInput,
-    IntegrateOptions, Policy, VerifyOptions, verify_authenticated_bundle, verify_bundle,
+    IntegrateOptions, VerifyOptions, verify_authenticated_bundle, verify_bundle,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -71,14 +71,6 @@ enum Command {
     Verify(VerifyArgs),
     /// Emit an in-toto Statement for a verified receipt, for SLSA/Sigstore tooling.
     Attest(AttestArgs),
-    /// Show structured lifecycle audit events for one capsule or all capsules.
-    Audit(AuditArgs),
-    /// Show an aggregate observability snapshot.
-    Metrics,
-    /// Read, replace, or evaluate resource and repository policy.
-    Policy(PolicyArgs),
-    /// Inspect or back up durable state.
-    State(StateArgs),
     /// Commit the capsule's current changes as a durable checkpoint.
     Checkpoint(CheckpointArgs),
     /// Attach externally-run verification evidence to an active capsule.
@@ -148,12 +140,6 @@ struct DiffArgs {
     /// Write patch bytes to a file instead of standard output.
     #[arg(long)]
     output: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct AuditArgs {
-    /// Capsule ID. Omit to read the administrative event stream.
-    id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -228,6 +214,10 @@ struct VerifyArgs {
     #[arg(long)]
     require_current_successful_evidence: bool,
 
+    /// Reject unless Capsule itself ran a passing command against the sealed patch.
+    #[arg(long)]
+    require_executed_evidence: bool,
+
     /// Raw 64-byte detached Ed25519 signature file.
     #[arg(long, requires = "trusted_public_key")]
     signature: Option<PathBuf>,
@@ -235,54 +225,6 @@ struct VerifyArgs {
     /// Raw 32-byte trusted Ed25519 public key supplied out of band.
     #[arg(long, requires = "signature")]
     trusted_public_key: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct PolicyArgs {
-    #[command(subcommand)]
-    command: PolicyCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum PolicyCommand {
-    /// Show the effective policy; absent policy.json means permissive defaults.
-    Show,
-    /// Evaluate all current records and workspaces against the effective policy.
-    Check,
-    /// Replace policy.json from a versioned JSON document.
-    Set {
-        #[arg(long)]
-        file: PathBuf,
-    },
-}
-
-#[derive(Debug, Args)]
-struct StateArgs {
-    #[command(subcommand)]
-    command: StateCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum StateCommand {
-    /// Inspect records without requiring their schema to be supported.
-    Inspect,
-    /// Copy durable manifests, results, patches, and policy to a new directory.
-    Backup {
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Validate or apply the explicit schema-v3 to schema-v4 migration.
-    Migrate {
-        /// Apply only after creating the required backup.
-        #[arg(long, conflicts_with = "dry_run")]
-        apply: bool,
-        /// Validate and report without mutation (the default).
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
-        /// New external backup directory; required with --apply and invalid for dry-run.
-        #[arg(long, required_if_eq("apply", "true"), requires = "apply")]
-        backup: Option<PathBuf>,
-    },
 }
 
 #[derive(Debug, Args)]
@@ -300,17 +242,28 @@ struct CheckpointArgs {
 struct EvidenceArgs {
     id: String,
 
-    /// Exact verification command run by the caller.
-    #[arg(long)]
-    command: String,
+    /// Record a caller-supplied claim instead of running anything.
+    ///
+    /// Capsule executes nothing and vouches for nothing. Prefer the executed
+    /// form: pass the command after `--` and let Capsule run it.
+    #[arg(long, requires = "exit_code")]
+    claim: Option<String>,
 
-    /// Exit code observed by the caller.
-    #[arg(long)]
-    exit_code: i32,
+    /// Exit code for --claim.
+    #[arg(long, requires = "claim")]
+    exit_code: Option<i32>,
 
-    /// Bounded human- or machine-generated result summary.
+    /// Kill an executed command after this many seconds.
+    #[arg(long, conflicts_with = "claim")]
+    timeout_seconds: Option<u64>,
+
+    /// Bounded result summary. Defaults to the tail of captured output.
     #[arg(long)]
     summary: Option<String>,
+
+    /// Command to run inside the capsule workspace, after `--`. No shell.
+    #[arg(last = true)]
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -324,6 +277,10 @@ struct CloseArgs {
     /// Refuse to seal unless successful evidence binds to the current complete patch.
     #[arg(long)]
     require_current_successful_evidence: bool,
+
+    /// Refuse to seal unless Capsule itself ran a passing command on this patch.
+    #[arg(long)]
+    require_executed_evidence: bool,
 }
 
 #[derive(Debug, Args)]
@@ -480,7 +437,7 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
     if let Command::Attest(arguments) = &cli.command {
         let statement = change_capsule::attest_bundle(
             &arguments.bundle,
-            &VerifyOptions::new(false, false, arguments.repo.clone()),
+            &verify_options(false, false, false, arguments.repo.clone()),
         )?;
         let mut rendered = if arguments.predicate_only {
             serde_json::to_vec_pretty(&statement.predicate)
@@ -510,18 +467,20 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
                 &arguments.bundle,
                 &signature,
                 &key,
-                &VerifyOptions::new(
+                &verify_options(
                     arguments.require_successful_evidence,
                     arguments.require_current_successful_evidence,
+                    arguments.require_executed_evidence,
                     arguments.repo.clone(),
                 ),
             )?
         } else {
             verify_bundle(
                 &arguments.bundle,
-                &VerifyOptions::new(
+                &verify_options(
                     arguments.require_successful_evidence,
                     arguments.require_current_successful_evidence,
+                    arguments.require_executed_evidence,
                     arguments.repo.clone(),
                 ),
             )?
@@ -674,36 +633,6 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
         Command::Keygen(_) | Command::Sign(_) | Command::Verify(_) | Command::Attest(_) => {
             unreachable!("keygen, sign, verify, and attest run before state initialization")
         }
-        Command::Audit(arguments) => {
-            let events = match arguments.id {
-                Some(id) => manager.audit_events(&id)?,
-                None => manager.audit_log()?,
-            };
-            print_value(&events, cli.json)?;
-        }
-        Command::Metrics => print_value(&manager.metrics()?, cli.json)?,
-        Command::Policy(arguments) => match arguments.command {
-            PolicyCommand::Show => print_value(&manager.policy()?, cli.json)?,
-            PolicyCommand::Check => print_value(&manager.policy_report()?, cli.json)?,
-            PolicyCommand::Set { file } => {
-                let policy: Policy = read_json_file(&file, 64 * 1024)?;
-                print_value(&manager.set_policy(policy)?, cli.json)?;
-            }
-        },
-        Command::State(arguments) => match arguments.command {
-            StateCommand::Inspect => print_value(&manager.inspect_state()?, cli.json)?,
-            StateCommand::Backup { output } => {
-                print_value(&manager.backup_state(output)?, cli.json)?;
-            }
-            StateCommand::Migrate {
-                apply,
-                dry_run: _,
-                backup,
-            } => print_value(
-                &manager.migrate_state_v3(backup.as_deref(), apply)?,
-                cli.json,
-            )?,
-        },
         Command::Checkpoint(arguments) => {
             let checkpoint = manager.checkpoint(
                 &arguments.id,
@@ -712,19 +641,35 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
             print_value(&checkpoint, cli.json)?;
         }
         Command::Evidence(arguments) => {
-            let evidence = manager.add_evidence(&arguments.id, {
-                let mut input = EvidenceInput::new(arguments.command, arguments.exit_code);
-                input.summary = arguments.summary;
-                input
-            })?;
-            print_value(&evidence, cli.json)?;
+            let mut input = match (&arguments.claim, arguments.argv.is_empty()) {
+                (Some(command), true) => {
+                    EvidenceInput::claim(command, arguments.exit_code.unwrap_or_default())
+                }
+                (None, false) => {
+                    let mut input = EvidenceInput::run(arguments.argv.clone());
+                    if let Some(seconds) = arguments.timeout_seconds {
+                        input = input.with_timeout(std::time::Duration::from_secs(seconds));
+                    }
+                    input
+                }
+                _ => {
+                    return Err(change_capsule::Error::InvalidInput(
+                        "pass either a command after `--` for Capsule to run, or --claim with --exit-code".to_owned(),
+                    ));
+                }
+            };
+            if let Some(summary) = arguments.summary {
+                input = input.with_summary(summary);
+            }
+            print_value(&manager.add_evidence(&arguments.id, input)?, cli.json)?;
         }
         Command::Close(arguments) => {
             let result = manager.close(
                 &arguments.id,
-                CloseOptions::new(
+                CloseOptions::requiring(
                     arguments.require_successful_evidence,
                     arguments.require_current_successful_evidence,
+                    arguments.require_executed_evidence,
                 ),
             )?;
             print_value(&result, cli.json)?;
@@ -758,6 +703,23 @@ fn run(cli: Cli) -> change_capsule::Result<()> {
         }
     }
     Ok(())
+}
+
+fn verify_options(
+    require_successful_evidence: bool,
+    require_current_successful_evidence: bool,
+    require_executed_evidence: bool,
+    repository: Option<PathBuf>,
+) -> VerifyOptions {
+    let mut options = VerifyOptions::requiring(
+        require_successful_evidence,
+        require_current_successful_evidence,
+        require_executed_evidence,
+    );
+    if let Some(repository) = repository {
+        options = options.with_repository(repository);
+    }
+    options
 }
 
 fn parse_link(value: &str) -> Result<(String, String), String> {
@@ -955,45 +917,6 @@ fn sync_parent_directory(_path: &Path) -> change_capsule::Result<()> {
     Ok(())
 }
 
-fn read_json_file<T: serde::de::DeserializeOwned>(
-    path: &Path,
-    cap: u64,
-) -> change_capsule::Result<T> {
-    let mut file = open_readonly_input(path)?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| change_capsule::Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if metadata_is_reparse_point(&metadata) || !metadata.is_file() || metadata.len() > cap {
-        return Err(change_capsule::Error::InvalidInput(format!(
-            "JSON input must be a regular non-link file no larger than {cap} bytes: {}",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(cap + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|source| change_capsule::Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() as u64 > cap {
-        return Err(change_capsule::Error::InvalidInput(format!(
-            "JSON input exceeds {cap} bytes: {}",
-            path.display()
-        )));
-    }
-    serde_json::from_slice(&bytes).map_err(|source| {
-        change_capsule::Error::InvalidInput(format!(
-            "invalid JSON input at {}: {source}",
-            path.display()
-        ))
-    })
-}
-
 fn print_value<T: Serialize + std::fmt::Debug>(
     value: &T,
     json_mode: bool,
@@ -1072,7 +995,6 @@ fn error_kind(error: &change_capsule::Error) -> &'static str {
         change_capsule::Error::IdempotencyConflict => "idempotency_conflict",
         change_capsule::Error::IdempotencyNotFound => "idempotency_not_found",
         change_capsule::Error::InvalidState { .. } => "invalid_state",
-        change_capsule::Error::PolicyViolation(_) => "policy",
         change_capsule::Error::ArtifactNotFound(_) => "artifact_not_found",
         change_capsule::Error::Verification(_) => "verification",
         change_capsule::Error::UnsafeState(_) | change_capsule::Error::ForeignWorktree(_) => {

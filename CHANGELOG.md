@@ -1,9 +1,81 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — unreleased
 
-- `ulid` 3.0 (ID generation now calls `Ulid::generate()`; identifiers are unchanged).
-- The published-action pin and committed receipt moved to the released 0.2.0: the receipt gate now installs `change-capsule 0.2.0` and the committed receipt is sealed at durable schema v4.
+This release narrows the crate to two jobs: producing a change an outside party
+can re-derive, and proving a verification command really ran. Everything that
+did not serve those was removed.
+
+### Added
+
+- **Executed evidence.** `capsule evidence <id> -- cargo test` spawns the program
+  directly in the capsule workspace, with no shell, and records the exit code it
+  observed plus a domain-separated SHA-256 over the captured stdout and stderr.
+  The record carries `executed: true`, and nothing in the API can set that flag
+  without an actual run. `--timeout-seconds` kills a command that overruns and
+  records nothing. The command runs while no lock is held, so a long test suite
+  in one capsule does not serialize every other capsule in the state root.
+- **`--require-executed-evidence`** on `close`, `verify`, the merge-gate script,
+  and the GitHub Action. It is the only evidence requirement that checks a fact
+  rather than a caller's assertion: a `Claim` record can never satisfy it.
+- `VerificationReport.evidence_executed` counts records Capsule ran itself.
+- Receipt verification and durable-manifest validation now reject any record
+  that asserts `executed` without the captured-output digest and byte count that
+  only an execution produces. Without this, editing that one boolean in a
+  receipt turned a rejected claim into an accepted one at the strictest gate.
+- `scripts/self-gate.sh` dogfoods the whole loop in CI on every push.
+
+### Changed
+
+- **`EvidenceInput` is now an enum**, `Run { .. }` or `Claim { .. }`, because
+  everything a verifier may conclude depends on which one produced a record.
+  Build them with `EvidenceInput::run(argv)` or `EvidenceInput::claim(command,
+  exit_code)`. `EvidenceInput::new` is gone.
+- `Evidence.patch_sha256` is now required rather than optional, and `Evidence`
+  gained `executed`, `output_sha256`, and `output_bytes`.
+- The attestation predicate field `claimed_evidence` is now `evidence`, and each
+  record carries `executed`. `ProofBoundary::current()` became
+  `ProofBoundary::for_receipt(has_executed_evidence)`: a receipt with executed
+  evidence moves `evidence-command-actually-ran` out of `does_not_prove` and adds
+  `executed-evidence-ran-in-capsule-workspace` to `proves`.
+  `producing-host-was-uncompromised` stays disclaimed either way, because
+  execution never removes the need to trust the producing host.
+- Durable state and receipts are **schema v5**. Schema v3 and v4 are not read.
+- `CloseOptions` and `VerifyOptions` gained `requiring(..)` constructors, plus
+  `CloseOptions::executed()` and `VerifyOptions::strict(repo)`. These set only
+  `require_executed_evidence`. The three requirements are independent, not a
+  ladder: `require_successful_evidence` asks that *every* record passed, which
+  rejects an attempt whose tests failed once and were then fixed, so folding it
+  into the strict presets made the strongest mode unusable for the ordinary
+  agent loop.
+- The GitHub Action now defaults `require-executed-evidence` to `true` and
+  `require-successful-evidence` to `false`, for the same reason.
+- The README leads with the argument that makes this crate different: a source
+  change can be re-derived, unlike a build artifact, so a verifier recomputes
+  rather than trusts.
+
+### Removed
+
+Roughly 3,000 lines, none of which had users:
+
+- **The policy engine** (`Policy`, `PolicyReport`, `capsule policy`, repository
+  allowlists, and every count/age/byte/path quota). A fixed 64 MiB patch safety
+  bound remains as `HARD_PATCH_BYTES`. Use OS quotas and process isolation for
+  real limits; the crate never enforced them anyway.
+- **The audit log and metrics** (`AuditEvent`, `AuditEventKind`,
+  `MetricsSnapshot`, `capsule audit`, `capsule metrics`, and the per-manifest
+  event ring). Lifecycle state is already in the manifest.
+- **State administration** (`capsule state inspect`, `capsule state backup`,
+  `StateInspection`, `BackupReport`).
+- **The v3-to-v4 migration** (`capsule state migrate`, `MigrationReport`,
+  rollback journals, `LEGACY_SCHEMA_VERSION`). The crate is days old; carrying
+  migration machinery cost more than it saved.
+- **The committed-receipt protocol**: `receipts/`, the `receipt-gate` job,
+  `scripts/prepare-committed-receipt.sh`, `scripts/test-committed-receipt.sh`,
+  `scripts/check-release-pins.sh`, and `docs/releasing.md`. It taxed every
+  contributor a second commit and forbade squash merges to prove something
+  `scripts/self-gate.sh` now proves in CI without touching the commit graph.
+- `Error::PolicyViolation` and the `policy` CLI error kind.
 
 ## 0.2.0 — 2026-08-08
 

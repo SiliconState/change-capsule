@@ -84,7 +84,7 @@ fn capabilities_current_json_is_an_exact_static_contract() {
     let expected = r#"{
   "capability_schema_version": 1,
   "product": "change-capsule",
-  "product_version": "0.2.0",
+  "product_version": "0.3.0",
   "protocol_versions": [
     1
   ],
@@ -98,18 +98,14 @@ fn capabilities_current_json_is_an_exact_static_contract() {
     "receipt.export.v1",
     "receipt.verify.v1",
     "receipt.attest.intoto.v1",
-    "state.inspect.v1"
+    "evidence.executed.v1"
   ],
   "schemas": {
     "durable_read_write": [
-      4
-    ],
-    "durable_migrate_from": [
-      3
+      5
     ],
     "receipt_verify": [
-      3,
-      4
+      5
     ],
     "bundle": [
       1
@@ -387,7 +383,7 @@ fn skip_invalid_listing_reports_bad_records_without_hiding_good_ones() {
     fs::create_dir(&broken).expect("corrupt record dir");
     fs::write(broken.join("capsule.json"), b"not json").expect("corrupt manifest");
 
-    // The fail-closed path is what policy counts depend on: it must still fail.
+    // The fail-closed path is what callers depend on for exact counts: it must still fail.
     assert!(
         manager.list().is_err(),
         "strict listing must stay fail-closed"
@@ -660,60 +656,6 @@ fn expect_prompt_failure(fixture: &Fixture, key: &str, case: &str) {
         ),
         "{case} must fail on the record itself, not read as an absent \
          reservation or an unrelated error: {error:?}"
-    );
-}
-
-#[test]
-fn backup_and_inspection_cover_valid_and_malformed_idempotency_records() {
-    let fixture = Fixture::new();
-    let manager = fixture.manager();
-    let capsule = manager
-        .create_idempotent(fixture.options("admin"), "admin:key")
-        .expect("create");
-    let valid = fixture.reservation_path("admin:key");
-    let valid_name = valid
-        .file_name()
-        .expect("reservation filename")
-        .to_string_lossy()
-        .into_owned();
-    let malformed_name = format!("{:064x}.json", 1_u64);
-    fs::write(
-        fixture.state.join("idempotency").join(&malformed_name),
-        b"{ not json",
-    )
-    .expect("malformed reservation");
-
-    let inspection = manager.inspect_state().expect("inspect state");
-    assert_eq!(inspection.idempotency_record_count, 2);
-    let valid_entry = inspection
-        .idempotency_records
-        .iter()
-        .find(|entry| entry.filename == valid_name)
-        .expect("valid entry inspected");
-    assert_eq!(valid_entry.schema_version, Some(1));
-    assert_eq!(valid_entry.capsule_id.as_deref(), Some(capsule.id.as_str()));
-    assert!(valid_entry.error.is_none());
-    let malformed_entry = inspection
-        .idempotency_records
-        .iter()
-        .find(|entry| entry.filename == malformed_name)
-        .expect("malformed entry inspected");
-    assert!(malformed_entry.error.is_some());
-    assert!(malformed_entry.capsule_id.is_none());
-    // Inspection never echoes a raw key, only its indexed digest.
-    assert!(!valid_name.contains("admin"));
-
-    let destination = fixture.temp.path().join("backup");
-    let report = manager.backup_state(&destination).expect("backup state");
-    assert!(report.files > 0);
-    let backed_up = destination.join("idempotency");
-    assert_eq!(
-        fs::read(backed_up.join(&valid_name)).expect("backed-up reservation"),
-        fs::read(&valid).expect("live reservation")
-    );
-    assert!(
-        backed_up.join(&malformed_name).exists(),
-        "backup must preserve malformed records for forensic inspection"
     );
 }
 

@@ -25,7 +25,7 @@ answer rather than a defence of a private schema.
 
 in-toto and SLSA describe **how an artifact was built**. They bind a producer,
 a build definition, and an output digest, and a verifier checks *signatures and
-policy* over those claims. That is the right model for a compiled artifact,
+*signatures and policy* over those claims. That is the right model for a compiled artifact,
 where nobody can re-derive the output from the inputs cheaply.
 
 A source change is different: the output **can** be re-derived, exactly and
@@ -69,9 +69,10 @@ deliver. The same list is machine-readable inside every statement, under
 
 **Does not prove** — and no amount of signing changes this:
 
-- that any recorded evidence command actually ran, or that its output is honest.
-  Capsule records claims; it never executes them. That is why the predicate
-  field is named `claimed_evidence`, not `evidence`;
+- that a record with `executed: false` ever ran, or that its reported output is
+  honest — that one is a caller's assertion and nothing more. A record with
+  `executed: true` did run, because Capsule spawned it and watched it, but even
+  then you are trusting the host that ran Capsule;
 - who or what wrote the change — a human, an agent, or neither;
 - that the change is correct, safe, reviewed, or good;
 - that the producing host was uncompromised.
@@ -114,7 +115,7 @@ map iteration order — so regenerating it from the same receipt is byte-identic
 
 The statement is deliberately **not** added to the receipt. `bundle.json`
 describes exactly two artifacts — `result.json` and `result.patch` — and the
-committed-receipt gate enforces that three-file envelope; adding a file would
+gate checks that three-file envelope exactly; an extra file would
 break every existing verifier for no gain. Generate the statement when you need
 it: it is a pure function of the receipt, so nothing is lost by not storing it.
 
@@ -157,7 +158,7 @@ Ed25519 key you supply out of band.
 | `changed_paths` | `predicate.changed_paths` |
 | `kind` | `predicate.kind` |
 | `ignored_content_sha256` | `predicate.ignored_content_sha256` |
-| `evidence[]` | `predicate.claimed_evidence[]`, with `current_for_sealed_patch` |
+| `evidence[]` | `predicate.evidence[]`, with `executed` and `current_for_sealed_patch` |
 | `label`, `links` | `predicate.label`, `predicate.links` |
 | — | `predicate.proof_boundary` (extension; see above) |
 

@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "change-capsule"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "fs2",

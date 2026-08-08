@@ -13,9 +13,8 @@ use crate::error::{Error, Result};
 use crate::git::Git;
 use crate::model::{
     ArtifactBundle, ArtifactDescriptor, ArtifactKind, BUNDLE_SCHEMA_VERSION, CapsuleResult,
-    LEGACY_SCHEMA_VERSION, ResultKind, SCHEMA_VERSION, VerificationReport,
+    HARD_PATCH_BYTES, ResultKind, SCHEMA_VERSION, VerificationReport,
 };
-use crate::policy::HARD_PATCH_BYTES;
 use crate::signature::verify_bundle_signature_bytes;
 use crate::state::{read_bytes_bounded, validate_id};
 
@@ -25,10 +24,21 @@ const BUNDLE_JSON_CAP: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct VerifyOptions {
-    /// Reject bundles whose evidence is absent or contains a non-zero exit code.
+    /// Reject bundles whose evidence is absent or contains *any* non-zero exit code.
+    ///
+    /// A receipt from an attempt that failed once and was then fixed carries
+    /// that earlier failure, so this rejects it. Prefer
+    /// [`Self::require_executed_evidence`] unless a spotless history is the
+    /// property you actually want.
     pub require_successful_evidence: bool,
     /// Reject unless successful evidence is bound to the sealed patch.
     pub require_current_successful_evidence: bool,
+    /// Reject unless Capsule itself ran a passing command against the sealed patch.
+    ///
+    /// This is the only evidence requirement that checks a fact rather than a
+    /// caller's assertion, and it subsumes
+    /// [`Self::require_current_successful_evidence`]. Set it in a merge gate.
+    pub require_executed_evidence: bool,
     /// When set, additionally confirm against this repository that the pinned
     /// base commit exists and that the sealed patch applies to it, reproducing
     /// exactly the sealed patch bytes and changed paths.
@@ -36,20 +46,47 @@ pub struct VerifyOptions {
 }
 
 impl VerifyOptions {
-    /// Verification policy.
-    ///
-    /// Pass `repository` to additionally require that the sealed patch applies
-    /// to its pinned base and reproduces exactly.
-    pub fn new(
+    /// Check receipt integrity only, against no repository.
+    #[must_use]
+    pub fn integrity() -> Self {
+        Self::default()
+    }
+
+    /// Verify with an explicit combination of evidence requirements.
+    #[must_use]
+    pub fn requiring(
         require_successful_evidence: bool,
         require_current_successful_evidence: bool,
-        repository: Option<std::path::PathBuf>,
+        require_executed_evidence: bool,
     ) -> Self {
         Self {
             require_successful_evidence,
             require_current_successful_evidence,
-            repository,
+            require_executed_evidence,
+            repository: None,
         }
+    }
+
+    /// Re-derive the tree from `repository` and require executed evidence.
+    ///
+    /// This is what a merge gate should use. It deliberately does not also
+    /// demand that every record on the capsule passed: an attempt that failed
+    /// once and was then fixed produces a perfectly good receipt.
+    #[must_use]
+    pub fn strict(repository: impl Into<PathBuf>) -> Self {
+        Self {
+            require_successful_evidence: false,
+            require_current_successful_evidence: false,
+            require_executed_evidence: true,
+            repository: Some(repository.into()),
+        }
+    }
+
+    /// Require the sealed patch to apply to its pinned base in `repository`.
+    #[must_use]
+    pub fn with_repository(mut self, repository: impl Into<PathBuf>) -> Self {
+        self.repository = Some(repository.into());
+        self
     }
 }
 
@@ -75,12 +112,9 @@ impl VerifyOptions {
 /// ```no_run
 /// use change_capsule::{VerifyOptions, verify_bundle};
 ///
-/// // Options types are `#[non_exhaustive]`, so build them with a constructor
-/// // rather than a struct literal; new fields can then be added compatibly.
-/// let report = verify_bundle(
-///     "./receipt",
-///     &VerifyOptions::new(true, false, Some(".".into())),
-/// )?;
+/// // The strongest option set: re-derive the tree from the repository, and
+/// // require that Capsule itself ran a passing command against this patch.
+/// let report = verify_bundle("./receipt", &VerifyOptions::strict("."))?;
 /// println!("{} changed {} path(s)", report.capsule_id, report.changed_paths);
 /// # Ok::<(), change_capsule::Error>(())
 /// ```
@@ -178,13 +212,23 @@ fn verify_bundle_snapshot_full(
     }
 
     if options.require_current_successful_evidence
-        && !result.evidence.iter().any(|item| {
-            item.exit_code == 0
-                && item.patch_sha256.as_deref() == Some(result.patch_sha256.as_str())
-        })
+        && !result
+            .evidence
+            .iter()
+            .any(|item| item.exit_code == 0 && item.patch_sha256 == result.patch_sha256)
     {
         return Err(fail(
             "current successful evidence is required, but no successful evidence is bound to the sealed patch",
+        ));
+    }
+
+    if options.require_executed_evidence
+        && !result.evidence.iter().any(|item| {
+            item.executed && item.exit_code == 0 && item.patch_sha256 == result.patch_sha256
+        })
+    {
+        return Err(fail(
+            "executed evidence is required, but no command that Capsule ran itself passed against the sealed patch",
         ));
     }
 
@@ -205,6 +249,7 @@ fn verify_bundle_snapshot_full(
         patch_sha256: result.patch_sha256.clone(),
         changed_paths: result.changed_paths.len(),
         evidence_total: result.evidence.len(),
+        evidence_executed: result.evidence.iter().filter(|item| item.executed).count(),
         evidence_failed: result
             .evidence
             .iter()
@@ -269,10 +314,7 @@ fn verify_result_consistency(
     result: &CapsuleResult,
     patch: &[u8],
 ) -> Result<()> {
-    if !matches!(
-        result.schema_version,
-        SCHEMA_VERSION | LEGACY_SCHEMA_VERSION
-    ) {
+    if result.schema_version != SCHEMA_VERSION {
         return Err(fail("result schema version is unsupported"));
     }
     if result.capsule_id != bundle.capsule_id {
@@ -301,9 +343,9 @@ fn verify_result_consistency(
     if result.created_at_unix > result.sealed_at_unix {
         return Err(fail("result was sealed before it was created"));
     }
-    if result.schema_version == SCHEMA_VERSION && result.ignored_content_sha256.is_none() {
+    if result.ignored_content_sha256.is_none() {
         return Err(fail(
-            "current result is missing its ignored-content structural digest",
+            "result is missing its ignored-content structural digest",
         ));
     }
     if result
@@ -314,22 +356,38 @@ fn verify_result_consistency(
     {
         return Err(fail("result contains a non-canonical path encoding"));
     }
-    if result.schema_version == LEGACY_SCHEMA_VERSION
-        && result
-            .evidence
-            .iter()
-            .any(|item| item.patch_sha256.is_some())
-    {
-        return Err(fail("legacy result contains impossible bound evidence"));
-    }
-    if result.schema_version == SCHEMA_VERSION
-        && result.evidence.iter().any(|item| {
-            item.patch_sha256
+    if result.evidence.iter().any(|item| {
+        !valid_sha256(&item.patch_sha256)
+            || item
+                .output_sha256
                 .as_ref()
                 .is_some_and(|digest| !valid_sha256(digest))
-        })
+    }) {
+        return Err(fail("evidence digest is malformed"));
+    }
+    if result
+        .evidence
+        .iter()
+        .any(|item| !item.executed && (item.output_sha256.is_some() || item.output_bytes.is_some()))
     {
-        return Err(fail("evidence patch digest is malformed"));
+        return Err(fail(
+            "evidence claims output bytes without being executed by Capsule",
+        ));
+    }
+    // The mirror of the check above, and the more important direction. Execution
+    // is the one thing `--require-executed-evidence` rests on, and running a
+    // command is exactly what produces an output digest and byte count. A record
+    // asserting `executed` without them did not come from an execution, so
+    // flipping that one boolean must not turn a rejected receipt into an
+    // accepted one.
+    if result
+        .evidence
+        .iter()
+        .any(|item| item.executed && (item.output_sha256.is_none() || item.output_bytes.is_none()))
+    {
+        return Err(fail(
+            "evidence claims Capsule executed it but carries no captured-output digest",
+        ));
     }
     let empty = patch.is_empty();
     if (result.kind == ResultKind::NoChange) != empty {
@@ -398,7 +456,7 @@ fn decode_receipt_result(path: &Path, bytes: &[u8]) -> Result<CapsuleResult> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| fail("result has no valid schema version"))?;
-    if !matches!(version, SCHEMA_VERSION | LEGACY_SCHEMA_VERSION) {
+    if version != SCHEMA_VERSION {
         return Err(fail(format!("unsupported result schema version {version}")));
     }
     serde_json::from_value(value).map_err(|source| Error::Json {

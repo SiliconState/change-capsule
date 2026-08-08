@@ -1,20 +1,15 @@
 # Contributing
 
-## The unusual part first
+## How this repository proves its own tool works
 
-This repository gates itself with its own tool. Every change to `main` lands as
-**two commits**: the implementation, then a commit containing only the three
-receipt artifacts under `receipts/required/`. The `receipt-gate` job proves the
-implementation tree is exactly the pinned base plus the sealed patch.
+CI runs [`scripts/self-gate.sh`](scripts/self-gate.sh), which drives the whole
+loop against this repository on every push: it creates a real capsule, changes a
+file, has Capsule execute `cargo test`, seals with `--require-executed-evidence`,
+exports a receipt, verifies it from a fresh clone, and confirms a tampered
+receipt is rejected.
 
-That means you cannot amend, squash, or rebase a branch without regenerating the
-receipt. A squash merge deliberately destroys the binding. The full protocol is
-in [`README.md`](README.md#committed-receipt-protocol), and
-[`docs/releasing.md`](docs/releasing.md) explains why the receipt's schema is
-tied to the published-action pin.
-
-If that is too much ceremony for a drive-by fix, open an issue or a PR without
-the receipt commit and say so — a maintainer can reseal it.
+Nothing about that touches your commits. Branch, commit, and merge however you
+like.
 
 ## Local checks
 
@@ -25,7 +20,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --release --locked
-bash scripts/check-release-pins.sh
+CAPSULE_BIN="$PWD/target/debug/capsule" bash scripts/self-gate.sh
 ```
 
 **Cross-check the other platforms.** A fully green Linux run has broken `main`
@@ -61,7 +56,8 @@ The crate also declares an MSRV in `Cargo.toml`, enforced by the `msrv` job.
 
 ## Tests
 
-- `tests/capsule.rs` — lifecycle, sealing, receipts, policy, state administration.
+- `tests/capsule.rs` — lifecycle, sealing, receipts, signing.
+- `tests/executed_evidence.rs` — executed evidence: the run/claim distinction and its verification.
 - `tests/orchestration.rs` — capabilities and idempotency protocol.
 - `tests/attestation.rs` — in-toto conformance and the proof boundary.
 - `fuzz/` — untrusted-input targets; CI builds them, it does not run campaigns.

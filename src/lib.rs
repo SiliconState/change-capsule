@@ -8,10 +8,10 @@
 //!
 //! A *capsule* is one attempt at a change. It pins an exact base commit, owns an
 //! ordinary Git worktree on its own branch, and records everything needed to
-//! review the attempt later: checkpoints, caller-recorded verification evidence,
-//! a complete binary-capable patch, a changed-path inventory, and content
-//! digests. Several capsules can start from the same commit and modify the same
-//! files without interfering, because each has its own worktree and index.
+//! review the attempt later: checkpoints, verification evidence, a complete
+//! binary-capable patch, a changed-path inventory, and content digests. Several
+//! capsules can start from the same commit and modify the same files without
+//! interfering, because each has its own worktree and index.
 //!
 //! Closing a capsule *seals* it. A sealed result is immutable: later mutation of
 //! the workspace is detected as drift and blocks integration and ordinary
@@ -30,6 +30,26 @@
 //! changed paths. [`attest_bundle`] projects a verified receipt into a standard
 //! in-toto Statement for SLSA/Sigstore tooling; its `proof_boundary` states
 //! machine-readably what the receipt does and does not establish.
+//!
+//! # Evidence
+//!
+//! Verification records come in two kinds, and the difference decides what a
+//! verifier may conclude.
+//!
+//! [`EvidenceInput::Run`] has Capsule spawn the program itself, in the capsule
+//! workspace, with no shell. Capsule observes the exit status and digests the
+//! output, and the record is stored with `executed: true`. Nothing in this API
+//! sets that flag any other way, and both receipt verification and durable-state
+//! validation reject a record that asserts it without the captured-output digest
+//! an execution produces.
+//!
+//! [`EvidenceInput::Claim`] records what a caller says happened elsewhere.
+//! Capsule runs nothing and vouches for nothing, and such a record can never
+//! satisfy [`CloseOptions::executed`] or [`VerifyOptions::strict`].
+//!
+//! Execution narrows the trust boundary rather than removing it: the exit code
+//! was still observed by a Capsule process on the producing host. Every
+//! attestation keeps `producing-host-was-uncompromised` in `does_not_prove`.
 //!
 //! # Orchestration protocol
 //!
@@ -51,28 +71,33 @@
 //! # Example
 //!
 //! ```no_run
-//! use change_capsule::{CapsuleManager, CloseOptions, CreateOptions};
+//! use change_capsule::{
+//!     CapsuleManager, CloseOptions, CreateOptions, EvidenceInput, VerifyOptions, verify_bundle,
+//! };
 //!
 //! let manager = CapsuleManager::open_default()?;
+//! let capsule = manager.create(CreateOptions::new(".").with_label("candidate a"))?;
 //!
-//! let mut options = CreateOptions::new(".");
-//! options.label = Some("candidate implementation".into());
-//! let capsule = manager.create(options)?;
+//! // Launch any external tool with capsule.workspace_path as its directory.
+//! // Then have Capsule run the verification command, so the result is observed
+//! // rather than asserted.
+//! manager.add_evidence(&capsule.id, EvidenceInput::run(["cargo", "test"]))?;
 //!
-//! // Launch any external tool with capsule.workspace_path as its directory,
-//! // then record whatever verification the caller performed.
+//! // Sealing refuses to proceed unless that command passed on this exact patch.
+//! let result = manager.close(&capsule.id, CloseOptions::executed())?;
+//! manager.export_artifacts(&capsule.id, "./receipt")?;
 //!
-//! let result = manager.close(&capsule.id, CloseOptions::default())?;
-//! println!("sealed {} changed paths", result.changed_paths.len());
+//! // Anywhere else, holding only ./receipt and a clone of the repository:
+//! let report = verify_bundle("./receipt", &VerifyOptions::strict("."))?;
+//! assert_eq!(report.patch_sha256, result.patch_sha256);
 //! # Ok::<(), change_capsule::Error>(())
 //! ```
 //!
 //! # Division of responsibility
 //!
-//! This crate owns the attempt lifecycle, provenance, artifacts, policy, audit
-//! records, and state administration. The caller owns process launch, model
-//! choice, prompts, credentials, sandboxing, verification execution, and any
-//! remote artifact transport. The workspace is an isolation boundary for Git
+//! This crate owns the attempt lifecycle, provenance, artifacts, and receipts.
+//! The caller owns process launch, model choice, prompts, credentials,
+//! sandboxing, and any remote artifact transport. The workspace is an isolation boundary for Git
 //! state, not a security sandbox; run untrusted code under an external sandbox.
 //!
 //! # Feature flags
@@ -84,20 +109,20 @@ pub mod artifact;
 pub mod attestation;
 pub mod capabilities;
 pub mod error;
+mod exec;
 mod git;
 pub mod idempotency;
 mod manager;
 pub mod model;
 mod path;
-pub mod policy;
 pub mod signature;
 mod state;
 pub mod verify;
 
 pub use artifact::{ArtifactReader, ArtifactSink, PublishedArtifact};
 pub use attestation::{
-    CHANGE_PREDICATE_TYPE, ChangePredicate, ClaimedEvidence, IN_TOTO_STATEMENT_TYPE, ProofBoundary,
-    ResourceDescriptor, Statement, attest_bundle, change_statement,
+    CHANGE_PREDICATE_TYPE, ChangePredicate, IN_TOTO_STATEMENT_TYPE, ProofBoundary,
+    RecordedEvidence, ResourceDescriptor, Statement, attest_bundle, change_statement,
 };
 pub use capabilities::{
     CAPABILITY_SCHEMA_VERSION, Capabilities, CapabilityLimits, CapabilitySchemas,
@@ -111,14 +136,12 @@ pub use manager::{
     IntegrateOptions,
 };
 pub use model::{
-    AUDIT_SCHEMA_VERSION, ArtifactBundle, ArtifactDescriptor, ArtifactKind, AuditEvent,
-    AuditEventKind, BUNDLE_SCHEMA_VERSION, BackupReport, Capsule, CapsuleHealth, CapsuleListing,
-    CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary, Checkpoint, CheckpointJournal,
-    Cleanup, Evidence, ExportReport, GitPath, Integration, LEGACY_SCHEMA_VERSION, MetricsSnapshot,
-    MigrationReport, RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, StateInspection,
-    StateRecordInspection, UnreadableRecord, VerificationReport,
+    ArtifactBundle, ArtifactDescriptor, ArtifactKind, BUNDLE_SCHEMA_VERSION, Capsule,
+    CapsuleHealth, CapsuleListing, CapsuleResult, CapsuleState, CapsuleStatus, CapsuleSummary,
+    Checkpoint, CheckpointJournal, Cleanup, Evidence, ExportReport, GitPath, HARD_PATCH_BYTES,
+    Integration, RecoveryAction, ResultKind, ResultRef, SCHEMA_VERSION, UnreadableRecord,
+    VerificationReport,
 };
-pub use policy::{HARD_PATCH_BYTES, POLICY_SCHEMA_VERSION, Policy, PolicyReport};
 pub use signature::{
     GeneratedKeypair, bundle_signature_commitment, derive_public_key, generate_keypair,
     sign_bundle, sign_bundle_bytes, verify_bundle_signature, verify_bundle_signature_bytes,

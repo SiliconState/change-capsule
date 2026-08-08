@@ -5,7 +5,7 @@
 # checked-out tree is exactly the pinned base plus the sealed patch. Used by
 # the repository-root composite action, and runnable directly:
 #
-#   scripts/verify-gate.sh --bundle ./receipt --repo . --verify-head
+#   scripts/verify-gate.sh --bundle ./receipt --repo . --require-executed-evidence
 #
 # Emits GitHub Actions outputs and a step summary when those environment
 # variables are present, and is silent about them otherwise.
@@ -14,6 +14,7 @@ set -euo pipefail
 bundle=""
 repo="."
 require_evidence="false"
+require_executed="false"
 verify_head="false"
 capsule_bin="${CAPSULE_BIN:-capsule}"
 
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --repo) repo="${2:-}"; shift 2 ;;
     --capsule-bin) capsule_bin="${2:-}"; shift 2 ;;
     --require-successful-evidence) require_evidence="true"; shift ;;
+    --require-executed-evidence) require_executed="true"; shift ;;
     --verify-head) verify_head="true"; shift ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -58,6 +60,7 @@ fail() {
 
 verify_args=("verify" "$bundle" "--repo" "$repo")
 [[ "$require_evidence" == "true" ]] && verify_args+=("--require-successful-evidence")
+[[ "$require_executed" == "true" ]] && verify_args+=("--require-executed-evidence")
 
 report=""
 if ! report=$("$capsule_bin" --json "${verify_args[@]}" 2>"$scratch/verify-err"); then
@@ -73,6 +76,7 @@ changed_paths=$(jq -r '.changed_paths' <<< "$report")
 patch_bytes=$(jq -r '.patch_bytes' <<< "$report")
 evidence_total=$(jq -r '.evidence_total' <<< "$report")
 evidence_failed=$(jq -r '.evidence_failed' <<< "$report")
+evidence_executed=$(jq -r '.evidence_executed' <<< "$report")
 kind=$(jq -r '.kind' <<< "$report")
 
 emit capsule-id "$capsule_id"
@@ -112,7 +116,7 @@ summary "| Result kind | ${kind} |"
 summary "| Pinned base | \`${base_commit}\` |"
 summary "| Patch digest | \`sha256:${patch_sha256}\` |"
 summary "| Patch size | ${patch_bytes} bytes across ${changed_paths} path(s) |"
-summary "| Evidence | ${evidence_total} record(s), ${evidence_failed} failing |"
+summary "| Evidence | ${evidence_total} record(s), ${evidence_executed} executed by Capsule, ${evidence_failed} failing |"
 summary "| Merged tree | ${head_state} |"
 
 printf 'Capsule receipt verified: %s (%s path(s), head %s)\n' \

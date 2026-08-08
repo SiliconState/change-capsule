@@ -8,9 +8,6 @@ This document is the framework-neutral contract for using Capsule from an agent 
 - [Capability negotiation](#capability-negotiation)
 - [Recommended flow](#recommended-flow) — [create](#1-create), [launch](#2-launch-any-worker), [inspect](#3-inspect-during-work), [checkpoint](#4-optional-checkpoint), [evidence](#5-record-evidence), [close](#6-close), [verify](#7-review-verify-or-compare), [integrate](#8-explicit-integration), [cleanup](#9-cleanup)
 - [JSON behavior](#json-behavior) — [error kinds](#error-kinds)
-- [Audit and metrics](#audit-and-metrics)
-- [Policy](#policy)
-- [State administration](#state-administration)
 - [Links](#links)
 - [Concurrency](#concurrency)
 - [Recovery](#recovery)
@@ -47,12 +44,11 @@ Its output is one bounded deterministic JSON object with no timestamps, host pat
     "receipt.export.v1",
     "receipt.verify.v1",
     "receipt.attest.intoto.v1",
-    "state.inspect.v1"
+    "evidence.executed.v1"
   ],
   "schemas": {
-    "durable_read_write": [4],
-    "durable_migrate_from": [3],
-    "receipt_verify": [3, 4],
+    "durable_read_write": [5],
+    "receipt_verify": [5],
     "bundle": [1],
     "idempotency_record": [1]
   },
@@ -151,7 +147,7 @@ Lookup is non-mutating and direct: it accesses only the hashed reservation path 
 
 This is the bounded correctness path for crash recovery. Do not use `list` as a recovery primitive on a large multi-agent state root.
 
-**At-most-one identity is not at-most-once execution.** It proves Capsule created one attempt, not that the external agent process ran exactly once. A replay may return a capsule that is already closed, integrated, orphaned, or dropped, so callers still need `status`, targeted `recover <id>`, and `state inspect`. Idempotency is local orchestration state: it never appears in a portable receipt, and receipts prove result consistency, not agent authorship.
+**At-most-one identity is not at-most-once execution.** It proves Capsule created one attempt, not that the external agent process ran exactly once. A replay may return a capsule that is already closed, integrated, orphaned, or dropped, so callers still need `status` and targeted `recover <id>`. Idempotency is local orchestration state: it never appears in a portable receipt, and receipts prove result consistency, not agent authorship.
 
 ### 2. Launch any worker
 
@@ -185,7 +181,7 @@ Status fields relevant to automation:
 
 The diff JSON metadata includes `patch_sha256`, a canonical lowercase SHA-256 of the exact live or sealed patch returned; with `--output`, it covers the exact bytes written. Use it rather than a capsule ID alone when deduplicating evidence.
 
-**Close-time stability.** Closing computes a complete ignored-content inventory both before and after its tracked snapshot transaction. The inventories must agree exactly on lossless path identities, byte total, and structural content digest; patch bytes, changed paths, `HEAD`, and the clean/dirty classification used for `result.kind` must also remain identical before any result artifacts are written. Policy and the sealed result use the stable final ignored inventory, and current-evidence policy is evaluated against the exact final patch. This narrows ordinary close races but is not an atomic security boundary against hostile same-user mutation after the final checks.
+**Close-time stability.** Closing computes a complete ignored-content inventory both before and after its tracked snapshot transaction. The inventories must agree exactly on lossless path identities, byte total, and structural content digest; patch bytes, changed paths, `HEAD`, and the clean/dirty classification used for `result.kind` must also remain identical before any result artifacts are written. The sealed result uses the stable final ignored inventory, and evidence requirements are evaluated against the exact final patch. This narrows ordinary close races but is not an atomic security boundary against hostile same-user mutation after the final checks.
 
 ### 4. Optional checkpoint
 
@@ -200,24 +196,39 @@ Checkpoint constructs the commit through a private index, journals the exact par
 
 ### 5. Record evidence
 
-Capsule records evidence; it does not execute verification commands.
+Prefer the executed form. Capsule spawns the program itself in the capsule workspace, with no shell, and records the exit status and a digest of the output it observed:
 
 ```sh
-capsule --json evidence <id> \
-  --command "cargo test --all-features" \
-  --exit-code 0 \
-  --summary "5 integration tests passed"
+capsule --json evidence <id> --timeout-seconds 900 -- cargo test --all-features
 ```
 
-The caller is responsible for command execution, timeout, sandboxing, output retention, and honesty. Evidence is explicit caller-claimed provenance, not a cryptographic attestation that the command ran. Schema-v4 records bind the claim to the SHA-256 of the complete patch observed when evidence is added. A later edit makes that evidence non-current. A capsule retains at most 64 evidence records totaling at most 256 KiB.
+The resulting record has `executed: true`, and `--require-executed-evidence` on close and verify accepts nothing else. The command runs with no lock held, so a long suite in one capsule does not block others in the same state root. Capsule kills only the process it spawned when the timeout expires.
+
+Record a claim when Capsule genuinely cannot run the command — for example a run on other hardware:
+
+```sh
+capsule --json evidence <id> --claim "cargo test on the GPU runner" --exit-code 0
+```
+
+A claim is caller-asserted provenance, not an attestation that anything ran, and it can never satisfy an executed-evidence requirement. Either kind binds to the SHA-256 of the complete patch observed when the record is added, so a later edit makes it non-current. A capsule retains at most 64 records totaling at most 256 KiB, and a single command may produce at most 8 MiB of captured output.
 
 ### 6. Close
 
 ```sh
-capsule --json close <id> --require-current-successful-evidence
+capsule --json close <id> --require-executed-evidence
 ```
 
-`--require-successful-evidence` is the legacy policy (evidence exists and every exit code is zero). `--require-current-successful-evidence` requires at least one successful claim whose patch digest equals the complete patch being sealed.
+The three requirements are **independent**, not a ladder:
+
+| Flag | Requires |
+| --- | --- |
+| `--require-executed-evidence` | one record that Capsule ran itself, that passed, and that is bound to the patch being sealed |
+| `--require-current-successful-evidence` | one passing record bound to that patch, executed or merely claimed |
+| `--require-successful-evidence` | that **every** record on the capsule passed |
+
+Use `--require-executed-evidence`. It is the only one that checks a fact rather than a caller's assertion, and it implies the second.
+
+The third asks something different and often unwanted: it fails if any earlier record failed, so an attempt whose tests failed once and were then fixed cannot seal. Set it only when a spotless history is genuinely the property you want.
 
 The sealed result is available through:
 
@@ -250,7 +261,7 @@ capsule --json verify /tmp/capsule-result --require-current-successful-evidence
 capsule --json verify /tmp/capsule-result --repo /path/to/repository
 ```
 
-Offline verification accepts exported result schemas v3 and v4. Current-evidence policy can only be satisfied by a successful schema-v4 evidence record bound to the sealed patch.
+Offline verification accepts exported result schema v5 only.
 
 #### Optional signature check
 
@@ -273,7 +284,7 @@ Several capsules may share one task link. A coordinator can compare their change
 capsule --json integrate <selected-id> --target /path/to/clean/worktree
 ```
 
-Integration fails if the target moved past the pinned base. The caller must make that policy decision explicitly: recreate the attempt on a new base, integrate elsewhere, or use its own reviewed conflict-resolution flow.
+Integration fails if the target moved past the pinned base. The caller must make that decision explicitly: recreate the attempt on a new base, integrate elsewhere, or use its own reviewed conflict-resolution flow.
 
 ### 9. Cleanup
 
@@ -306,7 +317,6 @@ Successful commands emit one JSON value to stdout. Failed commands emit one JSON
 | `invalid_state` | The operation is not allowed from the capsule's current state. |
 | `idempotency_conflict` | The key is already bound to a different creation request. |
 | `idempotency_not_found` | No reservation exists for that key in this state root. |
-| `policy` | A configured repository or resource limit rejected the operation. |
 | `artifact_not_found` | The requested artifact is not part of this result. |
 | `verification` | Receipt verification failed. |
 | `safety` | State or worktree ownership could not be proven; fail-closed. |
@@ -317,42 +327,7 @@ Successful commands emit one JSON value to stdout. Failed commands emit one JSON
 | `schema_version` | On-disk or receipt schema is not supported by this build. |
 | `internal` | I/O, JSON, or output-capture failure. |
 
-Consumers should branch on `kind` and retain the message for diagnosis. The on-disk manifest and result format is schema version 4. Schema-v3 state requires explicit migration; exported schema-v3 receipts remain verifiable.
-
-## Audit and metrics
-
-Every successful lifecycle mutation retains a versioned event in the capsule manifest, up to the newest 128 events. When older events roll off, `audit_events_dropped` increments and aggregate metrics report the dropped count. Read one stream with `capsule --json audit <id>` or all retained records with `capsule --json audit`. Events include transition identities and bounded attributes; evidence commands are represented by digest rather than duplicated verbatim. They are an administrative history, not a cryptographically signed or append-only ledger.
-
-`capsule --json metrics` computes an instantaneous snapshot of capsule states, live/sealed counts, result patch bytes, state/workspace bytes, and retained/dropped event counts. Core does not run a collector or transmit telemetry. Callers may scrape this command or use `CapsuleManager::metrics`.
-
-## Policy
-
-An absent policy means permissive defaults under hard safety bounds. `capsule policy set --file <json>` atomically replaces versioned policy; `capsule policy check` evaluates current records.
-
-Policy may allowlist canonical repository roots and limit total/live records, age, state/workspace bytes, patch bytes, changed paths, ignored paths, and ignored content bytes. Patch and changed-path limits apply to the complete base-to-current result at close and checkpoint boundaries, not only the newest checkpoint delta. Policy checking evaluates active and sealed results and reports unavailable or invalid usage as a violation.
-
-Policy is checked at core lifecycle boundaries. It is not a continuous filesystem reservation: a worker may grow a workspace between commands. Use OS/filesystem quotas when hard continuous enforcement is required.
-
-## State administration
-
-### Inspect
-
-`capsule state inspect` reports record versions and states even when normal schema deserialization would fail.
-
-It also reports the idempotency index separately: its record count and any malformed entries, identified by indexed digest rather than raw key, without requiring capsule schema compatibility.
-
-### Idempotency index
-
-Backup includes the index in its indexed layout, and migration does not reinterpret the index's independent schema.
-
-A malformed reservation makes keyed operations for that key fail closed while leaving direct lookups for other keys working. There is no garbage collector or key-reuse API, because one reservation per capsule is already bounded by capsule creation and policy limits.
-
-### Migrate
-
-- `capsule state migrate --dry-run` validates schema-v3 candidates without writes or a backup report, and rejects any backup argument.
-- `capsule state migrate --apply --backup <new-directory>` requires and completes a backup first, then applies through a rollback journal.
-
-Migration rejects mixed current/legacy capsule/result pairs and validates every sealed-result invariant before backup or mutation. V3 evidence migrates unbound and cannot satisfy current-evidence policy. Other incompatible schemas fail closed.
+Consumers should branch on `kind` and retain the message for diagnosis. The on-disk manifest and result format is schema version 5. Earlier schemas are not read.
 
 ## Links
 
@@ -370,13 +345,13 @@ No key has privileged semantics in core.
 
 ## Concurrency
 
-**Lock order.** Operations that mutate one repository's capsules take a project-scoped file lock. Policy-sensitive mutations also take the global lock so global counters cannot race. Backup, policy replacement/checking, metrics, inspection, and the administrative audit stream take the global lock plus every known project lock in deterministic order. Multiple active capsules remain independent Git worktrees.
+**Lock order.** Operations that mutate one repository's capsules take a project-scoped file lock, and also the global lock so cross-repository state cannot race. An executed verification command runs with no lock held, so a long test suite in one capsule never blocks another. Multiple active capsules remain independent Git worktrees.
 
 **Idempotent creation** runs entirely under that same global-then-project lock order. In sequence, it:
 
 1. canonicalizes the requested repository without mutation;
 2. resolves or reconciles an existing key reservation;
-3. resolves the base and enforces policy for a new key;
+3. resolves the base for a new key;
 4. generates exactly one capsule ID;
 5. durably publishes the reservation before any capsule-directory, branch, worktree, or manifest side effect;
 6. creates the manifest and worktree using exactly the reserved ID and immutable request;

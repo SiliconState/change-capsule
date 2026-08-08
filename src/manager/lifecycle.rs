@@ -21,12 +21,9 @@ impl CapsuleManager {
         let _lock = self.store.lock_project(&capsule.project_key)?;
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
-        let policy = self.enforce_capsule_policy(&capsule)?;
         self.validate_owned_worktree(&capsule)?;
         let head_before = self.git.head(&capsule.workspace_path)?;
         let checkpoint_snapshot = self.snapshot_against(&capsule, &head_before)?;
-        let (ignored_paths, ignored_bytes) =
-            self.ignored_usage_for_policy(&policy, &capsule.workspace_path)?;
         if checkpoint_snapshot.patch.is_empty() {
             return Err(Error::InvalidInput("nothing to checkpoint".to_owned()));
         }
@@ -54,13 +51,7 @@ impl CapsuleManager {
         let result_snapshot =
             self.git
                 .commit_snapshot(&capsule.workspace_path, &capsule.base_commit, &head_after)?;
-        Self::enforce_result_policy(
-            &policy,
-            result_snapshot.patch.len() as u64,
-            result_snapshot.changed_paths.len(),
-            ignored_paths,
-            ignored_bytes,
-        )?;
+        Self::require_patch_within_hard_bound(result_snapshot.patch.len() as u64)?;
         // Prove the manifest can still record this checkpoint before the branch
         // advances. Failing afterwards would strand the capsule in
         // `Checkpointing`, and every recovery attempt would fail the same way.
@@ -89,36 +80,74 @@ impl CapsuleManager {
             Error::UnsafeState("checkpoint side effect was not observable".to_owned())
         })?;
         capsule.updated_at_unix = now()?;
-        append_event(
-            &mut capsule,
-            AuditEventKind::Checkpointed,
-            Some(CapsuleState::Checkpointing),
-            CapsuleState::Active,
-            BTreeMap::from([("commit".to_owned(), checkpoint.commit.clone())]),
-        )?;
         self.store.write_capsule(&capsule)?;
         Ok(checkpoint)
     }
 
-    /// Attach a verification claim to an active capsule.
+    /// Attach a verification record to an active capsule.
+    ///
+    /// [`EvidenceInput::Run`] executes the command in the capsule workspace and
+    /// records what Capsule observed. [`EvidenceInput::Claim`] records a
+    /// caller's assertion and runs nothing. Either way the record is bound to
+    /// the complete patch as it stands once the work is done.
     ///
     /// Bounded to 64 records and 256 KiB of text per capsule.
     pub fn add_evidence(&self, id: &str, input: EvidenceInput) -> Result<Evidence> {
-        validate_bounded_text(
-            &input.command,
-            EVIDENCE_COMMAND_CAP,
-            "evidence command",
-            false,
-        )?;
-        if let Some(summary) = &input.summary {
-            validate_bounded_text(summary, EVIDENCE_SUMMARY_CAP, "evidence summary", true)?;
-        }
+        let command = input.command_line();
+        validate_bounded_text(&command, EVIDENCE_COMMAND_CAP, "evidence command", false)?;
+
+        // An executed command runs without any lock held. A test suite can run
+        // for minutes, and holding the global lock for that long would serialize
+        // every other capsule in the state root; a harness running attempts in
+        // parallel would degrade to running them one at a time.
+        let (exit_code, executed, output_sha256, output_bytes, summary) = match input {
+            EvidenceInput::Claim {
+                exit_code, summary, ..
+            } => {
+                if let Some(summary) = &summary {
+                    validate_bounded_text(summary, EVIDENCE_SUMMARY_CAP, "evidence summary", true)?;
+                }
+                (exit_code, false, None, None, summary)
+            }
+            EvidenceInput::Run {
+                argv,
+                summary,
+                timeout,
+            } => {
+                if let Some(summary) = &summary {
+                    validate_bounded_text(summary, EVIDENCE_SUMMARY_CAP, "evidence summary", true)?;
+                }
+                let capsule = self.show(id)?;
+                require_state(&capsule, CapsuleState::Active, "active")?;
+                self.validate_owned_worktree(&capsule)?;
+                let execution = crate::exec::run(&capsule.workspace_path, &argv, timeout)?;
+                // `tail_text` already bounds and sanitizes this, but validate
+                // it on the same path as a caller-supplied summary so the
+                // manifest invariant does not depend on a bound set elsewhere.
+                let summary = match summary {
+                    Some(summary) => Some(summary),
+                    None => Some(execution.tail)
+                        .filter(|tail| !tail.is_empty())
+                        .filter(|tail| {
+                            validate_bounded_text(tail, EVIDENCE_SUMMARY_CAP, "summary", true)
+                                .is_ok()
+                        }),
+                };
+                (
+                    execution.exit_code,
+                    true,
+                    Some(execution.output_sha256),
+                    Some(execution.output_bytes),
+                    summary,
+                )
+            }
+        };
+
         let mut capsule = self.show(id)?;
         let _global_lock = self.store.lock_global()?;
         let _lock = self.store.lock_project(&capsule.project_key)?;
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
-        self.enforce_capsule_policy(&capsule)?;
         self.validate_owned_worktree(&capsule)?;
         if capsule.evidence.len() >= EVIDENCE_COUNT_CAP {
             return Err(Error::InvalidInput(format!(
@@ -130,18 +159,24 @@ impl CapsuleManager {
             .iter()
             .map(|item| item.command.len() + item.summary.as_ref().map_or(0, String::len))
             .sum();
-        let pending_bytes = input.command.len() + input.summary.as_ref().map_or(0, String::len);
+        let pending_bytes = command.len() + summary.as_ref().map_or(0, String::len);
         if stored_evidence_bytes.saturating_add(pending_bytes) > EVIDENCE_TOTAL_BYTES_CAP {
             return Err(Error::InvalidInput(format!(
                 "total evidence payload would exceed the {EVIDENCE_TOTAL_BYTES_CAP}-byte capsule bound"
             )));
         }
+        // Bind the record to the patch as it stands now. An executed command may
+        // itself have changed the tree, and the binding must describe what would
+        // be sealed after the run, not before it.
         let snapshot = self.snapshot(&capsule)?;
         let evidence = Evidence {
-            command: input.command,
-            exit_code: input.exit_code,
-            summary: input.summary,
-            patch_sha256: Some(sha256_hex(&snapshot.patch)),
+            command,
+            exit_code,
+            executed,
+            output_sha256,
+            output_bytes,
+            summary,
+            patch_sha256: sha256_hex(&snapshot.patch),
             recorded_at_unix: now()?,
         };
         // The byte caps above count raw input; JSON escaping can still inflate
@@ -151,23 +186,19 @@ impl CapsuleManager {
         crate::state::ensure_manifest_capacity(&projected)?;
         capsule.evidence.push(evidence.clone());
         capsule.updated_at_unix = now()?;
-        let evidence_index = capsule.evidence.len() - 1;
-        append_event(
-            &mut capsule,
-            AuditEventKind::EvidenceAdded,
-            Some(CapsuleState::Active),
-            CapsuleState::Active,
-            BTreeMap::from([
-                ("evidence_index".to_owned(), evidence_index.to_string()),
-                (
-                    "command_sha256".to_owned(),
-                    sha256_hex(evidence.command.as_bytes()),
-                ),
-                ("exit_code".to_owned(), evidence.exit_code.to_string()),
-            ]),
-        )?;
         self.store.write_capsule(&capsule)?;
         Ok(evidence)
+    }
+
+    /// Refuse a patch larger than the hard buffering bound.
+    fn require_patch_within_hard_bound(bytes: u64) -> Result<()> {
+        if bytes > crate::model::HARD_PATCH_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "patch is {bytes} bytes, exceeding the {} byte hard bound",
+                crate::model::HARD_PATCH_BYTES
+            )));
+        }
+        Ok(())
     }
 
     /// Seal the capsule into an immutable result and patch.
@@ -180,7 +211,6 @@ impl CapsuleManager {
         let _lock = self.store.lock_project(&capsule.project_key)?;
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Active, "active")?;
-        let policy = self.enforce_capsule_policy(&capsule)?;
         self.validate_owned_worktree(&capsule)?;
         if options.require_successful_evidence
             && (capsule.evidence.is_empty()
@@ -204,22 +234,28 @@ impl CapsuleManager {
         } = self.close_snapshot_transaction(&capsule)?;
         let digest = sha256_hex(&snapshot.patch);
         if options.require_current_successful_evidence
-            && !capsule.evidence.iter().any(|item| {
-                item.exit_code == 0 && item.patch_sha256.as_deref() == Some(digest.as_str())
-            })
+            && !capsule
+                .evidence
+                .iter()
+                .any(|item| item.exit_code == 0 && item.patch_sha256 == digest)
         {
             return Err(Error::InvalidInput(
-                "current successful evidence is required, but no successful caller claim is bound to the exact final patch being sealed"
+                "current successful evidence is required, but no successful record is bound to the exact final patch being sealed"
                     .to_owned(),
             ));
         }
-        Self::enforce_result_policy(
-            &policy,
-            snapshot.patch.len() as u64,
-            snapshot.changed_paths.len(),
-            ignored_paths.len(),
-            ignored_bytes,
-        )?;
+        if options.require_executed_evidence
+            && !capsule
+                .evidence
+                .iter()
+                .any(|item| item.executed && item.exit_code == 0 && item.patch_sha256 == digest)
+        {
+            return Err(Error::InvalidInput(
+                "executed evidence is required, but Capsule did not itself run a passing command against the exact final patch being sealed"
+                    .to_owned(),
+            ));
+        }
+        Self::require_patch_within_hard_bound(snapshot.patch.len() as u64)?;
         let kind = if snapshot.patch.is_empty() {
             ResultKind::NoChange
         } else if clean {
@@ -262,16 +298,6 @@ impl CapsuleManager {
         capsule.state = CapsuleState::Closed;
         capsule.closed_at_unix = Some(sealed_at);
         capsule.updated_at_unix = sealed_at;
-        append_event(
-            &mut capsule,
-            AuditEventKind::Closed,
-            Some(CapsuleState::Active),
-            CapsuleState::Closed,
-            BTreeMap::from([
-                ("patch_sha256".to_owned(), result.patch_sha256.clone()),
-                ("patch_bytes".to_owned(), result.patch_bytes.to_string()),
-            ]),
-        )?;
         self.store.write_capsule(&capsule)?;
         Ok(result)
     }
@@ -292,21 +318,12 @@ impl CapsuleManager {
         let _lock = self.store.lock_project(&capsule.project_key)?;
         capsule = self.store.read_capsule(id)?;
         require_state(&capsule, CapsuleState::Closed, "closed")?;
-        let policy = self.enforce_capsule_policy(&capsule)?;
         self.ensure_sealed(&capsule)?;
         let (target, target_before, target_head_ref) =
             self.validate_integration_target(&capsule, &options.target)?;
         let result = self.store.read_result(id)?;
         let patch = self.store.read_patch(id)?;
-        let (ignored_paths, ignored_bytes) =
-            self.ignored_usage_for_policy(&policy, &capsule.workspace_path)?;
-        Self::enforce_result_policy(
-            &policy,
-            patch.len() as u64,
-            result.changed_paths.len(),
-            ignored_paths,
-            ignored_bytes,
-        )?;
+        Self::require_patch_within_hard_bound(patch.len() as u64)?;
         self.start_integration(
             &mut capsule,
             &target,
@@ -367,13 +384,6 @@ impl CapsuleManager {
                 &proposed_head,
             )?;
         }
-        append_event(
-            &mut capsule,
-            AuditEventKind::Integrated,
-            Some(CapsuleState::Integrating),
-            CapsuleState::Integrated,
-            BTreeMap::from([("target_head_after".to_owned(), proposed_head)]),
-        )?;
         self.store.write_capsule(&capsule)?;
         Ok(capsule)
     }
@@ -406,33 +416,13 @@ impl CapsuleManager {
             integrated_at_unix: None,
         });
         capsule.updated_at_unix = started_at;
-        append_event(
-            capsule,
-            AuditEventKind::IntegrationStarted,
-            Some(CapsuleState::Closed),
-            CapsuleState::Integrating,
-            BTreeMap::from([
-                (
-                    "target_worktree_sha256".to_owned(),
-                    sha256_hex(target.worktree.to_string_lossy().as_bytes()),
-                ),
-                ("target_head_before".to_owned(), target_before.to_owned()),
-            ]),
-        )?;
         self.store.write_capsule(capsule)
     }
 
-    pub(super) fn abort_integration(&self, capsule: &mut Capsule, error: &Error) -> Result<()> {
+    pub(super) fn abort_integration(&self, capsule: &mut Capsule, _error: &Error) -> Result<()> {
         capsule.state = CapsuleState::Closed;
         capsule.integration = None;
         capsule.updated_at_unix = now()?;
-        append_event(
-            capsule,
-            AuditEventKind::IntegrationAborted,
-            Some(CapsuleState::Integrating),
-            CapsuleState::Closed,
-            BTreeMap::from([("error".to_owned(), bounded_error(error))]),
-        )?;
         self.store.write_capsule(capsule)
     }
 
@@ -451,16 +441,6 @@ impl CapsuleManager {
         if capsule.state == CapsuleState::Dropping {
             self.finish_cleanup(&mut capsule)?;
             capsule.updated_at_unix = now()?;
-            append_event(
-                &mut capsule,
-                AuditEventKind::Recovered,
-                Some(CapsuleState::Dropping),
-                CapsuleState::Dropped,
-                BTreeMap::from([(
-                    "action".to_owned(),
-                    "completed cleanup requested before restart".to_owned(),
-                )]),
-            )?;
             self.store.write_capsule(&capsule)?;
             return Ok(capsule);
         }
@@ -477,7 +457,6 @@ impl CapsuleManager {
         if capsule.state == CapsuleState::Active && !force {
             return Err(Error::UnsealedChanges(id.to_owned()));
         }
-        let previous_state = capsule.state;
         let require_sealed = matches!(
             capsule.state,
             CapsuleState::Closed | CapsuleState::Integrated
@@ -517,27 +496,10 @@ impl CapsuleManager {
             started_at_unix: started_at,
         });
         capsule.updated_at_unix = started_at;
-        append_event(
-            &mut capsule,
-            AuditEventKind::CleanupStarted,
-            Some(previous_state),
-            CapsuleState::Dropping,
-            BTreeMap::from([
-                ("force".to_owned(), force.to_string()),
-                ("require_sealed".to_owned(), require_sealed.to_string()),
-            ]),
-        )?;
         self.store.write_capsule(&capsule)?;
 
         self.finish_cleanup(&mut capsule)?;
         capsule.updated_at_unix = now()?;
-        append_event(
-            &mut capsule,
-            AuditEventKind::Dropped,
-            Some(CapsuleState::Dropping),
-            CapsuleState::Dropped,
-            BTreeMap::new(),
-        )?;
         self.store.write_capsule(&capsule)?;
         Ok(capsule)
     }
@@ -569,13 +531,6 @@ impl CapsuleManager {
             author_email: journal.author_email.clone(),
             created_at_unix: journal.started_at_unix,
         });
-        append_event(
-            &mut completed,
-            AuditEventKind::Checkpointed,
-            Some(CapsuleState::Checkpointing),
-            CapsuleState::Active,
-            BTreeMap::from([("commit".to_owned(), journal.head_after.clone())]),
-        )?;
         crate::state::ensure_manifest_capacity(&completed)
     }
 
