@@ -84,7 +84,7 @@ fn capabilities_current_json_is_an_exact_static_contract() {
     let expected = r#"{
   "capability_schema_version": 1,
   "product": "change-capsule",
-  "product_version": "0.3.0",
+  "product_version": "{VERSION}",
   "protocol_versions": [
     1
   ],
@@ -122,6 +122,7 @@ fn capabilities_current_json_is_an_exact_static_contract() {
     "idempotency_key_bytes": 256
   }
 }"#;
+    let expected = expected.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
     assert_eq!(actual, expected);
 }
 

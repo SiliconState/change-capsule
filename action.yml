@@ -1,7 +1,9 @@
-name: Verify Capsule receipt
+name: Change Capsule
+# GitHub Marketplace rejects a description of 125 characters or more, and reads
+# it from the tagged action.yml rather than from the default branch.
 description: >-
-  Verify a sealed Capsule receipt in CI, and optionally prove that the
-  tree being merged is exactly the pinned base plus the sealed patch.
+  Verify a Capsule receipt in CI and prove the tree being merged is exactly the
+  pinned base plus the sealed patch.
 branding:
   icon: shield
   color: blue
@@ -46,7 +48,7 @@ inputs:
       Version of the change-capsule crate to install. Pass an empty string to
       install the newest published release (disables the binary cache).
     required: false
-    default: "0.3.0"
+    default: "0.3.1"
 
 outputs:
   verified:

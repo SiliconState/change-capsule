@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 — 2026-08-08
+
+Metadata only. No library, CLI, or receipt behaviour changed.
+
+- The GitHub Action is renamed **Change Capsule**, matching the crate, and its
+  description is shortened to 112 characters. Marketplace rejects a description
+  of 125 or more, and reads both from the tagged `action.yml` rather than from
+  the default branch, so listing 0.3.0 was impossible without a new tag.
+- The capability-contract test no longer hardcodes the package version, so a
+  release bump stops breaking a test whose point is the document's *shape*.
+
 ## 0.3.0 — 2026-08-08
 
 This release narrows the crate to two jobs: producing a change an outside party

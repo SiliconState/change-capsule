@@ -116,7 +116,7 @@ pinned Git commit
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0          # the pinned base must be present
-- uses: SiliconState/change-capsule@v0.3.0
+- uses: SiliconState/change-capsule@v0.3.1
   with:
     bundle: ./receipt
     repo: .
