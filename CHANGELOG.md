@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-08-08
 
 This release narrows the crate to two jobs: producing a change an outside party
 can re-derive, and proving a verification command really ran. Everything that
