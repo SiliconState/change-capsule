@@ -1,39 +1,19 @@
 {
   "schema_version": 3,
-  "capsule_id": "cap-01kzgm3q39myqqa3p7fmwz6y00",
-  "label": "0.2.0 orchestration protocol",
+  "capsule_id": "cap-01kzgmky6nerz68jkf23pkwvpb",
+  "label": "cross-platform CI fixes",
   "links": {
-    "task": "orchestration-protocol"
+    "task": "platform-gating"
   },
   "kind": "patch",
-  "base_commit": "7285e1a68f983a07eb131d43e9726e608e0ec800",
-  "head_commit": "7285e1a68f983a07eb131d43e9726e608e0ec800",
-  "patch_sha256": "0fd2ae8ee4e5fc1cf37880296bfb231797d598e8c01c0157b5dbe3a57609021e",
-  "patch_bytes": 330010,
+  "base_commit": "be02f6107f10f683781ed3bf7968e3e3c39254f8",
+  "head_commit": "be02f6107f10f683781ed3bf7968e3e3c39254f8",
+  "patch_sha256": "f642ef39c85aa92dbdaba2a23a7be485519364880fc83edf6d3ee79e7981d673",
+  "patch_bytes": 2560,
   "changed_paths": [
-    ".github/workflows/ci.yml",
-    "CHANGELOG.md",
-    "Cargo.lock",
-    "Cargo.toml",
-    "README.md",
-    "deny.toml",
-    "docs/architecture.md",
-    "docs/composition.md",
-    "docs/protocol.md",
-    "docs/security.md",
-    "src/capabilities.rs",
-    "src/error.rs",
-    "src/git.rs",
-    "src/idempotency.rs",
-    "src/lib.rs",
     "src/main.rs",
-    "src/manager.rs",
-    "src/model.rs",
     "src/signature.rs",
-    "src/state.rs",
-    "src/verify.rs",
-    "tests/capsule.rs",
-    "tests/orchestration.rs"
+    "tests/capsule.rs"
   ],
   "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "evidence": [
@@ -41,21 +21,33 @@
       "command": "cargo fmt --all -- --check",
       "exit_code": 0,
       "summary": "formatting clean",
-      "recorded_at_unix": 1786190672
+      "recorded_at_unix": 1786191190
     },
     {
       "command": "cargo clippy --all-targets --all-features --locked -- -D warnings",
       "exit_code": 0,
-      "summary": "no warnings",
-      "recorded_at_unix": 1786190672
+      "summary": "no warnings on linux",
+      "recorded_at_unix": 1786191190
+    },
+    {
+      "command": "cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings",
+      "exit_code": 0,
+      "summary": "no warnings on windows",
+      "recorded_at_unix": 1786191190
+    },
+    {
+      "command": "cargo clippy --target x86_64-apple-darwin --all-targets --all-features --locked -- -D warnings",
+      "exit_code": 0,
+      "summary": "no warnings on macos",
+      "recorded_at_unix": 1786191190
     },
     {
       "command": "cargo test --all-features --locked",
       "exit_code": 0,
       "summary": "7 unit, 65 integration, 12 orchestration, 3 doctests passed",
-      "recorded_at_unix": 1786190672
+      "recorded_at_unix": 1786191190
     }
   ],
-  "created_at_unix": 1786190617,
-  "sealed_at_unix": 1786190719
+  "created_at_unix": 1786191149,
+  "sealed_at_unix": 1786191190
 }

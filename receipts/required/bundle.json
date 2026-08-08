@@ -1,24 +1,24 @@
 {
   "schema_version": 1,
-  "capsule_id": "cap-01kzgm3q39myqqa3p7fmwz6y00",
+  "capsule_id": "cap-01kzgmky6nerz68jkf23pkwvpb",
   "artifacts": [
     {
       "kind": "result_manifest",
       "name": "result.json",
       "media_type": "application/json",
       "uri": "result.json",
-      "content_address": "sha256:16dce1b42ef35d0a55191331b4a62b487f51193cad94f2cd82c99e088710ce02",
-      "sha256": "16dce1b42ef35d0a55191331b4a62b487f51193cad94f2cd82c99e088710ce02",
-      "bytes": 1699
+      "content_address": "sha256:7c2be71b8c069a22323492d24b4a4233bab077dc373603fc02a4a51800134913",
+      "sha256": "7c2be71b8c069a22323492d24b4a4233bab077dc373603fc02a4a51800134913",
+      "bytes": 1708
     },
     {
       "kind": "result_patch",
       "name": "result.patch",
       "media_type": "application/vnd.git.patch",
       "uri": "result.patch",
-      "content_address": "sha256:0fd2ae8ee4e5fc1cf37880296bfb231797d598e8c01c0157b5dbe3a57609021e",
-      "sha256": "0fd2ae8ee4e5fc1cf37880296bfb231797d598e8c01c0157b5dbe3a57609021e",
-      "bytes": 330010
+      "content_address": "sha256:f642ef39c85aa92dbdaba2a23a7be485519364880fc83edf6d3ee79e7981d673",
+      "sha256": "f642ef39c85aa92dbdaba2a23a7be485519364880fc83edf6d3ee79e7981d673",
+      "bytes": 2560
     }
   ]
 }
