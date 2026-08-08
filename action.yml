@@ -73,7 +73,7 @@ runs:
 
     - name: Restore cached capsule binary
       if: steps.resolve.outputs.install == 'true' && inputs.version != ''
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/bin/capsule
         key: ${{ steps.resolve.outputs.cache-key }}

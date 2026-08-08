@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## 0.2.0 — 2026-08-08
 
 ### Added
 
@@ -25,6 +25,7 @@
 - `manager.rs` was split into a `manager/` module directory (`create`, `lifecycle`, `query`, `recover`, `artifacts`, `admin`, `tests`) with no behaviour change; the largest file dropped from about 3,700 lines to about 1,000.
 - CI gained MSRV verification against the declared `rust-version`, coverage via `cargo-llvm-cov`, a fuzz-target build, and a release-pin consistency check. `fuzz/` adds libFuzzer targets for receipt decoding, receipt verification, and `GitPath` canonicality; `benches/` adds criterion benchmarks; property tests prove the canonical request digest cannot be confused by field concatenation.
 - Added `SECURITY.md`, `CONTRIBUTING.md`, issue and pull-request templates, Dependabot configuration, `docs/interop.md`, and `docs/releasing.md`.
+- Dependencies updated across two semver-major crypto-stack revisions: `ed25519-dalek` 3.0 (curve25519-dalek 5), `sha2` 0.11 (digest 0.11), and `getrandom` 0.4, plus `criterion` 0.7 and GitHub Actions `checkout@v7`/`cache@v6`. No source changes were required, the declared 1.85 MSRV still verifies, and `cargo audit`/`cargo deny` stay clean.
 - CI dogfood keeps the published-action compatibility gate pinned to published 0.1.2 while also verifying the committed receipt with the current 0.2.0 source binary; dependency audit/license checks were added.
 
 ### Security
