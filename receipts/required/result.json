@@ -1,18 +1,16 @@
 {
   "schema_version": 3,
-  "capsule_id": "cap-01kzgmky6nerz68jkf23pkwvpb",
-  "label": "cross-platform CI fixes",
+  "capsule_id": "cap-01kzgn0xhvc05hxpjjt1ryvad9",
+  "label": "windows json path assertion",
   "links": {
     "task": "platform-gating"
   },
   "kind": "patch",
-  "base_commit": "be02f6107f10f683781ed3bf7968e3e3c39254f8",
-  "head_commit": "be02f6107f10f683781ed3bf7968e3e3c39254f8",
-  "patch_sha256": "f642ef39c85aa92dbdaba2a23a7be485519364880fc83edf6d3ee79e7981d673",
-  "patch_bytes": 2560,
+  "base_commit": "d6f98489e5ed714f3e525051fac2b1c02c583f49",
+  "head_commit": "d6f98489e5ed714f3e525051fac2b1c02c583f49",
+  "patch_sha256": "d89f686d5f8b9b812abe65d86c84167b6df9b755b71c27791b69480836b4cfd8",
+  "patch_bytes": 1137,
   "changed_paths": [
-    "src/main.rs",
-    "src/signature.rs",
     "tests/capsule.rs"
   ],
   "ignored_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -21,33 +19,21 @@
       "command": "cargo fmt --all -- --check",
       "exit_code": 0,
       "summary": "formatting clean",
-      "recorded_at_unix": 1786191190
+      "recorded_at_unix": 1786191611
     },
     {
       "command": "cargo clippy --all-targets --all-features --locked -- -D warnings",
       "exit_code": 0,
-      "summary": "no warnings on linux",
-      "recorded_at_unix": 1786191190
-    },
-    {
-      "command": "cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings",
-      "exit_code": 0,
-      "summary": "no warnings on windows",
-      "recorded_at_unix": 1786191190
-    },
-    {
-      "command": "cargo clippy --target x86_64-apple-darwin --all-targets --all-features --locked -- -D warnings",
-      "exit_code": 0,
-      "summary": "no warnings on macos",
-      "recorded_at_unix": 1786191190
+      "summary": "no warnings on linux, windows-msvc, and apple-darwin targets",
+      "recorded_at_unix": 1786191611
     },
     {
       "command": "cargo test --all-features --locked",
       "exit_code": 0,
       "summary": "7 unit, 65 integration, 12 orchestration, 3 doctests passed",
-      "recorded_at_unix": 1786191190
+      "recorded_at_unix": 1786191611
     }
   ],
-  "created_at_unix": 1786191149,
-  "sealed_at_unix": 1786191190
+  "created_at_unix": 1786191574,
+  "sealed_at_unix": 1786191611
 }

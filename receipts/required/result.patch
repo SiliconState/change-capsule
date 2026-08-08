@@ -1,70 +1,23 @@
-diff --git a/src/main.rs b/src/main.rs
-index d8b3f31be501387c92031ad2743af13b299d4dca..9c225a0353e615759a3e8540c9e7e37cd54364f3 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -874,7 +874,10 @@ fn sync_parent_directory(path: &Path) -> change_capsule::Result<()> {
-         })
- }
- 
-+/// Windows offers no portable directory-sync equivalent, so publication relies
-+/// on the file sync plus the atomic rename already performed by the caller.
- #[cfg(not(unix))]
-+#[allow(clippy::unnecessary_wraps)]
- fn sync_parent_directory(_path: &Path) -> change_capsule::Result<()> {
-     Ok(())
- }
-diff --git a/src/signature.rs b/src/signature.rs
-index ccefa9c5b1185f7f36ffa6aa1c1f82f4876856f2..dbf508e8f117c601888aa4eb9f3b655356245f54 100644
---- a/src/signature.rs
-+++ b/src/signature.rs
-@@ -4,7 +4,6 @@
- //! `bundle.json` bytes. The bundle descriptors in turn bind `result.json` and
- //! `result.patch`. Public keys are supplied out of band by the verifier.
- 
--use std::fs;
- use std::io::Write;
- use std::path::Path;
- 
-@@ -140,12 +139,15 @@ pub fn verify_bundle_signature(
- 
- #[cfg(unix)]
- fn sync_parent_directory(path: &Path) -> Result<()> {
--    fs::File::open(path)
-+    std::fs::File::open(path)
-         .and_then(|directory| directory.sync_all())
-         .map_err(|error| io(path, error))
- }
- 
-+/// Windows offers no portable directory-sync equivalent, so publication relies
-+/// on the file sync plus the atomic rename already performed by the caller.
- #[cfg(not(unix))]
-+#[allow(clippy::unnecessary_wraps)]
- fn sync_parent_directory(_path: &Path) -> Result<()> {
-     Ok(())
- }
 diff --git a/tests/capsule.rs b/tests/capsule.rs
-index 514b743029bb549725184fd55eeb73c3e24bdeaa..7b2abf9c06250e63046dab148e96cc316f2bdeef 100644
+index 7b2abf9c06250e63046dab148e96cc316f2bdeef..36b560a7f358182d2fec5606b36acde7b5ec05d3 100644
 --- a/tests/capsule.rs
 +++ b/tests/capsule.rs
-@@ -2840,7 +2840,9 @@ fn key_inputs_reject_symlinks() {
+@@ -2759,7 +2759,17 @@ fn keygen_reports_partial_publication_and_sign_never_overwrites() {
      assert!(!output.status.success());
- }
+     assert!(public.is_file(), "harmless public key remains published");
+     assert_eq!(fs::read(&private).expect("private untouched"), [1_u8; 32]);
+-    assert!(String::from_utf8_lossy(&output.stderr).contains(public.to_string_lossy().as_ref()));
++    // JSON mode escapes backslashes, so a raw-byte match would miss a Windows
++    // path. Decode the envelope and assert against the real message.
++    let reported: serde_json::Value =
++        serde_json::from_slice(&output.stderr).expect("keygen error JSON");
++    assert!(
++        reported["error"]
++            .as_str()
++            .expect("keygen error message")
++            .contains(public.to_string_lossy().as_ref()),
++        "{reported}"
++    );
  
--#[cfg(unix)]
-+// macOS enforces UTF-8 filenames (EILSEQ), so the fixture itself cannot be
-+// created there. The encoding under test stays platform-independent.
-+#[cfg(target_os = "linux")]
- #[test]
- fn non_utf8_ignored_names_and_symlink_targets_hash_losslessly() {
-     use std::os::unix::ffi::OsStringExt;
-@@ -2886,7 +2888,9 @@ fn git_path_raw_encoding_is_strictly_canonical() {
-     }
- }
- 
--#[cfg(unix)]
-+// macOS enforces UTF-8 filenames (EILSEQ), so the fixture itself cannot be
-+// created there. The encoding under test stays platform-independent.
-+#[cfg(target_os = "linux")]
- #[test]
- fn non_utf8_git_inventory_paths_round_trip_losslessly() {
-     use std::os::unix::ffi::OsStringExt;
+     let manager = fixture.manager();
+     let capsule = fixture.create("signature-no-overwrite");
